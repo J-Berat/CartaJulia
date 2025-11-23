@@ -11,11 +11,7 @@ using FITSIO
 using GLFW
 
 # ---- helpers (no TeX newlines; only inline LaTeX) ----
-include("helpers/scaling.jl")  # apply_scale, clamped_extrema
-include("helpers/mapping.jl")  # ijk_to_uv, uv_to_ijk, get_slice
-include("helpers/latex.jl")    # make_info_tex, make_slice_title, make_spec_title
-include("helpers/io.jl")       # to_cmap, get_box_str
-include("helpers/ui.jl")       # _pick_fig_size
+include("helpers/Helpers.jl")
 
 export carta
 
