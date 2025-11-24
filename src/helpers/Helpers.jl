@@ -90,7 +90,7 @@ end
 # =========================
 # path: src/helpers/latex.jl
 # =========================
-export make_info_tex, make_slice_title, make_spec_title
+export make_info_tex
 using LaTeXStrings
 
 # NOTE: Inline LaTeX only. No line breaks (no `\\` newlines). Thin spaces via `\\,`.
@@ -103,21 +103,6 @@ make_info_tex(i::Int, j::Int, k::Int, u::Int, v::Int, val::Float32) = latexstrin
     "\\text{pixel }(i,j,k) = ($i,$j,$k)\\,\\text{ ; slice }(\\text{row},\\text{col}) = ($u,$v)\\,\\text{ ; value }= $(isnan(val) ? "NaN" : string(round(val; digits=4)))"
 )
 
-"""
-make_slice_title(fname, axis, idx) -> LaTeXString
-Title for saved slice figures, inline.
-"""
-make_slice_title(fname::AbstractString, axis::Int, idx::Int) = latexstring(
-    "$(fname)\\,\\text{ — slice axis } $(axis),\\, \\text{index } $(idx)"
-)
-
-"""
-make_spec_title(i,j,k) -> LaTeXString
-Title for saved spectrum figure, inline.
-"""
-make_spec_title(i::Int, j::Int, k::Int) = latexstring(
-    "\\text{Spectrum at pixel }(i,j,k) = ($i,$j,$k)"
-)
 
 
 # =========================
@@ -132,11 +117,32 @@ Resolves a Makie colormap from Symbol/String.
 """
 to_cmap(name::Union{Symbol,String}) = Makie.to_colormap(Symbol(name))
 
+export get_box_str
+
 """
 get_box_str(textbox) -> String
-Returns trimmed content from a Makie Textbox.
+Returns the trimmed content of a Makie Textbox.
+- Uses `stored_string[]` when available (committed on Enter/focus out).
+- Falls back to `displayed_string[]` if stored is `nothing` or empty.
 """
-get_box_str(tb) = strip(String(tb.stored_string[]))
+function get_box_str(tb)
+    s = try
+        tb.stored_string[]
+    catch
+        nothing
+    end
+    if s === nothing || (s isa AbstractString && isempty(s))
+        s2 = try
+            tb.displayed_string[]
+        catch
+            ""
+        end
+        return strip(String(s2))
+    else
+        return strip(String(s))
+    end
+end
+
 
 
 # =========================
@@ -164,3 +170,38 @@ Decide figure size from explicit size or primary monitor.
         return (1800, 900)
     end
 end
+
+# =========================
+# path: src/helpers/title.jl
+# =========================
+export latex_safe, make_main_title, make_slice_title, make_spec_title
+using LaTeXStrings
+
+function latex_safe(s::AbstractString)
+    t = String(s)
+    t = replace(t, "\\" => "\\textbackslash{}")
+    # 2) the usual TeX special chars
+    t = replace(t, "_" => "\\_")
+    t = replace(t, "%" => "\\%")
+    t = replace(t, "&" => "\\&")
+    t = replace(t, "#" => "\\#")
+    t = replace(t, "\$" => "\\\$")            # ← this fixes your ParseError
+    t = replace(t, "{" => "\\{")
+    t = replace(t, "}" => "\\}")
+    t = replace(t, "^" => "\\^{}")
+    t = replace(t, "~" => "\\~{}")
+    return t
+end
+
+# Image title: enforce \text{...}
+make_main_title(fname::AbstractString) = latexstring("\\text{", latex_safe(fname), "}")
+
+# Slice title (for saved slice figure) — inline, no line breaks
+make_slice_title(fname::AbstractString, axis::Int, idx::Int) = latexstring(
+    "\\text{", latex_safe(fname), " — slice axis $(axis), index $(idx)}"
+)
+
+# Spectrum title (inline)
+make_spec_title(i::Int, j::Int, k::Int) = latexstring(
+    "\\text{Spectrum at pixel }(i,j,k) = ($i,$j,$k)"
+)

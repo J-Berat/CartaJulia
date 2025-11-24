@@ -79,4 +79,8 @@ fig = CartaViewer.carta(
     fullscreen=fullscreen,
 )
 
+#display(fig)
 display(fig)
+while isopen(fig.scene)
+    sleep(0.1)
+end
