@@ -96,6 +96,12 @@ end
     end
     tb = MockTB(Observable("   hello world   "))
     @test CartaViewer.get_box_str(tb) == "hello world"
+    
+    struct MockDisplayTB
+        displayed_string::Observable{String}
+    end
+    tb2 = MockDisplayTB(Observable("   fallback value   "))
+    @test CartaViewer.get_box_str(tb2) == "fallback value"
 end
 
 @testset "helpers: ui" begin
