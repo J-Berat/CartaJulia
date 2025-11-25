@@ -44,7 +44,6 @@ carta(filepath::String;
       vmin = nothing,                      # Float-like or nothing
       vmax = nothing,                      # Float-like or nothing
       invert::Bool = false,
-      fullscreen::Bool = false,            # fit window to primary monitor
       size::Union{Nothing,Tuple{Int,Int}} = nothing)  # explicit (w,h), overrides fullscreen
 ```
 Notes:
