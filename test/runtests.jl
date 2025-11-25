@@ -100,11 +100,7 @@ end
 
 @testset "helpers: ui" begin
     # override explicite
-    @test CartaViewer._pick_fig_size(false, (111, 222)) == (111, 222)
-
-    # défaut sans fullscreen
-    @test CartaViewer._pick_fig_size(false, nothing) == (1800, 900)
-
-    # fullscreen + size explicite prioritaire
-    @test CartaViewer._pick_fig_size(true, (640, 480)) == (640, 480)
+    @test CartaViewer._pick_fig_size((111, 222)) == (111, 222)
+    # défaut sans taille explicite
+    @test CartaViewer._pick_fig_size(nothing) == (1800, 900)
 end
