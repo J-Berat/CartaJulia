@@ -1,22 +1,25 @@
 # path: src/CartaViewer.jl
 module CartaViewer
 
+const _KEEP_ALIVE = Any[]
+keepalive!(x) = (push!(_KEEP_ALIVE, x); x)
+forget!(x) = (filter!(y -> y !== x, _KEEP_ALIVE); nothing)
+
 using GLMakie
 using CairoMakie
 using Makie
 using Observables
 using ImageFiltering
-# using LaTeXStrings           # <- Désactivé pour éviter MathTeX
+using LaTeXStrings
 using FITSIO
 using GLFW
 
+# ---- helpers ----
 include("helpers/Helpers.jl")
 
 spawn_safely(f::Function) = @async try f() catch e
     @error "Background task failed" exception=(e, catch_backtrace())
 end
-
-save_with_format(path::AbstractString, fig) = CairoMakie.save(String(path), fig)
 
 export carta
 
@@ -38,7 +41,6 @@ function carta(
     vmin = nothing,
     vmax = nothing,
     invert::Bool = false,
-    fullscreen::Bool = false,
     figsize::Union{Nothing,Tuple{Int,Int}} = nothing
 )
     # ---------- Load ----------
@@ -50,10 +52,10 @@ function carta(
     data = Float32.(cube)
     siz  = size(data)  # (nx, ny, nz)
 
-    @info "FITS ready" path = filepath size = siz
-
     fname_full = basename(filepath)
     fname = String(replace(fname_full, r"\.fits$" => ""))
+
+    @info "FITS ready" path=abspath(filepath) size=siz
 
     # ---------- State ----------
     axis   = Observable(3)          # 1/2/3
@@ -69,7 +71,7 @@ function carta(
     cmap_name   = Observable(cmap)
     invert_cmap = Observable(invert)
     cm_obs = lift(cmap_name, invert_cmap) do name, inv
-        inv ? Makie.Reverse(name) : name
+        base = to_cmap(name); inv ? reverse(base) : base
     end
 
     img_scale_mode  = Observable(:lin)
@@ -91,8 +93,10 @@ function carta(
         end
     end
 
+    # ---- display array: protect against NaN/Inf after log/ln
     slice_disp = lift(slice_proc, img_scale_mode) do s, m
-        apply_scale(s, m)
+        A = apply_scale(s, m)
+        map(x -> (isfinite(x) && !isnan(x)) ? Float32(x) : 0f0, A)
     end
 
     clims_auto = lift(slice_disp) do s
@@ -105,7 +109,7 @@ function carta(
     if vmin !== nothing && vmax !== nothing
         vmin_f, vmax_f = Float32(vmin), Float32(vmax)
         if vmin_f == vmax_f
-            vmin_f = prevfloat(vmin_f); vmax_f = nextfloat(vmax_f)  # éviter plage nulle
+            vmin_f = prevfloat(vmin_f); vmax_f = nextfloat(vmax_f)  # avoid zero-width
         end
         clims_manual[] = (vmin_f, vmax_f)
         use_manual[]   = true
@@ -113,6 +117,15 @@ function carta(
 
     clims_obs = lift(use_manual, clims_auto, clims_manual) do um, ca, cm
         um ? cm : ca
+    end
+
+    # safe clims for plotting/layout
+    clims_safe = lift(clims_obs) do (cmin, cmax)
+        if !(isfinite(cmin) && isfinite(cmax)) || isnan(cmin) || isnan(cmax) || cmin == cmax
+            (0f0, 1f0)
+        else
+            (cmin, cmax)
+        end
     end
 
     spec_x_raw  = Observable(collect(1:siz[3]))
@@ -123,50 +136,31 @@ function carta(
 
     # ---------- Figure & layout ----------
     GLMakie.activate!()
-    fig = Figure(size = _pick_fig_size(fullscreen, figsize))
+    fig = Figure(size = _pick_fig_size(figsize))
 
     main_grid = fig[1, 1] = GridLayout()
     top_grid  = main_grid[1, 1] = GridLayout()
 
-    # --- toast ---
-    toast_row   = main_grid[3, 1] = GridLayout()
-    toast_label = Label(
-        toast_row[1, 1];
-        text     = "",
-        visible  = false,
-        halign   = :right,
-        fontsize = 12,
-    )
-    show_toast!(msg::AbstractString; seconds::Real = 2.5) = begin
-        toast_label.text[] = String(msg)
-        toast_label.visible[] = true
-        @async begin
-            sleep(seconds)
-            try
-                toast_label.visible[] = false
-            catch
-            end
-        end
-    end
-
-    # --- Image + colorbar ---
+    # Image + colorbar
     img_grid  = top_grid[1, 1] = GridLayout()
+
     ax_img = Axis(
         img_grid[1, 1];
         title     = make_main_title(fname),
-        xlabel    = "pixel x",
-        ylabel    = "pixel y",
+        xlabel    = L"\text{pixel } x",
+        ylabel    = L"\text{pixel } y",
         aspect    = DataAspect(),
         yreversed = true,
     )
 
     uv_point = Observable(Point2f(1, 1))
-    hm = heatmap!(ax_img, slice_disp; colormap = cm_obs, colorrange = clims_obs)
+    hm = heatmap!(ax_img, slice_disp; colormap = cm_obs, colorrange = clims_safe)
     scatter!(ax_img, lift(p -> [p], uv_point); markersize = 10)
 
-    Colorbar(img_grid[1, 2], hm; label = "intensity (scaled)", width = 20)
+    # Colorbar linked to plot; tellheight=false avoids layout feedback loops
+    Colorbar(img_grid[1, 2], hm; label = L"\text{intensity (scaled)}", width = 20, tellheight = false)
 
-    # --- Info + spectrum ---
+    # Info + spectrum
     spec_grid = top_grid[1, 2] = GridLayout()
     lab_info = Label(
         spec_grid[1, 1];
@@ -178,15 +172,15 @@ function carta(
 
     ax_spec = Axis(
         spec_grid[2, 1];
-        title  = "Spectrum at selected pixel",
-        xlabel = "index along slice axis",
-        ylabel = "intensity (scaled)",
+        title  = L"\text{Spectrum at selected pixel}",
+        xlabel = L"\text{index along slice axis}",
+        ylabel = L"\text{intensity (scaled)}",
         width  = 600,
         height = 400,
     )
     lines!(ax_spec, spec_x_raw, spec_y_disp)
 
-    # --- Controls ---
+    # Controls
     bottom_grid    = main_grid[2, 1] = GridLayout()
     img_ctrl_grid  = bottom_grid[1, 1] = GridLayout()
     spec_ctrl_grid = bottom_grid[1, 2] = GridLayout()
@@ -195,16 +189,16 @@ function carta(
     im_row1_left  = img_ctrl_grid[1, 1] = GridLayout()
     im_row1_right = img_ctrl_grid[1, 2] = GridLayout()
 
-    Label(im_row1_left[1, 1], text = "Image scale")
+    Label(im_row1_left[1, 1], text = L"\text{Image scale}")
     img_scale_menu = Menu(im_row1_left[1, 2]; options = ["lin", "log10", "ln"], prompt = "lin", width = 60)
 
-    Label(im_row1_left[1, 3], text = "Spectrum scale")
+    Label(im_row1_left[1, 3], text = L"\text{Spectrum scale}")
     spec_scale_menu = Menu(im_row1_left[1, 4]; options = ["lin", "log10", "ln"], prompt = "lin", width = 60)
 
     invert_chk = Checkbox(im_row1_left[1, 5])
-    Label(im_row1_left[1, 6], text = "Invert colormap")
+    Label(im_row1_left[1, 6], text = L"\text{Invert colormap}")
 
-    Label(im_row1_right[1, 1], text = "Colorbar limits")
+    Label(im_row1_right[1, 1], text = L"\text{Colorbar limits}")
     clim_min_box   = Textbox(im_row1_right[1, 2]; placeholder = "min", width = 100, height = 24)
     clim_max_box   = Textbox(im_row1_right[1, 3]; placeholder = "max", width = 100, height = 24)
     clim_apply_btn = Button(im_row1_right[1, 4], label = "Apply")
@@ -220,7 +214,7 @@ function carta(
     im_row2_left  = img_ctrl_grid[2, 1] = GridLayout()
     im_row2_right = img_ctrl_grid[2, 2] = GridLayout()
 
-    Label(im_row2_left[1, 1], text = "Save")
+    Label(im_row2_left[1, 1], text = L"\text{Save}")
     fmt_menu  = Menu(im_row2_left[1, 2]; options = ["png", "pdf"], prompt = "png", width = 70)
     fname_box = Textbox(im_row2_left[1, 3]; placeholder = "filename base", width = 220, height = 24)
 
@@ -231,14 +225,14 @@ function carta(
     im_row3_left  = img_ctrl_grid[3, 1] = GridLayout()
     im_row3_right = img_ctrl_grid[3, 2] = GridLayout()
 
-    Label(im_row3_left[1, 1], text = "GIF indices")
+    Label(im_row3_left[1, 1], text = L"\text{GIF indices}")
     start_box = Textbox(im_row3_left[1, 2]; placeholder = "start", width = 80, height = 24)
     stop_box  = Textbox(im_row3_left[1, 3]; placeholder = "stop",  width = 80, height = 24)
     step_box  = Textbox(im_row3_left[1, 4]; placeholder = "step",  width = 80, height = 24)
     fps_box   = Textbox(im_row3_left[1, 5]; placeholder = "fps",   width = 80, height = 24)
 
     pingpong_chk = Checkbox(im_row3_left[1, 6])
-    Label(im_row3_left[1, 7], text = "Back-and-forth mode")
+    Label(im_row3_left[1, 7], text = L"\text{Back-and-forth mode}")
 
     anim_btn = Button(im_row3_right[1, 1], label = "Export GIF")
 
@@ -246,21 +240,21 @@ function carta(
     sp_row1_left  = spec_ctrl_grid[1, 1] = GridLayout()
     sp_row1_right = spec_ctrl_grid[1, 2] = GridLayout()
 
-    Label(sp_row1_left[1, 1], text = "Slice axis")
+    Label(sp_row1_left[1, 1], text = L"\text{Slice axis}")
     axes_labels = ["dim1 (x)", "dim2 (y)", "dim3 (z)"]
     axis_menu = Menu(sp_row1_left[1, 2]; options = axes_labels, prompt = "dim3 (z)", width = 90)
 
-    status_label = Label(sp_row1_left[1, 3], text = "axis 3, index 1", fontsize = 12)
+    status_label = Label(sp_row1_left[1, 3], text = latexstring("\\text{axis } 3,\\, \\text{index } 1"), fontsize = 12)
 
-    Label(sp_row1_right[1, 1], text = "Index")
+    Label(sp_row1_right[1, 1], text = L"\text{Index}")
     slice_slider = Slider(sp_row1_right[1, 2]; range = 1:siz[3], startvalue = 1, width = 200, height = 10)
 
     sp_row2_left  = spec_ctrl_grid[2, 1] = GridLayout()
     sp_row2_right = spec_ctrl_grid[2, 2] = GridLayout()
 
-    Label(sp_row2_left[1, 1], text = "Gaussian filter")
+    Label(sp_row2_left[1, 1], text = L"\text{Gaussian filter}")
     gauss_chk   = Checkbox(sp_row2_left[1, 2])
-    sigma_label = Label(sp_row2_left[1, 3], text = "σ = 1.5 px", fontsize = 12)
+    sigma_label = Label(sp_row2_left[1, 3], text = latexstring("\\sigma = 1.5\\,\\text{px}"), fontsize = 12)
 
     sigma_slider = Slider(sp_row2_right[1, 1]; range = LinRange(0, 10, 101), startvalue = 1.5, width = 200, height = 10)
 
@@ -276,8 +270,8 @@ function carta(
 
     function refresh_labels!()
         val = data[i_idx[], j_idx[], k_idx[]]
-        lab_info.text[]   = make_info_tex(i_idx[], j_idx[], k_idx[], u_idx[], v_idx[], val)
-        status_label.text[] = "axis $(axis[]), index $(idx[])"
+        lab_info.text[] = make_info_tex(i_idx[], j_idx[], k_idx[], u_idx[], v_idx[], val)
+        status_label.text[] = latexstring("\\text{axis } $(axis[]),\\, \\text{index } $(idx[])")
     end
 
     function refresh_spectrum!()
@@ -353,7 +347,7 @@ function carta(
 
     on(sigma_slider.value) do v
         sigma[] = Float32(v)
-        sigma_label.text[] = "σ = $(round(v; digits = 2)) px"
+        sigma_label.text[] = latexstring("\\sigma = $(round(v; digits = 2))\\,\\text{px}")
     end
 
     on(clim_apply_btn.clicks) do _
@@ -365,7 +359,7 @@ function carta(
         else
             vmin_p = tryparse(Float32, txtmin); vmax_p = tryparse(Float32, txtmax)
             if vmin_p === nothing || vmax_p === nothing
-                @warn "Could not parse colorbar limits from '$txtmin' '$txtmax'"
+                @warn "Could not parse colorbar limits" txtmin txtmax
             else
                 if vmin_p == vmax_p
                     vmin_p = prevfloat(vmin_p); vmax_p = nextfloat(vmax_p)
@@ -403,7 +397,10 @@ function carta(
     on(events(ax_img).mousebutton) do ev
         if ev.button == Mouse.left && ev.action == Mouse.press
             mp = events(ax_img).mouseposition[]
-            p  = to_world(ax_img.scene, mp)
+            p = to_world(ax_img.scene, events(ax_img).mouseposition[])
+            if any(isnan, p)
+                return  # pas de conversion en Int si hors axe
+            end
             u = Int(round(clamp(p[2], 1, size(slice_raw[], 1))))
             v = Int(round(clamp(p[1], 1, size(slice_raw[], 2))))
             u_idx[] = u; v_idx[] = v
@@ -422,19 +419,26 @@ function carta(
         return "$(b)_axis$(axis[])_idx$(idx[])_i$(i_idx[])_j$(j_idx[])_k$(k_idx[])_img$(String(img_scale_mode[]))_spec$(String(spec_scale_mode[])).$(ext)"
     end
 
-    # Save image (CairoMakie)
+    # utilitaire asynchrone (si pas déjà présent)
+    spawn_safely(f::Function) = @async try f() catch e
+        @error "Background task failed" exception=(e, catch_backtrace())
+    end
+
+    # Export unifié (laisser Makie/Cairo décider)
+    save_with_format(path::AbstractString, fig) = CairoMakie.save(String(path), fig)
+
+    # ---------- Save image (slice + colorbar + crosshair) ----------
     on(btn_save_img.clicks) do _
         spawn_safely() do
             ext  = String(something(fmt_menu.selection[], "png"))
-            base = get_box_str(fname_box); base = isempty(base) ? fname : base
-            out  = joinpath(save_dir, make_name(base * "_image", ext))
+            out  = joinpath(save_dir, "$(fname)_idx$(idx[])_axis$(axis[]).$(ext)")  # <--- ICI
             try
                 f_slice = CairoMakie.Figure(size = (700, 560))
                 axS = CairoMakie.Axis(
                     f_slice[1, 1];
                     title     = make_slice_title(fname, axis[], idx[]),
-                    xlabel    = "pixel x",
-                    ylabel    = "pixel y",
+                    xlabel    = L"\text{pixel } x",
+                    ylabel    = L"\text{pixel } y",
                     aspect    = CairoMakie.DataAspect(),
                     yreversed = true,
                 )
@@ -444,44 +448,44 @@ function carta(
 
                 CairoMakie.save(String(out), f_slice)
                 @info "Saved image" out
-                show_toast!("Saved image → $(out)")
             catch e
                 @error "Failed to save image" out exception=(e, catch_backtrace())
-                show_toast!("Failed to save image")
             end
         end
     end
 
-    # Save spectrum (CairoMakie)
+    # ---------- Save spectrum (lines plot) ----------
     on(btn_save_spec.clicks) do _
         spawn_safely() do
-            ext  = String(something(fmt_menu.selection[], "png"))
-            base = get_box_str(fname_box); base = isempty(base) ? fname : base
-            out  = joinpath(save_dir, make_name(base * "_spectrum", ext))
+            ext = String(something(fmt_menu.selection[], "png"))
+            # nouveau nom : nom_du_FITS_spectre_ij_axis.extension
+            out = joinpath(save_dir,
+                "$(fname)_spectre_i$(i_idx[])_j$(j_idx[])_axis$(axis[]).$(ext)")
+
             try
                 f_spec = CairoMakie.Figure(size = (600, 400))
                 axP = CairoMakie.Axis(
                     f_spec[1, 1];
                     title  = make_spec_title(i_idx[], j_idx[], k_idx[]),
-                    xlabel = "index along slice axis",
-                    ylabel = "intensity (scaled)",
+                    xlabel = L"\text{index along slice axis}",
+                    ylabel = L"\text{intensity (scaled)}",
                 )
                 CairoMakie.lines!(axP, spec_x_raw[], spec_y_disp[])
 
                 CairoMakie.save(String(out), f_spec)
                 @info "Saved spectrum" out
-                show_toast!("Saved spectrum → $(out)")
             catch e
                 @error "Failed to save spectrum" out exception=(e, catch_backtrace())
-                show_toast!("Failed to save spectrum")
             end
         end
     end
 
-    # ---------- GIF export ----------
+
+    # ---------- GIF export  ----------
     on(anim_btn.clicks) do _
         a = axis[]; amax = siz[a]
 
+        # bornes / pas / fps depuis les champs
         start = let v = get_box_str(start_box); isempty(v) ? 1 : clamp(something(tryparse(Int, v), 1), 1, amax) end
         stop  = let v = get_box_str(stop_box);  isempty(v) ? amax : clamp(something(tryparse(Int, v), amax), 1, amax) end
         step  = let v = get_box_str(step_box);  isempty(v) ? 1 : max(1, something(tryparse(Int, v), 1)) end
@@ -492,27 +496,48 @@ function carta(
             frames = vcat(frames, reverse(frames[2:end-1]))
         end
 
-        base = get_box_str(fname_box)
-        base = isempty(base) ? fname : base
-        outfile = joinpath(save_dir, "$(base)_axis$(a)_$(first(frames))to$(last(frames))_fps$(fps)_$(String(img_scale_mode[])).gif")
+        # nom strict : <nom_du_fits>.gif (ex: synthetic_cube.gif)
+        outfile = joinpath(save_dir, "$(fname).gif")
+
+        # Figure OFFSCREEN dédiée au GIF (CairoMakie -> pas de fenêtre GL)
+        nx, ny = size(slice_raw[], 2), size(slice_raw[], 1)
+        w_img = 640
+        h_img = Int(round(w_img * ny / nx))
+        extra_for_cb = 80  # un peu de place pour la colorbar
+        fig_gif = CairoMakie.Figure(size = (w_img + extra_for_cb, h_img))
+
+        # Axis minimal : juste l'image
+        axG = CairoMakie.Axis(fig_gif[1, 1]; aspect = DataAspect(), yreversed = true)
+        Makie.hidedecorations!(axG, grid = false)
+
+        # Heatmap alimentée par les observables existantes
+        hmG = CairoMakie.heatmap!(axG, slice_disp; colormap = cm_obs, colorrange = clims_obs)
+
+        # Colorbar liée AU PLOT (pas de colormap passée ici)
+        CairoMakie.Colorbar(fig_gif[1, 2], hmG; label = "intensity (scaled)", width = 20)
 
         try
-            record(fig, outfile, frames; framerate = fps) do fidx
+            record(fig_gif, outfile, frames; framerate = fps) do fidx
+                # on met à jour seulement l'indice de coupe
                 idx[] = fidx
-                ii, jj, kk = uv_to_ijk(u_idx[], v_idx[], axis[], idx[])
-                i_idx[] = clamp(ii, 1, siz[1]); j_idx[] = clamp(jj, 1, siz[2]); k_idx[] = clamp(kk, 1, siz[3])
-                refresh_labels!(); refresh_spectrum!()
             end
             @info "Animation saved: $outfile"
-            show_toast!("GIF saved → $(outfile)")
         catch e
             @error "Failed to export animation $outfile: $e"
-            show_toast!("Failed to export GIF")
         end
     end
 
+
     # ---------- Init ----------
     refresh_all!()
+    keepalive!(fig)
+
+    # Sur Makie, pas de `windowclose`; on écoute `window_open` (Bool)
+    on(fig.scene.events.window_open) do is_open
+        if !is_open
+            forget!(fig)  # autorise le GC une fois la fenêtre fermée
+        end
+    end
     display(fig)
     return fig
 end

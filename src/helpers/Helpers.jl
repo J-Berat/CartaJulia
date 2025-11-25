@@ -1,11 +1,33 @@
-# =========================
-# path: src/helpers/scaling.jl
-# =========================
+#       API stable: apply_scale, clamped_extrema, ijk_to_uv, uv_to_ijk, get_slice,
+#                   make_info_tex, to_cmap, get_box_str, _pick_fig_size,
+#                   latex_safe, make_main_title, make_slice_title, make_spec_title
+
+############################
+# Exports
+############################
 export apply_scale, clamped_extrema
+export ijk_to_uv, uv_to_ijk, get_slice
+export make_info_tex
+export to_cmap, get_box_str, _pick_fig_size
+export latex_safe, make_main_title, make_slice_title, make_spec_title
+
+############################
+# Deps
+############################
+using Makie
+using GLFW
+using LaTeXStrings          
+using MathTeXEngine         
+
+############################
+# Scaling / Extrema
+############################
 
 """
-apply_scale(x, mode::Symbol) -> Array{Float32}
-Scales data for display. Non-positive inputs become NaN for log modes.
+    apply_scale(x, mode::Symbol) -> Array{Float32}
+
+Display modes: :lin | :log10 | :ln.
+In log mode, values ≤ 0 become NaN to avoid -Inf/+Inf.
 """
 function apply_scale(x::AbstractArray, mode::Symbol)
     if mode === :lin
@@ -14,14 +36,14 @@ function apply_scale(x::AbstractArray, mode::Symbol)
         y = similar(x, Float32)
         @inbounds @fastmath for i in eachindex(x)
             xi = x[i]
-            y[i] = xi > 0 ? Float32(log10(xi)) : Float32(NaN32)
+            y[i] = xi > 0 ? Float32(log10(xi)) : Float32(NaN32)  # why: UI-safe
         end
         return y
     elseif mode === :ln
         y = similar(x, Float32)
         @inbounds @fastmath for i in eachindex(x)
             xi = x[i]
-            y[i] = xi > 0 ? Float32(log(xi)) : Float32(NaN32)
+            y[i] = xi > 0 ? Float32(log(xi)) : Float32(NaN32)    # why: UI-safe
         end
         return y
     else
@@ -30,8 +52,9 @@ function apply_scale(x::AbstractArray, mode::Symbol)
 end
 
 """
-clamped_extrema(vals) -> (Float32, Float32)
-Returns safe extrema; widens zero-width ranges and handles all-NaN.
+    clamped_extrema(vals) -> (Float32, Float32)
+
+Ignore NaN, expand zero ranges, fallback to (0,1).
 """
 function clamped_extrema(vals)::Tuple{Float32,Float32}
     f = filter(!isnan, Float32.(vals))
@@ -45,25 +68,26 @@ function clamped_extrema(vals)::Tuple{Float32,Float32}
     return (mn, mx)
 end
 
-
-# =========================
-# path: src/helpers/mapping.jl
-# =========================
-export ijk_to_uv, uv_to_ijk, get_slice
+############################
+# Mapping / Slicing
+############################
 
 """
-ijk_to_uv(i, j, k, axis) -> (u, v)
-Maps 3D voxel indices to 2D slice coords for the chosen axis.
+    ijk_to_uv(i, j, k, axis) -> (u, v)
+
+Map 3D voxel → 2D slice coords.
+axis=1 ⇒ (u=j, v=k), axis=2 ⇒ (u=i, v=k), axis=3 ⇒ (u=i, v=j).
 """
 @inline function ijk_to_uv(i::Int, j::Int, k::Int, axis::Int)
-    axis == 1 && return (j, k)  # slice is (y,z)
-    axis == 2 && return (i, k)  # slice is (x,z)
-    return (i, j)               # axis==3 -> (x,y)
+    axis == 1 && return (j, k)  # (y,z)
+    axis == 2 && return (i, k)  # (x,z)
+    return (i, j)               # (x,y)
 end
 
 """
-uv_to_ijk(u, v, axis, idx) -> (i, j, k)
-Inverse mapping: 2D slice coords + slice index -> 3D voxel.
+    uv_to_ijk(u, v, axis, idx) -> (i, j, k)
+
+Inverse: 2D coords + slice index → 3D voxel.
 """
 @inline function uv_to_ijk(u::Int, v::Int, axis::Int, idx::Int)
     axis == 1 && return (idx, u, v)
@@ -72,58 +96,87 @@ Inverse mapping: 2D slice coords + slice index -> 3D voxel.
 end
 
 """
-get_slice(data, axis, idx) -> Array{Float32,2}
-Returns a Float32 2D view/slice for rendering.
+    get_slice(data::Array{T,3}, axis, idx) -> Array{Float32,2}
+
+Returns a 2D view as Float32, orientation consistent with `ijk_to_uv`.
 """
 function get_slice(data::AbstractArray{T,3}, axis::Integer, idx::Integer) where {T}
     @assert 1 ≤ axis ≤ 3 "axis must be 1,2,3"
     if axis == 1
-        @views return Float32.(data[idx, :, :])
+        @views return Float32.(data[idx, :, :])  # (y,z)
     elseif axis == 2
-        @views return Float32.(data[:, idx, :])
+        @views return Float32.(data[:, idx, :])  # (x,z)
     else
-        @views return Float32.(data[:, :, idx])
+        @views return Float32.(data[:, :, idx])  # (x,y)
     end
 end
 
-
-# =========================
-# path: src/helpers/latex.jl
-# =========================
-export make_info_tex
-using LaTeXStrings
-
-# NOTE: Inline LaTeX only. No line breaks (no `\\` newlines). Thin spaces via `\\,`.
+############################
+# LaTeX helpers (safe)
+############################
 
 """
-make_info_tex(i,j,k,u,v,val) -> LaTeXString
-Inline status text. No line breaks, just thin spaces.
+    latex_safe(s) -> String
+
+Escape special LaTeX characters.
 """
-make_info_tex(i::Int, j::Int, k::Int, u::Int, v::Int, val::Float32) = latexstring(
-    "\\text{pixel }(i,j,k) = ($i,$j,$k)\\,\\text{ ; slice }(\\text{row},\\text{col}) = ($u,$v)\\,\\text{ ; value }= $(isnan(val) ? "NaN" : string(round(val; digits=4)))"
+function latex_safe(s::AbstractString)
+    t = String(s)
+    t = replace(t, "\\" => "\\textbackslash{}")
+    t = replace(t, "_" => "\\_")
+    t = replace(t, "%" => "\\%")
+    t = replace(t, "&" => "\\&")
+    t = replace(t, "#" => "\\#")
+    t = replace(t, "\$" => "\\\$")
+    t = replace(t, "{" => "\\{")
+    t = replace(t, "}" => "\\}")
+    t = replace(t, "^" => "\\^{}")
+    t = replace(t, "~" => "\\~{}")
+    return t
+end
+
+"""
+    make_main_title(fname) -> LaTeXString
+"""
+make_main_title(fname::AbstractString) = latexstring("\\text{", latex_safe(fname), "}")
+
+"""
+    make_slice_title(fname, axis, idx) -> LaTeXString
+"""
+make_slice_title(fname::AbstractString, axis::Int, idx::Int) =
+    latexstring("\\text{", latex_safe(fname), " — slice axis $(axis), index $(idx)}")
+
+"""
+    make_spec_title(i,j,k) -> LaTeXString
+"""
+make_spec_title(i::Int, j::Int, k::Int) =
+    latexstring("\\text{Spectrum at pixel }(i,j,k) = ($i,$j,$k)")
+
+"""
+    make_info_tex(i,j,k,u,v,val) -> LaTeXString
+
+Inline format; no line breaks to keep layout stable.
+"""
+make_info_tex(i::Int, j::Int, k::Int, u::Int, v::Int, val::Real) = latexstring(
+    "\\text{pixel }(i,j,k) = ($i,$j,$k)\\,\\text{ ; slice }(\\text{row},\\text{col}) = ($u,$v)\\,\\text{ ; value }= ",
+    isnan(val) ? "NaN" : string(round(Float32(val); digits=4))
 )
 
-
-
-# =========================
-# path: src/helpers/io.jl
-# =========================
-export to_cmap, get_box_str
-using Makie
+############################
+# IO / UI helpers
+############################
 
 """
-to_cmap(name) -> colormap
-Resolves a Makie colormap from Symbol/String.
+    to_cmap(name::Union{Symbol,String}) -> colormap
+
+Resolve to a Makie colormap.
 """
 to_cmap(name::Union{Symbol,String}) = Makie.to_colormap(Symbol(name))
 
-export get_box_str
-
 """
-get_box_str(textbox) -> String
-Returns the trimmed content of a Makie Textbox.
-- Uses `stored_string[]` when available (committed on Enter/focus out).
-- Falls back to `displayed_string[]` if stored is `nothing` or empty.
+    get_box_str(textbox) -> String
+
+Read the content of a Makie Textbox robustly.
 """
 function get_box_str(tb)
     s = try
@@ -143,65 +196,15 @@ function get_box_str(tb)
     end
 end
 
-
-
-# =========================
-# path: src/helpers/ui.jl
-# =========================
-export _pick_fig_size
-using GLFW
+############################
+# Window size
+############################
 
 """
-_pick_fig_size(fullscreen::Bool, sizeopt) -> (w,h)
-Decide figure size from explicit size or primary monitor.
+    _pick_fig_size(sizeopt) -> (w::Int, h::Int)
+
+Use `sizeopt` if provided, else default.
 """
-@inline function _pick_fig_size(fullscreen::Bool, sizeopt)
-    if sizeopt !== nothing
-        return sizeopt
-    elseif fullscreen
-        try
-            mon  = GLFW.GetPrimaryMonitor()
-            mode = GLFW.GetVideoMode(mon)
-            return (mode.width, mode.height)
-        catch
-            return (1920, 1080)  # fallback
-        end
-    else
-        return (1800, 900)
-    end
+@inline function _pick_fig_size(sizeopt)
+    sizeopt !== nothing ? (Int(sizeopt[1]), Int(sizeopt[2])) : (1200, 800)
 end
-
-# =========================
-# path: src/helpers/title.jl
-# =========================
-export latex_safe, make_main_title, make_slice_title, make_spec_title
-using LaTeXStrings
-
-function latex_safe(s::AbstractString)
-    t = String(s)
-    t = replace(t, "\\" => "\\textbackslash{}")
-    # 2) the usual TeX special chars
-    t = replace(t, "_" => "\\_")
-    t = replace(t, "%" => "\\%")
-    t = replace(t, "&" => "\\&")
-    t = replace(t, "#" => "\\#")
-    t = replace(t, "\$" => "\\\$")            # ← this fixes your ParseError
-    t = replace(t, "{" => "\\{")
-    t = replace(t, "}" => "\\}")
-    t = replace(t, "^" => "\\^{}")
-    t = replace(t, "~" => "\\~{}")
-    return t
-end
-
-# Image title: enforce \text{...}
-make_main_title(fname::AbstractString) = latexstring("\\text{", latex_safe(fname), "}")
-
-# Slice title (for saved slice figure) — inline, no line breaks
-make_slice_title(fname::AbstractString, axis::Int, idx::Int) = latexstring(
-    "\\text{", latex_safe(fname), " — slice axis $(axis), index $(idx)}"
-)
-
-# Spectrum title (inline)
-make_spec_title(i::Int, j::Int, k::Int) = latexstring(
-    "\\text{Spectrum at pixel }(i,j,k) = ($i,$j,$k)"
-)

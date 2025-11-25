@@ -38,7 +38,6 @@ function write_fits(path::AbstractString, data::AbstractArray{<:Real,3})
     FITS(path, "w") do f
         write(f, data)
     end
-    path
 end
 
 # CLI/env overrides
@@ -67,7 +66,7 @@ fits_path = joinpath(outdir, "synthetic_cube.fits")
 
 cube = create_synthetic_cube(nx=nx, ny=ny, nz=nz)
 write_fits(fits_path, cube)
-@info "FITS ready" path=fits_path size=size(cube)
+@debug "FITS ready" path=fits_path size=size(cube)
 
 # Launch UI
 fig = CartaViewer.carta(
@@ -76,7 +75,6 @@ fig = CartaViewer.carta(
     vmin=vmin,
     vmax=vmax,
     invert=false,
-    fullscreen=fullscreen,
 )
 
 #display(fig)
