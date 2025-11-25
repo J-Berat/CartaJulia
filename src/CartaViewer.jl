@@ -142,10 +142,8 @@ function carta(
     fig = Figure(size = _pick_fig_size(figsize))
 
     main_grid = fig[1, 1] = GridLayout()
-    top_grid  = main_grid[1, 1] = GridLayout()
-
     # Image + colorbar
-    img_grid  = top_grid[1, 1] = GridLayout()
+    img_grid  = main_grid[1, 1] = GridLayout()
 
     ax_img = Axis(
         img_grid[1, 1];
@@ -164,7 +162,7 @@ function carta(
     Colorbar(img_grid[1, 2], hm; label = L"\text{intensity (scaled)}", width = 20, tellheight = false)
 
     # Info + spectrum
-    spec_grid = top_grid[1, 2] = GridLayout()
+    spec_grid = main_grid[1, 2] = GridLayout()
     lab_info = Label(
         spec_grid[1, 1];
         text     = make_info_tex(1, 1, 1, 1, 1, 0f0),
@@ -184,9 +182,8 @@ function carta(
     lines!(ax_spec, spec_x_raw, spec_y_disp)
 
     # Controls
-    bottom_grid    = main_grid[2, 1] = GridLayout()
-    img_ctrl_grid  = bottom_grid[1, 1] = GridLayout()
-    spec_ctrl_grid = bottom_grid[1, 2] = GridLayout()
+    img_ctrl_grid  = main_grid[2, 1] = GridLayout()
+    spec_ctrl_grid = main_grid[2, 2] = GridLayout()
 
     # Image controls (row1)
     im_row1_left  = img_ctrl_grid[1, 1] = GridLayout()
@@ -260,7 +257,7 @@ function carta(
     sigma_label = Label(sp_row2_left[1, 3], text = latexstring("\\sigma = 1.5\\,\\text{px}"), fontsize = 12)
 
     sigma_slider = Slider(sp_row2_right[1, 1]; range = LinRange(0, 10, 101), startvalue = 1.5, width = 200, height = 10)
-    bottom_grid[2, 1:2] = Label(; text = "Shortcuts: arrow keys move the crosshair, mouse click picks a voxel, press 'i' to invert the colormap.",
+    main_grid[3, 1:2] = Label(; text = "Shortcuts: arrow keys move the crosshair, mouse click picks a voxel, press 'i' to invert the colormap."
         halign = :left, tellwidth = false)
 
     # ---------- Helpers ----------
