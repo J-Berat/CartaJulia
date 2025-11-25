@@ -258,7 +258,8 @@ function carta(
 
     sigma_slider = Slider(sp_row2_right[1, 1]; range = LinRange(0, 10, 101), startvalue = 1.5, width = 200, height = 10)
     main_grid[3, 1:2] = Label(
-        ; text = "Shortcuts: arrow keys move the crosshair, mouse click picks a voxel, press 'i' to invert the colormap.",
+        main_grid[3, 1:2];
+        text = "Shortcuts: arrow keys move the crosshair, mouse click picks a voxel, press 'i' to invert the colormap.",
         halign = :left,
         tellwidth = false,
     )
