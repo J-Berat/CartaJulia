@@ -15,9 +15,8 @@ export latex_safe, make_main_title, make_slice_title, make_spec_title
 # Deps
 ############################
 using Makie
-using GLFW
-using LaTeXStrings          
-using MathTeXEngine         
+using LaTeXStrings
+using MathTeXEngine       
 
 ############################
 # Scaling / Extrema
@@ -203,8 +202,8 @@ end
 """
     _pick_fig_size(sizeopt) -> (w::Int, h::Int)
 
-Use `sizeopt` if provided, else default.
+Use an explicit size when provided; otherwise, return a fallback `(1800, 900)`.
 """
 @inline function _pick_fig_size(sizeopt)
-    sizeopt !== nothing ? (Int(sizeopt[1]), Int(sizeopt[2])) : (1200, 800)
+    sizeopt !== nothing ? (Int(sizeopt[1]), Int(sizeopt[2])) : (1800, 900)
 end
