@@ -34,7 +34,7 @@ julia --project demo/run_demo.jl
 ```julia
 julia --project
 julia> push!(LOAD_PATH, "src"); using CartaViewer
-julia> fig = CartaViewer.carta("path/to/your_cube.fits"; fullscreen=true)
+julia> fig = CartaViewer.carta("path/to/your_cube.fits"; figsize=(1400, 900))
 ```
 
 ## API
@@ -44,15 +44,13 @@ carta(filepath::String;
       vmin = nothing,                      # Float-like or nothing
       vmax = nothing,                      # Float-like or nothing
       invert::Bool = false,
-      figsize::Union{Nothing,Tuple{Int,Int}} = nothing,  # explicit (w,h), overrides fullscreen
-      save_dir::Union{Nothing,AbstractString} = nothing) # export root (Desktop if present, else CWD)
+      figsize::Union{Nothing,Tuple{Int,Int}} = nothing,
+      save_dir::Union{Nothing,AbstractString} = nothing)
 ```
 Notes:
 - If both `vmin` and `vmax` are provided, manual limits are enabled and the spectrum Y-limits are synced to `[vmin, vmax]`.
-- `fullscreen=true` sizes the figure to your primary monitor resolution.
-- Use `size=(w, h)` for a specific window size (takes precedence over `fullscreen`).
-- Set `save_dir="/path/to/output"` to direct figure/slice/GIF exports; when omitted the viewer writes to your Desktop if it exists,
-  otherwise to the current working directory.
+- Use `figsize=(w, h)` to pick a specific window size; otherwise a reasonable default is chosen.
+- Saved figures default to `~/Desktop` when available, falling back to the current directory; override with `save_dir`
 
 ## UI Tips
 - Arrow keys: move the crosshair (row/col) within the current slice.
@@ -72,5 +70,5 @@ julia --project -e 'using Pkg; Pkg.test()'
 ## Troubleshooting
 - GL window doesn’t appear: ensure you run with a GPU-capable OpenGL context (avoid headless SSH without proper display; on Linux, set `DISPLAY`).
 - Text/LaTeX issues: the viewer uses inline LaTeX via `LaTeXStrings`; no LaTeX line breaks are used.
-- Tiny UI on HiDPI (Retina): try launching with `size=(w, h)`; OS-level scaling also helps.
+- Tiny UI on HiDPI (Retina): try launching with `figsize=(w, h)`; OS-level scaling also helps.
 - GIF export fails headlessly: GIF recording needs an active OpenGL context.
