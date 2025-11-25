@@ -59,7 +59,7 @@ Notes:
 - Image scale / Spectrum scale menus: choose `lin`, `log10`, or `ln`.
 - Gaussian filter: enable the checkbox and tune σ with the slider.
 - Colorbar limits: enter `min` and `max`, then click Apply.
-- Save fig / Save slice+spec: writes to `~/Desktop` (or current directory if Desktop is not available).
+- Save fig / Save slice+spec: writes to `save_dir` (or `~/Desktop`, otherwise current directory).
 - Export GIF: set `start/stop/step/fps`; Ping-pong repeats the sequence forward and backward.
 
 ## Testing
