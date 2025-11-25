@@ -1,7 +1,7 @@
 # path: demo/run_demo.jl
 # Run:
 #   julia --project demo/run_demo.jl
-#   NX=96 NY=72 NZ=48 FULLSCREEN=0 VMIN=5 VMAX=1500 julia --project demo/run_demo.jl 80 60 40
+#   NX=96 NY=72 NZ=48 VMIN=5 VMAX=1500 julia --project demo/run_demo.jl 80 60 40
 
 import Pkg
 Pkg.activate(joinpath(@__DIR__, ".."))
@@ -55,7 +55,6 @@ function _parse_dims()
 end
 
 (nx, ny, nz) = _parse_dims()
-fullscreen = get(ENV, "FULLSCREEN", "1") != "0"
 
 vmin = let s = get(ENV, "VMIN", ""); isempty(s) ? nothing : parse(Float64, s) end
 vmax = let s = get(ENV, "VMAX", ""); isempty(s) ? nothing : parse(Float64, s) end
