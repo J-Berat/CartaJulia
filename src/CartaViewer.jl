@@ -28,12 +28,14 @@ export carta
           vmin = nothing, vmax = nothing,
           invert::Bool = false,
           fullscreen::Bool = false,
-          figsize::Union{Nothing,Tuple{Int,Int}} = nothing)
+          figsize::Union{Nothing,Tuple{Int,Int}} = nothing,
+          save_dir::Union{Nothing,AbstractString} = nothing)
 
 Interactive 3D FITS viewer (slice + per-voxel spectrum).
 - Manual color limits when `vmin` & `vmax` set (also sync spectrum Y).
 - Window sized by explicit `figsize=(w,h)` or a fallback default.
-- Export directory configurable via `save_dir` (defaults to Desktop or CWD).
+- Export directory configurable via `save_dir`; defaults to your Desktop if
+  it exists, otherwise the current working directory.
 """
 function carta(
     filepath::String;
