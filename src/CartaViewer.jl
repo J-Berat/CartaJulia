@@ -12,7 +12,6 @@ using Observables
 using ImageFiltering
 using LaTeXStrings
 using FITSIO
-using GLFW
 
 # ---- helpers ----
 include("helpers/Helpers.jl")
@@ -33,7 +32,8 @@ export carta
 
 Interactive 3D FITS viewer (slice + per-voxel spectrum).
 - Manual color limits when `vmin` & `vmax` set (also sync spectrum Y).
-- Window sized by `fullscreen=true` or explicit `figsize=(w,h)`.
+- Window sized by explicit `figsize=(w,h)` or a fallback default.
+- Export directory configurable via `save_dir` (defaults to Desktop or CWD).
 """
 function carta(
     filepath::String;
@@ -41,7 +41,8 @@ function carta(
     vmin = nothing,
     vmax = nothing,
     invert::Bool = false,
-    figsize::Union{Nothing,Tuple{Int,Int}} = nothing
+    figsize::Union{Nothing,Tuple{Int,Int}} = nothing,
+    save_dir::Union{Nothing,AbstractString} = nothing)
 )
     # ---------- Load ----------
     cube = FITS(filepath) do f
@@ -257,6 +258,8 @@ function carta(
     sigma_label = Label(sp_row2_left[1, 3], text = latexstring("\\sigma = 1.5\\,\\text{px}"), fontsize = 12)
 
     sigma_slider = Slider(sp_row2_right[1, 1]; range = LinRange(0, 10, 101), startvalue = 1.5, width = 200, height = 10)
+    bottom_grid[2, 1:2] = Label(; text = "Shortcuts: arrow keys move the crosshair, mouse click picks a voxel, press 'i' to invert the colormap.",
+        halign = :left, tellwidth = false)
 
     # ---------- Helpers ----------
     function refresh_uv!()
@@ -412,7 +415,16 @@ function carta(
     end
 
     # ---------- Saving ----------
-    save_dir = isdir(joinpath(homedir(), "Desktop")) ? joinpath(homedir(), "Desktop") : pwd()
+    default_desktop = joinpath(homedir(), "Desktop")
+    save_root = if save_dir === nothing
+        isdir(default_desktop) ? default_desktop : pwd()
+    else
+        path = String(save_dir)
+        if !isdir(path)
+            mkpath(path)
+        end
+        path
+    end
 
     make_name = function (base::AbstractString, ext::AbstractString)
         b = isempty(base) ? fname : base
@@ -431,7 +443,7 @@ function carta(
     on(btn_save_img.clicks) do _
         spawn_safely() do
             ext  = String(something(fmt_menu.selection[], "png"))
-            out  = joinpath(save_dir, "$(fname)_idx$(idx[])_axis$(axis[]).$(ext)")  # <--- ICI
+            out  = joinpath(save_root, "$(fname)_idx$(idx[])_axis$(axis[]).$(ext)")
             try
                 f_slice = CairoMakie.Figure(size = (700, 560))
                 axS = CairoMakie.Axis(
@@ -459,8 +471,8 @@ function carta(
         spawn_safely() do
             ext = String(something(fmt_menu.selection[], "png"))
             # nouveau nom : nom_du_FITS_spectre_ij_axis.extension
-            out = joinpath(save_dir,
-                "$(fname)_spectre_i$(i_idx[])_j$(j_idx[])_axis$(axis[]).$(ext)")
+            oout = joinpath(save_root,
+                "$(fname)_spectrum_i$(i_idx[])_j$(j_idx[])_axis$(axis[]).$(ext)")
 
             try
                 f_spec = CairoMakie.Figure(size = (600, 400))
@@ -497,7 +509,7 @@ function carta(
         end
 
         # nom strict : <nom_du_fits>.gif (ex: synthetic_cube.gif)
-        outfile = joinpath(save_dir, "$(fname).gif")
+        outfile = joinpath(save_root, "$(fname).gif")
 
         # Figure OFFSCREEN dédiée au GIF (CairoMakie -> pas de fenêtre GL)
         nx, ny = size(slice_raw[], 2), size(slice_raw[], 1)
