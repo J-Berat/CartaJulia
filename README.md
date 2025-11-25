@@ -70,5 +70,5 @@ julia --project -e 'using Pkg; Pkg.test()'
 ## Troubleshooting
 - GL window doesn’t appear: ensure you run with a GPU-capable OpenGL context (avoid headless SSH without proper display; on Linux, set `DISPLAY`).
 - Text/LaTeX issues: the viewer uses inline LaTeX via `LaTeXStrings`; no LaTeX line breaks are used.
-- Tiny UI on HiDPI (Retina): try `fullscreen=true` or launch with `size=(w, h)`; OS-level scaling also helps.
+- Tiny UI on HiDPI (Retina): try launching with `size=(w, h)`; OS-level scaling also helps.
 - GIF export fails headlessly: GIF recording needs an active OpenGL context.
