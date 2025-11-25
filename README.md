@@ -44,12 +44,15 @@ carta(filepath::String;
       vmin = nothing,                      # Float-like or nothing
       vmax = nothing,                      # Float-like or nothing
       invert::Bool = false,
-      size::Union{Nothing,Tuple{Int,Int}} = nothing)  # explicit (w,h), overrides fullscreen
+      figsize::Union{Nothing,Tuple{Int,Int}} = nothing,  # explicit (w,h), overrides fullscreen
+      save_dir::Union{Nothing,AbstractString} = nothing) # export root (Desktop if present, else CWD)
 ```
 Notes:
 - If both `vmin` and `vmax` are provided, manual limits are enabled and the spectrum Y-limits are synced to `[vmin, vmax]`.
 - `fullscreen=true` sizes the figure to your primary monitor resolution.
 - Use `size=(w, h)` for a specific window size (takes precedence over `fullscreen`).
+- Set `save_dir="/path/to/output"` to direct figure/slice/GIF exports; when omitted the viewer writes to your Desktop if it exists,
+  otherwise to the current working directory.
 
 ## UI Tips
 - Arrow keys: move the crosshair (row/col) within the current slice.
