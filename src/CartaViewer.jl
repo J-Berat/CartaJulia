@@ -44,8 +44,9 @@ function carta(
     vmax = nothing,
     invert::Bool = false,
     figsize::Union{Nothing,Tuple{Int,Int}} = nothing,
-    save_dir::Union{Nothing,AbstractString} = nothing)
-)
+    save_dir::Union{Nothing,AbstractString} = nothing
+    )
+
     # ---------- Load ----------
     cube = FITS(filepath) do f
         read(f[1])
@@ -182,12 +183,20 @@ function carta(
     lines!(ax_spec, spec_x_raw, spec_y_disp)
 
     # Controls
-    img_ctrl_grid  = main_grid[2, 1] = GridLayout()
-    spec_ctrl_grid = main_grid[2, 2] = GridLayout()
+    img_ctrl_grid  = main_grid[2, 1] = GridLayout(; alignmode = Outside(), tellwidth = false, tellheight = false)
+    spec_ctrl_grid = main_grid[2, 2] = GridLayout(; alignmode = Outside(), tellwidth = false, tellheight = false)
+
+    halign!(img_ctrl_grid, :left);  valign!(img_ctrl_grid, :top)
+    halign!(spec_ctrl_grid, :left); valign!(spec_ctrl_grid, :top)
+
+    colgap!(img_ctrl_grid, 10); rowgap!(img_ctrl_grid, 6)
+    colgap!(spec_ctrl_grid, 10); rowgap!(spec_ctrl_grid, 6)
 
     # Image controls (row1)
     im_row1_left  = img_ctrl_grid[1, 1] = GridLayout()
     im_row1_right = img_ctrl_grid[1, 2] = GridLayout()
+    colgap!(im_row1_left, 6);  halign!(im_row1_left, :left)
+    colgap!(im_row1_right, 6); halign!(im_row1_right, :left)
 
     Label(im_row1_left[1, 1], text = L"\text{Image scale}")
     img_scale_menu = Menu(im_row1_left[1, 2]; options = ["lin", "log10", "ln"], prompt = "lin", width = 60)
@@ -198,10 +207,14 @@ function carta(
     invert_chk = Checkbox(im_row1_left[1, 5])
     Label(im_row1_left[1, 6], text = L"\text{Invert colormap}")
 
+    foreach(c -> colsize!(im_row1_left, c, Auto()), 1:6)
+
     Label(im_row1_right[1, 1], text = L"\text{Colorbar limits}")
     clim_min_box   = Textbox(im_row1_right[1, 2]; placeholder = "min", width = 100, height = 24)
     clim_max_box   = Textbox(im_row1_right[1, 3]; placeholder = "max", width = 100, height = 24)
     clim_apply_btn = Button(im_row1_right[1, 4], label = "Apply")
+
+    foreach(c -> colsize!(im_row1_right, c, Auto()), 1:4)
 
     if use_manual[]
         mn, mx = clims_manual[]
@@ -213,6 +226,8 @@ function carta(
     # Image controls (row2)
     im_row2_left  = img_ctrl_grid[2, 1] = GridLayout()
     im_row2_right = img_ctrl_grid[2, 2] = GridLayout()
+    colgap!(im_row2_left, 6);  halign!(im_row2_left, :left)
+    colgap!(im_row2_right, 6); halign!(im_row2_right, :left)
 
     Label(im_row2_left[1, 1], text = L"\text{Save}")
     fmt_menu  = Menu(im_row2_left[1, 2]; options = ["png", "pdf"], prompt = "png", width = 70)
@@ -221,9 +236,13 @@ function carta(
     btn_save_img  = Button(im_row2_right[1, 1], label = "Save image")
     btn_save_spec = Button(im_row2_right[1, 2], label = "Save spectrum")
 
+    foreach(c -> colsize!(im_row2_left, c, Auto()), 1:3)
+    foreach(c -> colsize!(im_row2_right, c, Auto()), 1:2)
+
     # Image controls (row3)
     im_row3_left  = img_ctrl_grid[3, 1] = GridLayout()
     im_row3_right = img_ctrl_grid[3, 2] = GridLayout()
+    colgap!(im_row3_left, 6); halign!(im_row3_left, :left)
 
     Label(im_row3_left[1, 1], text = L"\text{GIF indices}")
     start_box = Textbox(im_row3_left[1, 2]; placeholder = "start", width = 80, height = 24)
@@ -235,11 +254,16 @@ function carta(
     Label(im_row3_left[1, 7], text = L"\text{Back-and-forth mode}")
 
     anim_btn = Button(im_row3_right[1, 1], label = "Export GIF")
+    halign!(im_row3_right, :left)
 
+    foreach(c -> colsize!(im_row3_left, c, Auto()), 1:7)
+    colsize!(im_row3_right, 1, Auto())
     # Spectrum controls
     sp_row1_left  = spec_ctrl_grid[1, 1] = GridLayout()
     sp_row1_right = spec_ctrl_grid[1, 2] = GridLayout()
-
+    
+    colgap!(sp_row1_left, 6);  halign!(sp_row1_left, :left)
+    colgap!(sp_row1_right, 6); halign!(sp_row1_right, :left)
     Label(sp_row1_left[1, 1], text = L"\text{Slice axis}")
     axes_labels = ["dim1 (x)", "dim2 (y)", "dim3 (z)"]
     axis_menu = Menu(sp_row1_left[1, 2]; options = axes_labels, prompt = "dim3 (z)", width = 90)
@@ -249,14 +273,23 @@ function carta(
     Label(sp_row1_right[1, 1], text = L"\text{Index}")
     slice_slider = Slider(sp_row1_right[1, 2]; range = 1:siz[3], startvalue = 1, width = 200, height = 10)
 
+    foreach(c -> colsize!(sp_row1_left, c, Auto()), 1:3)
+
     sp_row2_left  = spec_ctrl_grid[2, 1] = GridLayout()
     sp_row2_right = spec_ctrl_grid[2, 2] = GridLayout()
+    colgap!(sp_row2_left, 6); halign!(sp_row2_left, :left)
+    halign!(sp_row1_right, :left)
+
+    foreach(c -> colsize!(sp_row1_right, c, Auto()), 1:2)
 
     Label(sp_row2_left[1, 1], text = L"\text{Gaussian filter}")
     gauss_chk   = Checkbox(sp_row2_left[1, 2])
     sigma_label = Label(sp_row2_left[1, 3], text = latexstring("\\sigma = 1.5\\,\\text{px}"), fontsize = 12)
 
     sigma_slider = Slider(sp_row2_right[1, 1]; range = LinRange(0, 10, 101), startvalue = 1.5, width = 200, height = 10)
+    halign!(sp_row2_right, :left)
+    foreach(c -> colsize!(sp_row2_left, c, Auto()), 1:3)
+    colsize!(sp_row2_right, 1, Auto())
     main_grid[3, 1:2] = Label(
         main_grid[3, 1:2];
         text = "Shortcuts: arrow keys move the crosshair, mouse click picks a voxel, press 'i' to invert the colormap.",
