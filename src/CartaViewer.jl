@@ -152,7 +152,6 @@ function carta(
         xlabel    = L"\text{pixel } x",
         ylabel    = L"\text{pixel } y",
         aspect    = DataAspect(),
-        yreversed = true,
     )
 
     uv_point = Observable(Point2f(1, 1))
@@ -160,23 +159,24 @@ function carta(
     scatter!(ax_img, lift(p -> [p], uv_point); markersize = 10)
 
     # Colorbar linked to plot; tellheight=false avoids layout feedback loops
-    Colorbar(img_grid[1, 2], hm; label = L"\text{intensity (scaled)}", width = 20, tellheight = false)
+    Colorbar(img_grid[1, 2], hm; label = L"\text{intensity}", width = 20, tellheight = false)
 
     # Info + spectrum
     spec_grid = main_grid[1, 2] = GridLayout()
     lab_info = Label(
         spec_grid[1, 1];
-        text     = make_info_tex(1, 1, 1, 1, 1, 0f0),
-        halign   = :left,
-        valign   = :top,
-        fontsize = 14,
+        text      = make_info_tex(1, 1, 1, 1, 1, 0f0),
+        halign    = :left,
+        valign    = :top,
+        fontsize  = 14,
+        tellwidth = false,
     )
 
     ax_spec = Axis(
         spec_grid[2, 1];
         title  = L"\text{Spectrum at selected pixel}",
         xlabel = L"\text{index along slice axis}",
-        ylabel = L"\text{intensity (scaled)}",
+        ylabel = L"\text{intensity}",
         width  = 600,
         height = 400,
     )
@@ -186,35 +186,64 @@ function carta(
     img_ctrl_grid  = main_grid[2, 1] = GridLayout(; alignmode = Outside(), tellwidth = false, tellheight = false)
     spec_ctrl_grid = main_grid[2, 2] = GridLayout(; alignmode = Outside(), tellwidth = false, tellheight = false)
 
-    halign!(img_ctrl_grid, :left);  valign!(img_ctrl_grid, :top)
-    halign!(spec_ctrl_grid, :left); valign!(spec_ctrl_grid, :top)
-
-    colgap!(img_ctrl_grid, 10); rowgap!(img_ctrl_grid, 6)
-    colgap!(spec_ctrl_grid, 10); rowgap!(spec_ctrl_grid, 6)
+    colgap!(img_ctrl_grid, 6); rowgap!(img_ctrl_grid, 6)
+    colgap!(spec_ctrl_grid, 6); rowgap!(spec_ctrl_grid, 6)
 
     # Image controls (row1)
-    im_row1_left  = img_ctrl_grid[1, 1] = GridLayout()
-    im_row1_right = img_ctrl_grid[1, 2] = GridLayout()
-    colgap!(im_row1_left, 6);  halign!(im_row1_left, :left)
-    colgap!(im_row1_right, 6); halign!(im_row1_right, :left)
+    im_row1 = img_ctrl_grid[1, 1:2] = GridLayout(; alignmode = Outside())
+    colgap!(im_row1, 6)
 
-    Label(im_row1_left[1, 1], text = L"\text{Image scale}")
-    img_scale_menu = Menu(im_row1_left[1, 2]; options = ["lin", "log10", "ln"], prompt = "lin", width = 60)
+    Label(im_row1[1, 1], text = L"\text{Image scale}", halign = :left, tellwidth = false)
+    img_scale_menu = Menu(im_row1[1, 2]; options = ["lin", "log10", "ln"], prompt = "lin", width = 60)
 
-    Label(im_row1_left[1, 3], text = L"\text{Spectrum scale}")
-    spec_scale_menu = Menu(im_row1_left[1, 4]; options = ["lin", "log10", "ln"], prompt = "lin", width = 60)
+    Label(im_row1[1, 3], text = L"\text{Spectrum scale}", halign = :left, tellwidth = false)
+    spec_scale_menu = Menu(im_row1[1, 4]; options = ["lin", "log10", "ln"], prompt = "lin", width = 60)
 
-    invert_chk = Checkbox(im_row1_left[1, 5])
-    Label(im_row1_left[1, 6], text = L"\text{Invert colormap}")
+    invert_chk = Checkbox(im_row1[1, 5])
+    Label(im_row1[1, 6], text = L"\text{Invert colormap}", halign = :left, tellwidth = false)
 
-    foreach(c -> colsize!(im_row1_left, c, Auto()), 1:6)
+    reset_zoom_btn = Button(im_row1[1, 7]; label = "Reset zoom", width = 96, height = 26)
 
-    Label(im_row1_right[1, 1], text = L"\text{Colorbar limits}")
-    clim_min_box   = Textbox(im_row1_right[1, 2]; placeholder = "min", width = 100, height = 24)
-    clim_max_box   = Textbox(im_row1_right[1, 3]; placeholder = "max", width = 100, height = 24)
-    clim_apply_btn = Button(im_row1_right[1, 4], label = "Apply")
+    foreach(c -> colsize!(im_row1, c, Auto()), 1:7)
 
-    foreach(c -> colsize!(im_row1_right, c, Auto()), 1:4)
+    # Image controls (row2)
+    im_row2 = img_ctrl_grid[2, 1:2] = GridLayout(; alignmode = Outside())
+    colgap!(im_row2, 4)
+
+    Label(im_row2[1, 1], text = L"\text{Save}", halign = :left, tellwidth = false)
+    fmt_menu  = Menu(im_row2[1, 2]; options = ["png", "pdf"], prompt = "png", width = 60)
+    fname_box = Textbox(im_row2[1, 3]; placeholder = "filename base", width = 150, height = 24)
+    btn_save_img  = Button(im_row2[1, 4]; label = "Save image", width = 96, height = 26)
+    btn_save_spec = Button(im_row2[1, 5]; label = "Save spectrum", width = 118, height = 26)
+
+    foreach(c -> colsize!(im_row2, c, Auto()), 1:5)
+
+    # Image controls (row3)
+    im_row3 = img_ctrl_grid[3, 1:2] = GridLayout(; alignmode = Outside())
+    colgap!(im_row3, 6)
+
+    Label(im_row3[1, 1], text = L"\text{GIF indices}", halign = :left, tellwidth = false)
+    start_box = Textbox(im_row3[1, 2]; placeholder = "start", width = 70, height = 26)
+    stop_box  = Textbox(im_row3[1, 3]; placeholder = "stop",  width = 70, height = 26)
+    step_box  = Textbox(im_row3[1, 4]; placeholder = "step",  width = 70, height = 26)
+    fps_box   = Textbox(im_row3[1, 5]; placeholder = "fps",   width = 70, height = 26)
+
+    pingpong_chk = Checkbox(im_row3[1, 6])
+    Label(im_row3[1, 7], text = L"\text{Back-and-forth mode}", halign = :left, tellwidth = false)
+    anim_btn = Button(im_row3[1, 8], label = "Export GIF")
+
+    foreach(c -> colsize!(im_row3, c, Auto()), 1:8)
+
+    # Image controls (row4)
+    im_row4 = img_ctrl_grid[4, 1:2] = GridLayout(; alignmode = Outside())
+    colgap!(im_row4, 6)
+
+    Label(im_row4[1, 1], text = L"\text{Colorbar limits}", halign = :left, tellwidth = false)
+    clim_min_box   = Textbox(im_row4[1, 2]; placeholder = "min", width = 100, height = 24)
+    clim_max_box   = Textbox(im_row4[1, 3]; placeholder = "max", width = 100, height = 24)
+    clim_apply_btn = Button(im_row4[1, 4], label = "Apply")
+
+    foreach(c -> colsize!(im_row4, c, Auto()), 1:4)
 
     if use_manual[]
         mn, mx = clims_manual[]
@@ -223,77 +252,44 @@ function carta(
         clim_max_box.displayed_string[] = s_mx; clim_max_box.stored_string[] = s_mx
     end
 
-    # Image controls (row2)
-    im_row2_left  = img_ctrl_grid[2, 1] = GridLayout()
-    im_row2_right = img_ctrl_grid[2, 2] = GridLayout()
-    colgap!(im_row2_left, 6);  halign!(im_row2_left, :left)
-    colgap!(im_row2_right, 6); halign!(im_row2_right, :left)
+    # Spectrum controls moved under the image controls for easier access
+    im_row5 = img_ctrl_grid[5, 1:2] = GridLayout(; alignmode = Outside())
+    colgap!(im_row5, 6)
 
-    Label(im_row2_left[1, 1], text = L"\text{Save}")
-    fmt_menu  = Menu(im_row2_left[1, 2]; options = ["png", "pdf"], prompt = "png", width = 70)
-    fname_box = Textbox(im_row2_left[1, 3]; placeholder = "filename base", width = 220, height = 24)
-
-    btn_save_img  = Button(im_row2_right[1, 1], label = "Save image")
-    btn_save_spec = Button(im_row2_right[1, 2], label = "Save spectrum")
-
-    foreach(c -> colsize!(im_row2_left, c, Auto()), 1:3)
-    foreach(c -> colsize!(im_row2_right, c, Auto()), 1:2)
-
-    # Image controls (row3)
-    im_row3_left  = img_ctrl_grid[3, 1] = GridLayout()
-    im_row3_right = img_ctrl_grid[3, 2] = GridLayout()
-    colgap!(im_row3_left, 6); halign!(im_row3_left, :left)
-
-    Label(im_row3_left[1, 1], text = L"\text{GIF indices}")
-    start_box = Textbox(im_row3_left[1, 2]; placeholder = "start", width = 80, height = 24)
-    stop_box  = Textbox(im_row3_left[1, 3]; placeholder = "stop",  width = 80, height = 24)
-    step_box  = Textbox(im_row3_left[1, 4]; placeholder = "step",  width = 80, height = 24)
-    fps_box   = Textbox(im_row3_left[1, 5]; placeholder = "fps",   width = 80, height = 24)
-
-    pingpong_chk = Checkbox(im_row3_left[1, 6])
-    Label(im_row3_left[1, 7], text = L"\text{Back-and-forth mode}")
-
-    anim_btn = Button(im_row3_right[1, 1], label = "Export GIF")
-    halign!(im_row3_right, :left)
-
-    foreach(c -> colsize!(im_row3_left, c, Auto()), 1:7)
-    colsize!(im_row3_right, 1, Auto())
-    # Spectrum controls
-    sp_row1_left  = spec_ctrl_grid[1, 1] = GridLayout()
-    sp_row1_right = spec_ctrl_grid[1, 2] = GridLayout()
-    
-    colgap!(sp_row1_left, 6);  halign!(sp_row1_left, :left)
-    colgap!(sp_row1_right, 6); halign!(sp_row1_right, :left)
-    Label(sp_row1_left[1, 1], text = L"\text{Slice axis}")
+    Label(im_row5[1, 1], text = L"\text{Slice axis}", halign = :left, tellwidth = false)
     axes_labels = ["dim1 (x)", "dim2 (y)", "dim3 (z)"]
-    axis_menu = Menu(sp_row1_left[1, 2]; options = axes_labels, prompt = "dim3 (z)", width = 90)
+    axis_menu = Menu(im_row5[1, 2]; options = axes_labels, prompt = "dim3 (z)", width = 90)
+    status_label = Label(
+        im_row5[1, 3];
+        text      = latexstring("\\text{axis } 3,\\, \\text{index } 1"),
+        fontsize  = 12,
+        halign    = :left,
+        tellwidth = false,
+    )
+    Label(im_row5[1, 4], text = L"\text{Index}", halign = :left, tellwidth = false)
+    slice_slider = Slider(im_row5[1, 5]; range = 1:siz[3], startvalue = 1, width = 200, height = 10)
 
-    status_label = Label(sp_row1_left[1, 3], text = latexstring("\\text{axis } 3,\\, \\text{index } 1"), fontsize = 12)
+    foreach(c -> colsize!(im_row5, c, Auto()), 1:5)
 
-    Label(sp_row1_right[1, 1], text = L"\text{Index}")
-    slice_slider = Slider(sp_row1_right[1, 2]; range = 1:siz[3], startvalue = 1, width = 200, height = 10)
+    im_row6 = img_ctrl_grid[6, 1:2] = GridLayout(; alignmode = Outside())
+    colgap!(im_row6, 6)
 
-    foreach(c -> colsize!(sp_row1_left, c, Auto()), 1:3)
+    Label(im_row6[1, 1], text = L"\text{Gaussian filter}", halign = :left, tellwidth = false)
+    gauss_chk   = Checkbox(im_row6[1, 2])
+    sigma_label = Label(
+        im_row6[1, 3];
+        text      = latexstring("\\sigma = 1.5\\,\\text{px}"),
+        fontsize  = 12,
+        halign    = :left,
+        tellwidth = false,
+    )
 
-    sp_row2_left  = spec_ctrl_grid[2, 1] = GridLayout()
-    sp_row2_right = spec_ctrl_grid[2, 2] = GridLayout()
-    colgap!(sp_row2_left, 6); halign!(sp_row2_left, :left)
-    halign!(sp_row1_right, :left)
-
-    foreach(c -> colsize!(sp_row1_right, c, Auto()), 1:2)
-
-    Label(sp_row2_left[1, 1], text = L"\text{Gaussian filter}")
-    gauss_chk   = Checkbox(sp_row2_left[1, 2])
-    sigma_label = Label(sp_row2_left[1, 3], text = latexstring("\\sigma = 1.5\\,\\text{px}"), fontsize = 12)
-
-    sigma_slider = Slider(sp_row2_right[1, 1]; range = LinRange(0, 10, 101), startvalue = 1.5, width = 200, height = 10)
-    halign!(sp_row2_right, :left)
-    foreach(c -> colsize!(sp_row2_left, c, Auto()), 1:3)
-    colsize!(sp_row2_right, 1, Auto())
+    sigma_slider = Slider(im_row6[1, 4]; range = LinRange(0, 10, 101), startvalue = 1.5, width = 200, height = 10)
+    foreach(c -> colsize!(im_row6, c, Auto()), 1:4)
     main_grid[3, 1:2] = Label(
         main_grid[3, 1:2];
-        text = "Shortcuts: arrow keys move the crosshair, mouse click picks a voxel, press 'i' to invert the colormap.",
-        halign = :left,
+        text      = "Shortcuts: arrow keys move the crosshair, mouse click picks a voxel, press 'i' to invert the colormap.",
+        halign    = :left,
         tellwidth = false,
     )
 
@@ -343,6 +339,10 @@ function carta(
         else
             autolimits!(ax_spec)
         end
+    end
+
+    on(reset_zoom_btn.clicks) do _
+        autolimits!(ax_img)
     end
 
     # ---------- UI callbacks ----------
@@ -435,10 +435,9 @@ function carta(
     # Mouse pick
     on(events(ax_img).mousebutton) do ev
         if ev.button == Mouse.left && ev.action == Mouse.press
-            mp = events(ax_img).mouseposition[]
-            p = to_world(ax_img.scene, events(ax_img).mouseposition[])
+            p = mouseposition(ax_img)
             if any(isnan, p)
-                return  # pas de conversion en Int si hors axe
+                return  
             end
             u = Int(round(clamp(p[2], 1, size(slice_raw[], 1))))
             v = Int(round(clamp(p[1], 1, size(slice_raw[], 2))))
@@ -467,12 +466,12 @@ function carta(
         return "$(b)_axis$(axis[])_idx$(idx[])_i$(i_idx[])_j$(j_idx[])_k$(k_idx[])_img$(String(img_scale_mode[]))_spec$(String(spec_scale_mode[])).$(ext)"
     end
 
-    # utilitaire asynchrone (si pas déjà présent)
+    # Async helper (no-op if it already exists)
     spawn_safely(f::Function) = @async try f() catch e
         @error "Background task failed" exception=(e, catch_backtrace())
     end
 
-    # Export unifié (laisser Makie/Cairo décider)
+    # Unified export (let Makie/Cairo choose the backend)
     save_with_format(path::AbstractString, fig) = CairoMakie.save(String(path), fig)
 
     # ---------- Save image (slice + colorbar + crosshair) ----------
@@ -492,7 +491,7 @@ function carta(
                 )
                 hmS = CairoMakie.heatmap!(axS, slice_disp[]; colormap = cm_obs[], colorrange = clims_obs[])
                 CairoMakie.scatter!(axS, [Point2f(uv_point[]...)], markersize = 10)
-                CairoMakie.Colorbar(f_slice[1, 2], hmS; label = "intensity (scaled)", width = 20)
+                CairoMakie.Colorbar(f_slice[1, 2], hmS; label = "intensity", width = 20)
 
                 CairoMakie.save(String(out), f_slice)
                 @info "Saved image" out
@@ -506,7 +505,6 @@ function carta(
     on(btn_save_spec.clicks) do _
         spawn_safely() do
             ext = String(something(fmt_menu.selection[], "png"))
-            # nouveau nom : nom_du_FITS_spectre_ij_axis.extension
             oout = joinpath(save_root,
                 "$(fname)_spectrum_i$(i_idx[])_j$(j_idx[])_axis$(axis[]).$(ext)")
 
@@ -516,7 +514,7 @@ function carta(
                     f_spec[1, 1];
                     title  = make_spec_title(i_idx[], j_idx[], k_idx[]),
                     xlabel = L"\text{index along slice axis}",
-                    ylabel = L"\text{intensity (scaled)}",
+                    ylabel = L"\text{intensity}",
                 )
                 CairoMakie.lines!(axP, spec_x_raw[], spec_y_disp[])
 
@@ -533,7 +531,6 @@ function carta(
     on(anim_btn.clicks) do _
         a = axis[]; amax = siz[a]
 
-        # bornes / pas / fps depuis les champs
         start = let v = get_box_str(start_box); isempty(v) ? 1 : clamp(something(tryparse(Int, v), 1), 1, amax) end
         stop  = let v = get_box_str(stop_box);  isempty(v) ? amax : clamp(something(tryparse(Int, v), amax), 1, amax) end
         step  = let v = get_box_str(step_box);  isempty(v) ? 1 : max(1, something(tryparse(Int, v), 1)) end
@@ -544,29 +541,21 @@ function carta(
             frames = vcat(frames, reverse(frames[2:end-1]))
         end
 
-        # nom strict : <nom_du_fits>.gif (ex: synthetic_cube.gif)
+        # strict name: <fits_name>.gif (e.g., synthetic_cube.gif)
         outfile = joinpath(save_root, "$(fname).gif")
-
-        # Figure OFFSCREEN dédiée au GIF (CairoMakie -> pas de fenêtre GL)
         nx, ny = size(slice_raw[], 2), size(slice_raw[], 1)
         w_img = 640
         h_img = Int(round(w_img * ny / nx))
-        extra_for_cb = 80  # un peu de place pour la colorbar
+        extra_for_cb = 80 # colorbar space
         fig_gif = CairoMakie.Figure(size = (w_img + extra_for_cb, h_img))
-
-        # Axis minimal : juste l'image
         axG = CairoMakie.Axis(fig_gif[1, 1]; aspect = DataAspect(), yreversed = true)
         Makie.hidedecorations!(axG, grid = false)
 
-        # Heatmap alimentée par les observables existantes
         hmG = CairoMakie.heatmap!(axG, slice_disp; colormap = cm_obs, colorrange = clims_obs)
-
-        # Colorbar liée AU PLOT (pas de colormap passée ici)
-        CairoMakie.Colorbar(fig_gif[1, 2], hmG; label = "intensity (scaled)", width = 20)
+        CairoMakie.Colorbar(fig_gif[1, 2], hmG; label = "intensity", width = 20)
 
         try
             record(fig_gif, outfile, frames; framerate = fps) do fidx
-                # on met à jour seulement l'indice de coupe
                 idx[] = fidx
             end
             @info "Animation saved: $outfile"
@@ -580,10 +569,9 @@ function carta(
     refresh_all!()
     keepalive!(fig)
 
-    # Sur Makie, pas de `windowclose`; on écoute `window_open` (Bool)
     on(fig.scene.events.window_open) do is_open
         if !is_open
-            forget!(fig)  # autorise le GC une fois la fenêtre fermée
+            forget!(fig)  
         end
     end
     display(fig)

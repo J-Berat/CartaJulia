@@ -2,11 +2,11 @@
 import Pkg
 using Test
 
-# charge le module local
+# load the local module
 push!(LOAD_PATH, joinpath(@__DIR__, "..", "src"))
 using CartaViewer
 
-# deps utilisées par les helpers
+# deps used by the helpers
 using Observables
 using Makie
 using LaTeXStrings
@@ -42,7 +42,7 @@ using ColorTypes
 end
 
 @testset "helpers: mapping" begin
-    # bijection uv <-> ijk selon l'axe
+    # bijection uv <-> ijk depending on the axis
     for axis in 1:3
         i, j, k = 3, 2, 1
         u, v = CartaViewer.ijk_to_uv(i, j, k, axis)
@@ -50,7 +50,7 @@ end
         @test (ii, jj, kk) == (i, j, k)
     end
 
-    # get_slice dims et type
+    # get_slice dims and type
     data = Array{Float32}(undef, 7, 5, 4)
     fill!(data, 1f0)
     s1 = CartaViewer.get_slice(data, 1, 2)
@@ -71,7 +71,7 @@ end
     @test t1 isa LaTeXString
     @test t2 isa LaTeXString
 
-    # Pas de sauts de ligne LaTeX : interdit "\\ " et "\\\n"
+    # No LaTeX line breaks: forbid "\\ " and "\\\n"
     raw_s  = String(s)
     raw_t1 = String(t1)
     raw_t2 = String(t2)
@@ -80,7 +80,7 @@ end
         @test !occursin("\\\\\\n", raw)
     end
 
-    # Présence de LaTeX inline attendue (ex: \\, pour espace fine)
+    # Expect inline LaTeX (e.g., \\, for thin space)
     @test occursin("\\\\,", raw_s) || occursin("\\\\,", raw_t1) || occursin("\\\\,", raw_t2)
 end
 
@@ -90,7 +90,7 @@ end
     @test length(cm) > 0
     @test cm[1] isa ColorTypes.Colorant
 
-    # get_box_str via mock (pas de Textbox Makie)
+    # get_box_str via mock (no Makie Textbox available)
     struct MockTB
         stored_string::Observable{String}
     end
@@ -105,8 +105,8 @@ end
 end
 
 @testset "helpers: ui" begin
-    # override explicite
+    # explicit override
     @test CartaViewer._pick_fig_size((111, 222)) == (111, 222)
-    # défaut sans taille explicite
+    # default when no explicit size is provided
     @test CartaViewer._pick_fig_size(nothing) == (1800, 900)
 end
