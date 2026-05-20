@@ -64,18 +64,51 @@ function load_fits(
             "MANTA: failed to read FITS primary HDU in $(abspath(filepath)). " *
             "Original error: $(primary_error === nothing ? "(unknown)" : sprint(showerror, primary_error))"))
     end
+    if ndims(raw) == 1
+        return _load_vector_fits(filepath, raw, header)
+    end
     if ndims(raw) == 2
         return _load_image_fits(filepath, raw, header)
     end
     if ndims(raw) != 3
         throw(ArgumentError(
-            "MANTA: Expected a 3D FITS cube or 2D image in $(abspath(filepath)), " *
+            "MANTA: Expected a 3D FITS cube, 2D image or 1D vector in $(abspath(filepath)), " *
             "got ndims=$(ndims(raw)) and size=$(size(raw))."))
     end
     return _load_cube_fits(filepath, raw, header)
 end
 
 # ---- internal helpers (one per dataset kind) ----
+
+function _load_vector_fits(filepath::AbstractString, raw, header)
+    data = as_float32(raw)
+    # Parse the WCS for axis 1. `read_simple_wcs` always returns a length-1
+    # vector here; we keep the axis only when it is actually available so the
+    # viewer's fast `ds.wcs !== nothing` branch implies a usable mapping.
+    wcs_axes = header === nothing ? SimpleWCSAxis[] : read_simple_wcs(header, 1)
+    raw_axis = isempty(wcs_axes) ? nothing : wcs_axes[1]
+    wcs_axis = (raw_axis === nothing || !raw_axis.available) ? nothing : raw_axis
+    # `axis_label` is stored as a plain String on the dataset. When WCS is
+    # absent, fall back to "index"; otherwise expose the raw CTYPE base name
+    # (with unit) so downstream tools can echo it back without parsing LaTeX.
+    axis_label = if wcs_axis === nothing
+        "index"
+    else
+        name = isempty(wcs_axis.ctype_base) ? "axis1" : wcs_axis.ctype_base
+        isempty(wcs_axis.cunit) ? name : "$(name) [$(wcs_axis.cunit)]"
+    end
+    unit_label = data_unit_label(header; fallback = "value")
+    fname = String(replace(basename(filepath), r"\.fits(\.gz)?$" => ""))
+    meta = Dict{Symbol,Any}(:fits_header => header,
+                            :fits_path => abspath(String(filepath)))
+    return VectorDataset(data;
+        axis_label = axis_label,
+        wcs = wcs_axis,
+        unit_label = unit_label,
+        source_id = fname,
+        metadata = meta,
+    )
+end
 
 function _load_image_fits(filepath::AbstractString, raw, header)
     data = as_float32(raw)

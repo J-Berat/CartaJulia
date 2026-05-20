@@ -954,10 +954,168 @@ end
     @test fig_hpix_cube isa Makie.Figure
     MANTA.forget!(fig_hpix_cube)
 
-    # VectorDataset is still explicitly unsupported.
+    # VectorDataset now has a dedicated 1D viewer.
     vds = MANTA.load_dataset(rand(Float32, 16))
     @test vds isa MANTA.VectorDataset
-    @test_throws ErrorException MANTA.manta(vds; activate_gl = false, display_fig = false)
+    fig_vec = MANTA.manta(vds; activate_gl = false, display_fig = false,
+                          figsize = (700, 450))
+    @test fig_vec isa Makie.Figure
+    MANTA.forget!(fig_vec)
+end
+
+@testset "dispatch: vector viewer" begin
+    # ---- Pure helpers (no Makie state required) ----
+    @testset "selection helpers" begin
+        xs = Float64.(1:10)
+        # Full range when sel === nothing.
+        r = MANTA._vector_selection_indices(xs, nothing)
+        @test r === 1:10
+        # Inclusive bounds on a monotonic axis.
+        r = MANTA._vector_selection_indices(xs, (3.0, 7.0))
+        @test r == 3:7
+        # Out-of-range high bound clamps to length.
+        r = MANTA._vector_selection_indices(xs, (5.0, 100.0))
+        @test r == 5:10
+        # Empty intersection → empty range, NOT an error.
+        r = MANTA._vector_selection_indices(xs, (100.0, 200.0))
+        @test isempty(r)
+        # Empty input vector → empty range, never throws.
+        r = MANTA._vector_selection_indices(Float64[], (0.0, 1.0))
+        @test isempty(r)
+        # Non-monotonic fallback: pick the first/last matching index.
+        xs2 = [1.0, 5.0, 2.0, 8.0, 3.0]
+        r = MANTA._vector_selection_indices(xs2, (2.0, 5.0))
+        @test r == 2:5
+    end
+
+    @testset "stats helpers" begin
+        s = MANTA._vector_stats([1.0, 2.0, 3.0, 4.0, 5.0])
+        @test s.n == 5
+        @test s.n_finite == 5
+        @test s.n_nan == 0
+        @test s.min == 1.0
+        @test s.max == 5.0
+        @test s.mean ≈ 3.0
+        @test s.median == 3.0
+        # std uses the corrected (n-1) estimator.
+        @test s.std ≈ sqrt(2.5)
+
+        s2 = MANTA._vector_stats([1.0, NaN, 3.0])
+        @test s2.n == 3
+        @test s2.n_finite == 2
+        @test s2.n_nan == 1
+        @test s2.min == 1.0
+        @test s2.max == 3.0
+
+        # All-NaN vector: finite stats degrade to NaN, no exception.
+        s3 = MANTA._vector_stats([NaN, NaN])
+        @test s3.n_finite == 0
+        @test isnan(s3.mean)
+        @test isnan(s3.std)
+        @test isnan(s3.median)
+    end
+
+    @testset "parse range" begin
+        ok, manual, bounds, _ = MANTA._parse_vector_range("", ""; fallback = (0.0, 1.0))
+        @test ok && !manual
+        @test bounds == (0.0, 1.0)
+
+        ok, manual, bounds, _ = MANTA._parse_vector_range("1", ""; fallback = (0.0, 1.0))
+        @test !ok && !manual
+
+        ok, manual, bounds, _ = MANTA._parse_vector_range("abc", "5"; fallback = (0.0, 1.0))
+        @test !ok
+
+        ok, manual, bounds, _ = MANTA._parse_vector_range("5", "1"; fallback = (0.0, 1.0))
+        @test ok && manual
+        # Swapped automatically.
+        @test bounds == (1.0, 5.0)
+
+        ok, manual, bounds, _ = MANTA._parse_vector_range("2", "2"; fallback = (0.0, 1.0))
+        @test ok && manual
+        @test bounds[1] < 2.0 < bounds[2]
+    end
+
+    # ---- Figure creation (headless) ----
+    @testset "view from VectorDataset" begin
+        ys = Float32.(sin.(range(0.0, 4π; length = 64)))
+        vds = MANTA.VectorDataset(ys;
+            axis_label = "index",
+            unit_label = "K",
+            source_id  = "synthetic_vec",
+        )
+        fig = MANTA.manta(vds;
+            activate_gl = false, display_fig = false,
+            figsize = (640, 420))
+        @test fig isa Makie.Figure
+        MANTA.forget!(fig)
+
+        # AbstractVector bridge: bypass explicit dataset construction.
+        fig2 = MANTA.manta(collect(1.0:32.0);
+            activate_gl = false, display_fig = false,
+            figsize = (640, 420))
+        @test fig2 isa Makie.Figure
+        MANTA.forget!(fig2)
+
+        # Log scales must not crash on a positive vector.
+        fig3 = MANTA.manta(collect(1.0:32.0);
+            xscale = :lin, yscale = :log10,
+            activate_gl = false, display_fig = false,
+            figsize = (640, 420))
+        @test fig3 isa Makie.Figure
+        MANTA.forget!(fig3)
+    end
+
+    @testset "view from 1D FITS file" begin
+        mktempdir() do tmp
+            path = joinpath(tmp, "vec1d.fits")
+            FITS(path, "w") do f
+                keys = String["BUNIT", "CTYPE1", "CRVAL1", "CRPIX1", "CDELT1", "CUNIT1"]
+                vals = Any["Jy",    "FREQ",   1.0e9,    1.0,       1.0e6,    "Hz"]
+                comms = String["",   "",       "",       "",        "",       ""]
+                hdr = FITSIO.FITSHeader(keys, vals, comms)
+                write(f, Float32.(collect(1:16)); header = hdr)
+            end
+            ds = MANTA.load_dataset(path)
+            @test ds isa MANTA.VectorDataset
+            @test ds.wcs !== nothing
+            @test ds.unit_label == "Jy"
+            fig = MANTA.manta(ds;
+                activate_gl = false, display_fig = false,
+                figsize = (640, 420))
+            @test fig isa Makie.Figure
+            MANTA.forget!(fig)
+        end
+    end
+
+    @testset "CSV export round-trip" begin
+        ys = Float64[1.0, 2.0, 3.0, 4.0, NaN]
+        vds = MANTA.VectorDataset(ys;
+            axis_label = "index", unit_label = "K",
+            source_id = "csv_export_test")
+        xs, _ = MANTA._vector_x_axis(vds)
+        mktempdir() do tmp
+            out = joinpath(tmp, "vec.csv")
+            MANTA._write_vector_csv(out, xs, ys, 1:length(ys),
+                (source_id = vds.source_id,
+                 axis_label = vds.axis_label,
+                 unit_label = vds.unit_label))
+            txt = read(out, String)
+            # Comment header with provenance.
+            @test occursin("# source=csv_export_test", txt)
+            @test occursin("# axis_label=index", txt)
+            @test occursin("# unit_label=K", txt)
+            # CSV body header is the literal "x,y".
+            @test occursin("x,y", txt)
+            # NaN values are written explicitly so external tools can detect
+            # missing samples.
+            @test occursin("NaN", txt)
+            # The four finite rows are all present.
+            for v in ("1.0", "2.0", "3.0", "4.0")
+                @test occursin(v, txt)
+            end
+        end
+    end
 end
 
 @testset "view_cube: respects dataset fields" begin

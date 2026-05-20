@@ -183,8 +183,36 @@ cube = rand(64, 64, 32)
 MANTA.manta(cube; cmap=:magma)
 ```
 
-1D vectors can be loaded as internal datasets, but their dedicated viewer is not
-implemented yet.
+1D vectors have a dedicated viewer with a `lines` plot, live statistics over an
+optional selection range (n, finite, NaN, min, max, mean, std, median), `:lin /
+:log10 / :ln` scale toggles for both axes, and PNG / PDF / CSV exports:
+
+```julia
+using MANTA
+
+# A plain numeric vector goes through the AbstractVector bridge.
+MANTA.manta(sin.(range(0.0, 4π; length = 512));
+            title  = "sin(t)",
+            yscale = :lin)
+
+# A 1D FITS file (single image-HDU vector) opens the same viewer; if the
+# header carries CTYPE1/CRVAL1/CDELT1/CUNIT1, the X axis is automatically
+# WCS-mapped (e.g. frequency in Hz, velocity in km/s).
+MANTA.manta("path/to/spectrum.fits")
+
+# A VectorDataset can be built explicitly for custom labels / WCS.
+ds = MANTA.VectorDataset(rand(Float32, 256);
+        axis_label = "channel",
+        unit_label = "K",
+        source_id  = "my_spectrum")
+MANTA.manta(ds; xlimits = (10, 200))
+```
+
+Keyword arguments for the 1D viewer: `title`, `xscale`, `yscale`, `xlimits`,
+`ylimits`, `figsize`, `save_dir`, plus the usual `activate_gl` / `display_fig`
+toggles for headless usage. The exported CSV contains the values currently
+within the X-axis selection (or the full vector if no selection is set) and a
+self-describing comment header.
 
 Multiple panels:
 

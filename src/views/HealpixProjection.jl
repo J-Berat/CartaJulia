@@ -17,22 +17,27 @@ sur `(l, b) = (0, 0)`. Pixels hors ellipse → `NaN32`. Convention :
   même convention que `Healpix.jl` (lon = φ HEALPix).
 """
 function mollweide_grid(m::Healpix.HealpixMap; nx::Int=1200, ny::Int=600)
+    return mollweide_apply_index(mollweide_pixel_index(m.resolution, nx, ny), m)
+end
+
+"""
+    mollweide_apply_index(idx, m::HealpixMap) -> Matrix{Float32}
+
+Gather scalar HEALPix values onto a precomputed Mollweide pixel-index grid
+(see [`mollweide_pixel_index`](@ref)). Pixels with `idx == 0` are NaN32.
+`Healpix.UNSEEN` and non-finite values are also mapped to NaN32. Use this
+when reprojecting many frames sharing the same `(nside, nx, ny)`: the
+projection is done once and only the cheap gather step runs per frame.
+"""
+function mollweide_apply_index(idx::AbstractMatrix{<:Integer}, m::Healpix.HealpixMap)
+    ny, nx = size(idx)
     img = fill(NaN32, ny, nx)
-    res = m.resolution
+    pix = m.pixels
+    npix = length(pix)
     @inbounds for j in 1:ny, i in 1:nx
-        x = 2 * (2 * (i - 0.5) / nx - 1)        # x ∈ [-2, 2]
-        y = 2 * (j - 0.5) / ny - 1              # y ∈ [-1, 1]
-        (x^2 / 4 + y^2 > 1) && continue
-        θaux = asin(y)
-        sinφ = (2θaux + sin(2θaux)) / π
-        abs(sinφ) > 1 && continue
-        lat = asin(sinφ)
-        lon = π * x / (2 * cos(θaux))
-        abs(lon) > π && continue
-        θhp = π/2 - lat
-        φhp = lon < 0 ? lon + 2π : lon
-        ipix = Healpix.ang2pixRing(res, θhp, φhp)
-        v = m.pixels[ipix]
+        ip = Int(idx[j, i])
+        (ip < 1 || ip > npix) && continue
+        v = pix[ip]
         img[j, i] = (isfinite(v) && v != Healpix.UNSEEN) ? Float32(v) : NaN32
     end
     img
@@ -48,21 +53,26 @@ function mollweide_color_grid(pixels::AbstractVector{<:Colorant}; nx::Int=1200, 
     nside = valid_healpix_npix(length(pixels))
     nside > 0 || throw(ArgumentError("RGB HEALPix vector length must be 12*nside^2."))
     res = Healpix.Resolution(nside)
+    return mollweide_apply_index_color(mollweide_pixel_index(res, nx, ny), pixels)
+end
+
+"""
+    mollweide_apply_index_color(idx, pixels) -> Matrix{RGBAf}
+
+Gather colorant HEALPix values onto a precomputed Mollweide pixel-index
+grid. Out-of-ellipse cells (`idx == 0`) are fully transparent. Companion
+to [`mollweide_apply_index`](@ref) — see its docstring for the projection
+caching motivation.
+"""
+function mollweide_apply_index_color(idx::AbstractMatrix{<:Integer},
+                                     pixels::AbstractVector{<:Colorant})
+    ny, nx = size(idx)
     img = fill(RGBAf(1, 1, 1, 0), ny, nx)
+    npix = length(pixels)
     @inbounds for j in 1:ny, i in 1:nx
-        x = 2 * (2 * (i - 0.5) / nx - 1)
-        y = 2 * (j - 0.5) / ny - 1
-        (x^2 / 4 + y^2 > 1) && continue
-        θaux = asin(y)
-        sinφ = (2θaux + sin(2θaux)) / π
-        abs(sinφ) > 1 && continue
-        lat = asin(sinφ)
-        lon = π * x / (2 * cos(θaux))
-        abs(lon) > π && continue
-        θhp = π/2 - lat
-        φhp = lon < 0 ? lon + 2π : lon
-        ipix = Healpix.ang2pixRing(res, θhp, φhp)
-        img[j, i] = RGBAf(pixels[ipix])
+        ip = Int(idx[j, i])
+        (ip < 1 || ip > npix) && continue
+        img[j, i] = RGBAf(pixels[ip])
     end
     img
 end
@@ -71,21 +81,25 @@ function _mollweide_scalar_grid(vals::AbstractVector; nx::Int=1200, ny::Int=600)
     nside = valid_healpix_npix(length(vals))
     nside > 0 || throw(ArgumentError("HEALPix vector length must be 12*nside^2."))
     res = Healpix.Resolution(nside)
+    return _mollweide_apply_index_scalar(mollweide_pixel_index(res, nx, ny), vals)
+end
+
+"""
+    _mollweide_apply_index_scalar(idx, vals) -> Matrix{Float32}
+
+Gather scalar HEALPix values (plain vector, not a `HealpixMap`) onto a
+precomputed Mollweide pixel-index grid. Out-of-ellipse cells are NaN32,
+as are non-finite source values.
+"""
+function _mollweide_apply_index_scalar(idx::AbstractMatrix{<:Integer},
+                                       vals::AbstractVector)
+    ny, nx = size(idx)
     img = fill(NaN32, ny, nx)
+    npix = length(vals)
     @inbounds for j in 1:ny, i in 1:nx
-        x = 2 * (2 * (i - 0.5) / nx - 1)
-        y = 2 * (j - 0.5) / ny - 1
-        (x^2 / 4 + y^2 > 1) && continue
-        θaux = asin(y)
-        sinφ = (2θaux + sin(2θaux)) / π
-        abs(sinφ) > 1 && continue
-        lat = asin(sinφ)
-        lon = π * x / (2 * cos(θaux))
-        abs(lon) > π && continue
-        θhp = π/2 - lat
-        φhp = lon < 0 ? lon + 2π : lon
-        ipix = Healpix.ang2pixRing(res, θhp, φhp)
-        v = Float32(vals[ipix])
+        ip = Int(idx[j, i])
+        (ip < 1 || ip > npix) && continue
+        v = Float32(vals[ip])
         img[j, i] = isfinite(v) ? v : NaN32
     end
     img

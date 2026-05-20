@@ -12,6 +12,10 @@
 #
 # Public entry point: `view_cube(ds; kwargs...)`. The internal name
 # `_view_cube` is preserved for backwards compatibility with earlier drafts.
+#
+# Pure helpers used by this file live in sibling files included by
+# MANTA.jl before this one:
+#   - src/views/cube/PowerSpectrumBundle.jl  -> `_cube_ps_bundle`
 
 """
     view_cube(ds::CubeDataset; kwargs...) -> Figure
@@ -45,6 +49,7 @@ function _view_cube(
     moment_threshold::Real = 0.0,
     moment_nsigma::Union{Nothing,Real} = nothing,
     moment_channels::Union{Nothing,AbstractVector{<:Integer}} = nothing,
+    compare::Union{Nothing,AbstractString} = nothing,
 )
     data = as_float32(ds.data)
     siz  = size(data)
@@ -127,17 +132,28 @@ function _view_cube(
     layout_mode = Observable(:base)
     anim_playing = Observable(false)
 
+    # why: read-only display path — view avoids per-frame allocation of the slice
+    # buffer. Mutating consumers downstream must clone; current ones build their
+    # own output (`apply_scale`, `imfilter(Float32.(s), ...)`, `dual_view_product`).
     slice_raw = lift(axis, idx) do a, id
-        get_slice(data, a, clamp(id, 1, siz[a]))
+        get_slice_view(data, a, clamp(id, 1, siz[a]))
     end
 
     compare_slice_raw = lift(compare_data, axis, idx) do cmp, a, id
         cmp === nothing && return fill(NaN32, slice_dims(a))
-        get_slice(cmp, a, clamp(id, 1, siz[a]))
+        get_slice_view(cmp, a, clamp(id, 1, siz[a]))
     end
 
     gauss_on = Observable(false)
     sigma    = Observable(1.5f0)
+    # why: Kernel.gaussian((σ, σ)) is rebuilt on every slice / compare update.
+    # The viewer is dominated by frames at constant σ, so cache by σ value.
+    # Scope is local to this `_view_cube` invocation — released when the
+    # figure is GC'd. Float32 keys are well-behaved (σ is always > 0 here).
+    _gauss_kernel_cache = Dict{Float32, Any}()
+    _get_gauss_kernel(σ::Real) = get!(_gauss_kernel_cache, Float32(σ)) do
+        ImageFiltering.Kernel.gaussian((Float32(σ), Float32(σ)))
+    end
     show_crosshair = Observable(true)
     show_marker    = Observable(true)
     show_grid      = Observable(false)
@@ -175,22 +191,12 @@ function _view_cube(
     style_menu!(menu) = manta_style_menu!(menu, ui_theme; compact = compact_layout)
     style_textbox!(tb) = manta_style_textbox!(tb, ui_theme; compact = compact_layout)
 
-    latex_tick(v::Real) = begin
-        x = abs(Float64(v)) < 1e-10 ? 0.0 : Float64(v)
-        r = round(x)
-        s = if abs(x - r) < 1e-8
-            string(Int(r))
-        else
-            string(round(x; digits = 2))
-        end
-        latexstring("\\mathrm{", latex_safe(s), "}")
-    end
-    latex_tick_formatter(vals) = [latex_tick(v) for v in vals]
+    # `latex_tick` and `latex_tick_formatter` are now module-level helpers in
+    # `src/helpers/UIBits.jl` — they used to live inline here.
 
     base_slice_proc = lift(slice_raw, gauss_on, sigma) do s, on, σ
         if on && σ > 0
-            k = ImageFiltering.Kernel.gaussian((σ, σ))
-            imfilter(Float32.(s), k)
+            imfilter(Float32.(s), _get_gauss_kernel(σ))
         else
             s
         end
@@ -201,12 +207,19 @@ function _view_cube(
     # in "K·channel" rather than silently relying on the old summation.
     moment_dx_for(a::Integer) = has_wcs(wcs, a) ? abs(Float64(wcs[a].cdelt)) : 1.0
 
+    # why: data is immutable during a viewer session and threshold / nsigma /
+    # channels are passed once at construction. Cache by (axis, order) so
+    # toggling axis or moment order doesn't recompute the whole map. Up to
+    # 3 axes × 3 orders = 9 entries.
+    _moment_cache = Dict{Tuple{Int,Int}, Matrix{Float32}}()
     moment_raw = lift(axis, moment_order) do a, ord
-        moment_map(data, a, ord; coords = spectral_coords(a),
-                   threshold = moment_threshold,
-                   nsigma = moment_nsigma,
-                   channels = moment_channels === nothing ? (1:siz[a]) : moment_channels,
-                   dx = moment_dx_for(a))
+        get!(_moment_cache, (Int(a), Int(ord))) do
+            moment_map(data, a, ord; coords = spectral_coords(a),
+                       threshold = moment_threshold,
+                       nsigma = moment_nsigma,
+                       channels = moment_channels === nothing ? (1:siz[a]) : moment_channels,
+                       dx = moment_dx_for(a))
+        end
     end
 
     view_raw = lift(slice_raw, moment_raw, view_product) do s, m, product
@@ -215,8 +228,7 @@ function _view_cube(
 
     slice_proc = lift(view_raw, gauss_on, sigma, view_product) do s, on, σ, product
         if product === :slice && on && σ > 0
-            k = ImageFiltering.Kernel.gaussian((σ, σ))
-            imfilter(Float32.(s), k)
+            imfilter(Float32.(s), _get_gauss_kernel(σ))
         else
             s
         end
@@ -224,8 +236,7 @@ function _view_cube(
 
     compare_slice_proc = lift(compare_slice_raw, gauss_on, sigma) do s, on, σ
         if on && σ > 0
-            k = ImageFiltering.Kernel.gaussian((σ, σ))
-            imfilter(Float32.(s), k)
+            imfilter(Float32.(s), _get_gauss_kernel(σ))
         else
             s
         end
@@ -237,24 +248,14 @@ function _view_cube(
     end
 
     # ---- display array: protect against NaN/Inf after log/ln
+    # why: apply_scale_display fuses the scale step and the NaN→0 sanitization
+    # into a single pass, saving one allocation per slice update.
     slice_disp = lift(slice_proc, img_scale_mode) do s, m
-        A = apply_scale(s, m)
-        out = similar(A, Float32)
-        @inbounds for i in eachindex(A)
-            x = A[i]
-            out[i] = isfinite(x) ? Float32(x) : 0f0
-        end
-        out
+        apply_scale_display(s, m)
     end
 
     compare_slice_disp = lift(compare_product_proc, img_scale_mode) do s, m
-        A = apply_scale(s, m)
-        out = similar(A, Float32)
-        @inbounds for i in eachindex(A)
-            x = A[i]
-            out[i] = isfinite(x) ? Float32(x) : 0f0
-        end
-        out
+        apply_scale_display(s, m)
     end
 
     clims_auto = lift(slice_disp) do s
@@ -350,6 +351,16 @@ function _view_cube(
     spec_x_raw  = Observable(spec_x_axes[3])
     spec_y_raw  = Observable(spec_y_buf)
     spec_y_disp = lift(spec_y_raw, spec_scale_mode) do y, m
+        apply_scale(y, m)
+    end
+    # Second-cube spectrum buffer / Observables — same x grid as cube A
+    # (same region selection), filled by `refresh_spectrum!` only when a
+    # comparison cube is loaded. NaN-init so the (hidden) line shows
+    # nothing before the first refresh.
+    spec_y_compare_buf = Vector{Float32}(undef, siz[3])
+    fill!(spec_y_compare_buf, NaN32)
+    spec_y_compare_raw = Observable(spec_y_compare_buf)
+    spec_y_compare_disp = lift(spec_y_compare_raw, spec_scale_mode) do y, m
         apply_scale(y, m)
     end
     spec_ylimits_value = Observable(spec_ylimits === nothing ?
@@ -534,6 +545,19 @@ function _view_cube(
         tellheight = false,
         valign = :center,
     )
+    # Dedicated colorbar for cube B, slot 4 — hidden until a comparison cube
+    # is loaded (mirrors how `ax_cmp` is hidden via `colsize!(img_grid, 2, ...)`).
+    img_colorbar_cmp = Colorbar(
+        img_grid[1, 4];
+        colormap = cm_obs,
+        colorrange = compare_clims_safe,
+        label = display_unit_label,
+        width = 20,
+        height = _axis_render_height(ax_cmp),
+        tellheight = false,
+        valign = :center,
+    )
+    colsize!(img_grid, 4, Fixed(0))
 
     # Info + spectrum
     spec_grid = main_grid[1, 2] = GridLayout()
@@ -568,7 +592,30 @@ function _view_cube(
         xtickformat = latex_tick_formatter,
         ytickformat = latex_tick_formatter,
     )
-    lines!(ax_spec, spec_x_raw, spec_y_disp)
+    lines!(ax_spec, spec_x_raw, spec_y_disp; label = "A")
+    lines!(ax_spec, spec_x_raw, spec_y_compare_disp;
+           color = ui_compare, linewidth = 1.6,
+           visible = compare_visible, label = "B")
+    # Legend gated by compare_visible — hidden when only cube A is loaded so
+    # the legend chip does not waste space.
+    spec_legend = axislegend(ax_spec; position = :rt,
+                             framevisible = true,
+                             backgroundcolor = (ui_panel, 0.85),
+                             labelcolor = ui_text,
+                             framecolor = ui_border,
+                             padding = (8, 8, 4, 4))
+    # Toggle whole Legend block across Makie versions: older Makie exposes
+    # `.visible`, newer Makie only exposes `.scene.visible` / `.blockscene.visible`.
+    _set_legend_visible! = (v::Bool) -> begin
+        try; spec_legend.visible[] = v; catch; end
+        try; spec_legend.scene.visible[] = v; catch; end
+        try; spec_legend.blockscene.visible[] = v; catch; end
+        nothing
+    end
+    _set_legend_visible!(compare_visible[])
+    on(compare_visible) do v
+        _set_legend_visible!(v)
+    end
     ax_img.xgridvisible[] = show_grid[]
     ax_img.ygridvisible[] = show_grid[]
     ax_cmp.xgridvisible[] = show_grid[]
@@ -1049,6 +1096,22 @@ function _view_cube(
     end
     refresh_control_mode!()
 
+    # ---------- Mode-gated event helper ----------
+    # Cards from different modes share the same grid cell, so even when
+    # `set_block_visible!` hides a card, the underlying Buttons / Checkboxes /
+    # Menus / Sliders are still pickable and forward clicks to their listeners.
+    # `on_mode` wraps `on(obs)` so the callback fires only when the active mode
+    # matches, neutralising leak-through clicks (e.g. clicking a Contours
+    # button while in :analysis mode used to also trigger the hidden GIF
+    # button stacked underneath).
+    # `bypass_mode_gate` is a re-entrant escape hatch for routines that
+    # programmatically poke widgets across modes (load state, etc.).
+    bypass_mode_gate = Ref(false)
+    on_mode(callback, obs, mode::Symbol) = on(obs) do v
+        (bypass_mode_gate[] || control_mode[] === mode) || return
+        callback(v)
+    end
+
     set_block_visible!(ax_cmp, false)
 
     function show_compare_loader!()
@@ -1091,6 +1154,63 @@ function _view_cube(
         return p
     end
 
+    # Native OS file picker. Tries platform-appropriate tools without
+    # adding a Julia dep. Returns "" when the user cancels or no backend
+    # is available — the caller then falls back to the legacy textbox loader.
+    function pick_compare_path()
+        initial = filepath != "" ? dirname(abspath(filepath)) : pwd()
+        out = ""
+        try
+            if Sys.isapple()
+                script = "POSIX path of (choose file with prompt \"Select FITS cube to compare\" default location POSIX file \"$(initial)\")"
+                out = readchomp(`osascript -e $script`)
+            elseif Sys.islinux()
+                zenity = Sys.which("zenity")
+                if zenity !== nothing
+                    out = readchomp(`$zenity --file-selection --title=Select\ FITS\ cube\ to\ compare --filename=$(initial)/`)
+                else
+                    kdialog = Sys.which("kdialog")
+                    if kdialog !== nothing
+                        out = readchomp(`$kdialog --getopenfilename $initial "FITS (*.fits *.fits.gz)"`)
+                    end
+                end
+            elseif Sys.iswindows()
+                ps = """
+                Add-Type -AssemblyName System.Windows.Forms | Out-Null;
+                \$f = New-Object System.Windows.Forms.OpenFileDialog;
+                \$f.Filter = 'FITS (*.fits;*.fits.gz)|*.fits;*.fits.gz|All files (*.*)|*.*';
+                \$f.InitialDirectory = '$initial';
+                if (\$f.ShowDialog() -eq 'OK') { Write-Output \$f.FileName }
+                """
+                out = readchomp(`powershell -NoProfile -Command $ps`)
+            end
+        catch e
+            @debug "Native file dialog failed; falling back to textbox." exception=e
+            return ""
+        end
+        return strip(String(out))
+    end
+
+    # Lightweight WCS compatibility check: when both cubes declare a WCS on a
+    # given axis, CTYPE base / CRVAL / CRPIX / CDELT must agree (relative
+    # tolerance 1e-6). Axes where neither cube has WCS are accepted. Axes
+    # where only one cube has WCS are rejected — that asymmetry would break
+    # tick formatting and world-coordinate readouts on `ax_cmp`.
+    wcs_axes_compatible(a::AbstractVector, b::AbstractVector) = begin
+        length(a) == length(b) || return false
+        for (xa, xb) in zip(a, b)
+            if !xa.available && !xb.available
+                continue
+            end
+            xa.available == xb.available || return false
+            xa.ctype_base == xb.ctype_base || return false
+            isapprox(xa.crval, xb.crval; rtol = 1e-6, atol = 0.0) || return false
+            isapprox(xa.cdelt, xb.cdelt; rtol = 1e-6, atol = 0.0) || return false
+            isapprox(xa.crpix, xb.crpix; rtol = 0.0, atol = 1e-6) || return false
+        end
+        return true
+    end
+
     function load_compare_cube!(path_txt::AbstractString)
         cmp_path = resolve_compare_path(path_txt)
         if isempty(cmp_path)
@@ -1101,9 +1221,9 @@ function _view_cube(
             set_status!("Second cube not found: $(cmp_path)")
             return false
         end
-        raw_cmp = try
+        raw_cmp, cmp_header = try
             FITS(cmp_path) do f
-                read(f[1])
+                (read(f[1]), read_header(f[1]))
             end
         catch e
             msg = "Failed to read second cube: $(sprint(showerror, e))"
@@ -1119,17 +1239,33 @@ function _view_cube(
             set_status!("Second cube size $(size(raw_cmp)) does not match primary cube size $(siz).")
             return false
         end
+        # WCS compatibility check — required since axes/colorbar/spectrum
+        # ticks on `ax_cmp` reuse the primary cube's `wcs`.
+        cmp_wcs = try
+            read_simple_wcs(cmp_header, 3)
+        catch
+            SimpleWCSAxis[]
+        end
+        if !wcs_axes_compatible(wcs, cmp_wcs)
+            set_status!("Second cube WCS does not match primary cube WCS.")
+            return false
+        end
         compare_data[] = Float32.(raw_cmp)
         compare_name[] = String(replace(basename(cmp_path), r"\.fits(\.gz)?$" => ""))
         compare_visible[] = true
         colsize!(img_grid, 2, Auto())
+        colsize!(img_grid, 4, Auto())
         set_block_visible!(ax_cmp, true)
+        set_block_visible!(img_colorbar_cmp, true)
         ax_cmp.xgridvisible[] = show_grid[]
         ax_cmp.ygridvisible[] = show_grid[]
         autolimits!(ax_cmp)
         hide_compare_loader!()
         compare_state_label.text[] = "Comparison: cube loaded ($(compare_name[]))"
         compare_state_label.color[] = ui_success
+        # Pull the spectrum line in immediately so the user sees overlay
+        # without having to click anything.
+        refresh_spectrum!()
         set_status!("Comparison cube loaded: $(cmp_path).")
         return true
     end
@@ -1255,6 +1391,29 @@ function _view_cube(
             ax_spec.title[] = L"\text{Spectrum at selected pixel}"
         end
         spec_y_raw[] = spec_y_buf
+        # Mirror the cube-A extraction on the comparison cube when loaded.
+        # Same axis, same voxel / region — only the source array changes.
+        cmp = compare_data[]
+        if cmp !== nothing
+            if !isempty(region_uvs[])
+                y2 = mean_region_spectrum(cmp, axis[], region_uvs[])
+                resize!(spec_y_compare_buf, length(y2))
+                copyto!(spec_y_compare_buf, y2)
+            elseif axis[] == 1
+                resize!(spec_y_compare_buf, siz[1])
+                @views copyto!(spec_y_compare_buf, cmp[:, j_idx[], k_idx[]])
+            elseif axis[] == 2
+                resize!(spec_y_compare_buf, siz[2])
+                @views copyto!(spec_y_compare_buf, cmp[i_idx[], :, k_idx[]])
+            else
+                resize!(spec_y_compare_buf, siz[3])
+                @views copyto!(spec_y_compare_buf, cmp[i_idx[], j_idx[], :])
+            end
+        else
+            resize!(spec_y_compare_buf, length(spec_y_buf))
+            fill!(spec_y_compare_buf, NaN32)
+        end
+        spec_y_compare_raw[] = spec_y_compare_buf
         refresh_spec_ylim!()
     end
 
@@ -1302,13 +1461,13 @@ function _view_cube(
         nothing
     end
 
-    on(reset_zoom_btn.clicks) do _
+    on_mode(reset_zoom_btn.clicks, :navigation) do _
         reset_zoom!()
     end
-    on(reset_zoom_analysis_btn.clicks) do _
+    on_mode(reset_zoom_analysis_btn.clicks, :analysis) do _
         reset_zoom!()
     end
-    on(reset_zoom_export_btn.clicks) do _
+    on_mode(reset_zoom_export_btn.clicks, :export) do _
         reset_zoom!()
     end
 
@@ -1329,7 +1488,7 @@ function _view_cube(
     end
 
     # Keep the slice slider synced to the active axis (range + knob position)
-    on(axis_menu.selection) do sel
+    on_mode(axis_menu.selection, :navigation) do sel
         sel === nothing && return
         new_axis = findfirst(==(String(sel)), axes_labels)
         new_axis === nothing && return
@@ -1347,7 +1506,7 @@ function _view_cube(
         layout_mode[] === :power_spectrum && render_power_spectrum_layout!()
     end
 
-    on(slice_slider.value) do v
+    on_mode(slice_slider.value, :navigation) do v
         syncing_slice_controls[] && return
         idx[] = Int(round(v))
         ii, jj, kk = uv_to_ijk(u_idx[], v_idx[], axis[], idx[])
@@ -1356,29 +1515,29 @@ function _view_cube(
         layout_mode[] === :power_spectrum && render_power_spectrum_layout!()
     end
 
-    on(img_scale_menu.selection) do sel
+    on_mode(img_scale_menu.selection, :navigation) do sel
         sel === nothing && return
         img_scale_mode[] = Symbol(sel)
     end
 
-    on(spec_scale_menu.selection) do sel
+    on_mode(spec_scale_menu.selection, :navigation) do sel
         sel === nothing && return
         spec_scale_mode[] = Symbol(sel)
     end
 
-    on(cmap_menu.selection) do sel
+    on_mode(cmap_menu.selection, :navigation) do sel
         sel === nothing && return
         cmap_name[] = Symbol(sel)
         set_status!("Colormap set to $(String(sel)).")
     end
 
-    on(hist_mode_menu.selection) do sel
+    on_mode(hist_mode_menu.selection, :analysis) do sel
         sel === nothing && return
         hist_mode_obs[] = normalize_histogram_mode(sel)
         set_status!("Histogram mode set to $(String(hist_mode_obs[])).")
     end
 
-    on(hist_apply_btn.clicks) do _
+    on_mode(hist_apply_btn.clicks, :analysis) do _
         ok_bins, bins, bins_msg = parse_histogram_bins(get_box_str(hist_bins_box); fallback = hist_bins_obs[])
         ok_x, manual_x, xlim, x_msg = parse_histogram_xlimits(
             get_box_str(hist_xmin_box),
@@ -1408,14 +1567,14 @@ function _view_cube(
         set_status!("$(bins_msg) $(x_msg)")
     end
 
-    on(hist_auto_btn.clicks) do _
+    on_mode(hist_auto_btn.clicks, :analysis) do _
         hist_xlimits_manual[] = false
         set_box_text!(hist_xmin_box, "")
         set_box_text!(hist_xmax_box, "")
         set_status!("Automatic histogram x-axis enabled.")
     end
 
-    on(hist_y_auto_btn.clicks) do _
+    on_mode(hist_y_auto_btn.clicks, :analysis) do _
         hist_ylimits_manual[] = false
         set_box_text!(hist_ymin_box, "")
         set_box_text!(hist_ymax_box, "")
@@ -1423,7 +1582,7 @@ function _view_cube(
         set_status!("Automatic histogram y-axis enabled.")
     end
 
-    on(hist_y_apply_btn.clicks) do _
+    on_mode(hist_y_apply_btn.clicks, :analysis) do _
         ok_y, manual_y, ylim, y_msg = parse_histogram_ylimits(
             get_box_str(hist_ymin_box),
             get_box_str(hist_ymax_box);
@@ -1443,7 +1602,7 @@ function _view_cube(
         refresh_hist_axes!()
     end
 
-    on(spec_y_apply_btn.clicks) do _
+    on_mode(spec_y_apply_btn.clicks, :analysis) do _
         ok, manual, ylim, msg = parse_spectrum_ylimits(
             get_box_str(spec_ymin_box),
             get_box_str(spec_ymax_box);
@@ -1464,7 +1623,7 @@ function _view_cube(
         refresh_spec_ylim!()
     end
 
-    on(spec_y_auto_btn.clicks) do _
+    on_mode(spec_y_auto_btn.clicks, :analysis) do _
         spec_ylimits_source[] = :auto
         set_box_text!(spec_ymin_box, "")
         set_box_text!(spec_ymax_box, "")
@@ -1482,24 +1641,24 @@ function _view_cube(
         refresh_hist_axes!()
     end
 
-    on(invert_chk.checked) do v
+    on_mode(invert_chk.checked, :navigation) do v
         invert_cmap[] = v
     end
 
-    on(gauss_chk.checked) do v
+    on_mode(gauss_chk.checked, :navigation) do v
         gauss_on[] = v
         refresh_spectrum!()
     end
 
-    on(crosshair_chk.checked) do v
+    on_mode(crosshair_chk.checked, :navigation) do v
         show_crosshair[] = v
     end
 
-    on(marker_chk.checked) do v
+    on_mode(marker_chk.checked, :navigation) do v
         show_marker[] = v
     end
 
-    on(grid_chk.checked) do v
+    on_mode(grid_chk.checked, :navigation) do v
         show_grid[] = v
         ax_img.xgridvisible[] = v
         ax_img.ygridvisible[] = v
@@ -1509,16 +1668,26 @@ function _view_cube(
         ax_spec.ygridvisible[] = v
     end
 
-    on(btn_show_compare.clicks) do _
-        show_compare_loader!()
+    on_mode(btn_show_compare.clicks, :export) do _
+        # Try a native file picker first. If it returns a path we load
+        # immediately; otherwise we fall back to the legacy textbox loader
+        # (useful in headless CI where no dialog backend is available, or
+        # when the user cancels and wants to type a path).
+        picked = pick_compare_path()
+        if !isempty(picked) && isfile(picked)
+            set_box_text!(compare_path_box, picked)
+            load_compare_cube!(picked)
+        else
+            show_compare_loader!()
+        end
     end
 
-    on(btn_load_compare.clicks) do _
+    on_mode(btn_load_compare.clicks, :export) do _
         btn_load_compare.width[] <= 0 && return
         load_compare_cube!(get_box_str(compare_path_box))
     end
 
-    on(compare_mode_menu.selection) do sel
+    on_mode(compare_mode_menu.selection, :export) do sel
         sel === nothing && return
         label = String(sel)
         compare_mode[] = label == "A" ? :A :
@@ -1529,12 +1698,12 @@ function _view_cube(
         set_status!("Dual product set to $(compare_mode_label(compare_mode[])).")
     end
 
-    on(sigma_slider.value) do v
+    on_mode(sigma_slider.value, :navigation) do v
         sigma[] = Float32(v)
         sigma_label.text[] = latexstring("\\sigma = $(round(v; digits = 2))\\,\\text{px}")
     end
 
-    on(clim_apply_btn.clicks) do _
+    on_mode(clim_apply_btn.clicks, :analysis) do _
         txtmin = get_box_str(clim_min_box)
         txtmax = get_box_str(clim_max_box)
         ok, new_manual, parsed_clims, msg = parse_manual_clims(txtmin, txtmax; fallback = clims_manual[])
@@ -1565,7 +1734,7 @@ function _view_cube(
         end
     end
 
-    on(clim_auto_btn.clicks) do _
+    on_mode(clim_auto_btn.clicks, :analysis) do _
         use_manual[] = false
         set_box_text!(clim_min_box, "")
         set_box_text!(clim_max_box, "")
@@ -1578,15 +1747,15 @@ function _view_cube(
         set_status!("Automatic contrast enabled.")
     end
 
-    on(clim_p1_btn.clicks) do _
+    on_mode(clim_p1_btn.clicks, :analysis) do _
         apply_percentile_clims!(1, 99)
     end
 
-    on(clim_p5_btn.clicks) do _
+    on_mode(clim_p5_btn.clicks, :analysis) do _
         apply_percentile_clims!(5, 95)
     end
 
-    on(region_mode_menu.selection) do sel
+    on_mode(region_mode_menu.selection, :analysis) do sel
         sel === nothing && return
         mode = Symbol(String(sel))
         if mode in (:point, :box, :circle)
@@ -1602,19 +1771,19 @@ function _view_cube(
         end
     end
 
-    on(region_clear_btn.clicks) do _
+    on_mode(region_clear_btn.clicks, :analysis) do _
         clear_region!()
         refresh_labels!()
         refresh_spectrum!()
         set_status!("Selection cleared; spectrum follows the selected pixel.")
     end
 
-    on(contour_chk.checked) do v
+    on_mode(contour_chk.checked, :analysis) do v
         show_contours[] = v
         set_status!(v ? "Contours enabled." : "Contours hidden.")
     end
 
-    on(contour_apply_btn.clicks) do _
+    on_mode(contour_apply_btn.clicks, :analysis) do _
         ok, use_man, levels, colors, msg = parse_contour_specs(
             get_box_str(contour_levels_box);
             fallback_levels = contour_manual_levels[],
@@ -1637,14 +1806,14 @@ function _view_cube(
         contour_chk.checked[] = true
     end
 
-    on(moment_menu.selection) do sel
+    on_mode(moment_menu.selection, :analysis) do sel
         sel === nothing && return
         label = String(sel)
         moment_order[] = startswith(label, "M1") ? 1 : startswith(label, "M2") ? 2 : 0
         view_product[] === :moment && set_status!("Showing $(label) along axis $(axis[]).")
     end
 
-    on(btn_show_moment.clicks) do _
+    on_mode(btn_show_moment.clicks, :analysis) do _
         view_product[] = :moment
         use_manual[] = false
         autolimits!(ax_spec)
@@ -1653,7 +1822,7 @@ function _view_cube(
         set_status!("Moment map displayed along axis $(axis[]).")
     end
 
-    on(btn_show_slice.clicks) do _
+    on_mode(btn_show_slice.clicks, :analysis) do _
         view_product[] = :slice
         use_manual[] = false
         autolimits!(ax_img)
@@ -1919,21 +2088,19 @@ function _view_cube(
             return
         end
 
-        res = power_spectrum_2d(sub;
-                                window = ps_layout_window[],
-                                pad_pow2 = ps_layout_pad[],
-                                apodize_nan = ps_layout_nanapo[])
-        P2d = res.P2d
-        ny, nx = res.ny_eff, res.nx_eff
         src_label = ps_layout_src[] === :full ? "full" : "zoom"
         use_phys = ps_layout_units[] === :physical && ps_physical_available()
         dx, dy = ps_pixel_scales()
         k_unit_lbl = use_phys ? "1/$(ps_physical_unit_label())" : "cycles/pixel"
-        meta = (; ny_in = res.ny_in, nx_in = res.nx_in,
-                  ny_eff = ny, nx_eff = nx,
-                  padded = res.padded, window = res.window,
-                  apodized = res.apodized, f_sky = res.f_sky,
-                  k_phys = use_phys, src = src_label)
+        # why: factored computation shared with the pop-out window's ps_render!
+        bundle = _cube_ps_bundle(sub;
+                                 window = ps_layout_window[],
+                                 pad_pow2 = ps_layout_pad[],
+                                 apodize_nan = ps_layout_nanapo[],
+                                 use_phys = use_phys, dx = dx, dy = dy)
+        P2d = bundle.P2d
+        ny, nx = bundle.meta.ny_eff, bundle.meta.nx_eff
+        meta = (; bundle.meta..., k_phys = use_phys, src = src_label)
 
         # ---- Tailles dynamiques pour stacker dans la rangée plots ----
         ps_inner_gap = compact_layout ? 6 : 12
@@ -1943,9 +2110,7 @@ function _view_cube(
         ps_box_w = heatmap_box_h  # heatmap carrée → PSD alignée sur la même largeur
 
         # ---- 2D power spectrum heatmap (row 1) ----
-        pmax = maximum(P2d)
-        floor_val = max(eps(Float64), pmax * 1e-12)
-        vis = log10.(max.(P2d, floor_val))
+        vis = bundle.P2d_log10
         ax2d = Axis(
             ps_plot_grid[1, 1];
             title = latexstring("\\text{2D power spectrum (log10) — ", latex_safe(src_label), "}"),
@@ -1963,12 +2128,8 @@ function _view_cube(
             xtickformat = latex_tick_formatter,
             ytickformat = latex_tick_formatter,
         )
-        kx = collect(Float32, (-nx / 2):(nx / 2 - 1)) ./ Float32(nx)
-        ky = collect(Float32, (-ny / 2):(ny / 2 - 1)) ./ Float32(ny)
-        if use_phys
-            kx ./= Float32(dx)
-            ky ./= Float32(dy)
-        end
+        kx = bundle.kx
+        ky = bundle.ky
         hm_ps = heatmap!(ax2d, kx, ky, vis; colormap = cm_obs[])
         cb = Colorbar(
             ps_plot_grid[1, 2],
@@ -1983,12 +2144,9 @@ function _view_cube(
         push!(ps_layout_blocks, cb)
 
         # ---- 1D radial PSD (log–log) just below the heatmap ----
-        radii, prof = power_spectrum_1d_radial(P2d)
-        k_cyc = radii ./ Float32(min(ny, nx))
-        k = use_phys ? Float32.(k_cyc ./ Float32(sqrt(dx * dy))) : k_cyc
-        pmax_1d = isempty(prof) ? 1.0f0 : maximum(prof)
-        floor_val_1d = Float32(max(eps(Float32), pmax_1d * 1f-12))
-        p_floored = max.(prof, floor_val_1d)
+        prof = bundle.prof
+        k = bundle.k
+        p_floored = bundle.prof_floored
         # log–log : on retire le DC (k = 0) et tout k ≤ 0 (cf. convention :log10).
         pos_mask = k .> 0
         k_pos = k[pos_mask]
@@ -2049,6 +2207,7 @@ function _view_cube(
             set_block_visible!(ax_img, true)
             set_block_visible!(ax_cmp, false)
             set_block_visible!(img_colorbar, true)
+            set_block_visible!(img_colorbar_cmp, false)
             set_block_visible!(info_box, false)
             set_block_visible!(lab_info, false)
             set_block_visible!(ax_spec, false)
@@ -2068,6 +2227,7 @@ function _view_cube(
             set_block_visible!(ax_img, true)
             set_block_visible!(ax_cmp, compare_visible[])
             set_block_visible!(img_colorbar, true)
+            set_block_visible!(img_colorbar_cmp, compare_visible[])
             set_block_visible!(info_box, !compact_layout)
             set_block_visible!(lab_info, !compact_layout)
             set_block_visible!(ax_spec, true)
@@ -2083,11 +2243,11 @@ function _view_cube(
         apply_layout_mode!()
     end
 
-    on(ps_btn.clicks) do _
+    on_mode(ps_btn.clicks, :navigation) do _
         layout_mode[] = :power_spectrum
     end
 
-    on(base_layout_btn.clicks) do _
+    on_mode(base_layout_btn.clicks, :navigation) do _
         layout_mode[] = :base
     end
 
@@ -2212,7 +2372,7 @@ function _view_cube(
         nothing
     end
 
-    on(btn_moment_png.clicks) do _
+    on_mode(btn_moment_png.clicks, :analysis) do _
         spawn_safely() do
             base = get_box_str(fname_box)
             base = isempty(base) ? "$(fname)_$(moment_label())" : base
@@ -2228,7 +2388,7 @@ function _view_cube(
         end
     end
 
-    on(btn_moment_fits.clicks) do _
+    on_mode(btn_moment_fits.clicks, :analysis) do _
         spawn_safely() do
             base = get_box_str(fname_box)
             base = isempty(base) ? "$(fname)_$(moment_label())" : base
@@ -2246,7 +2406,7 @@ function _view_cube(
         end
     end
 
-    on(btn_save_fits.clicks) do _
+    on_mode(btn_save_fits.clicks, :analysis) do _
         spawn_safely() do
             product = String(something(fits_product_menu.selection[], "slice"))
             clean_product = replace(product, " " => "_")
@@ -2264,7 +2424,7 @@ function _view_cube(
         end
     end
 
-    on(btn_save_state.clicks) do _
+    on_mode(btn_save_state.clicks, :export) do _
         try
             save_viewer_settings(resolved_settings_path, current_settings())
             btn_save_state.labelcolor[] = ui_success
@@ -2276,11 +2436,16 @@ function _view_cube(
         end
     end
 
-    on(btn_load_state.clicks) do _
+    on_mode(btn_load_state.clicks, :export) do _
         if !isfile(resolved_settings_path)
             set_status!("Settings file not found: $(resolved_settings_path)")
             return
         end
+        # Loading viewer state pokes widgets that belong to :navigation /
+        # :analysis cards (axis_menu, slice_slider, invert_chk, ...). Without
+        # the bypass their `on_mode` listeners would silently no-op because
+        # we are currently in :export mode.
+        bypass_mode_gate[] = true
         try
             st = load_viewer_settings(resolved_settings_path)
 
@@ -2355,11 +2520,13 @@ function _view_cube(
             msg = "Failed to load settings: $(sprint(showerror, e))"
             set_status!(msg)
             @error msg exception=(e, catch_backtrace())
+        finally
+            bypass_mode_gate[] = false
         end
     end
 
     # ---------- Save image (slice + colorbar + crosshair) ----------
-    on(btn_save_img.clicks) do _
+    on_mode(btn_save_img.clicks, :export) do _
         spawn_safely() do
             ext  = String(something(fmt_menu.selection[], "png"))
             out  = joinpath(save_root, make_name(get_box_str(fname_box), ext))
@@ -2430,7 +2597,7 @@ function _view_cube(
     end
 
     # ---------- Save spectrum (lines plot) ----------
-    on(btn_save_spec.clicks) do _
+    on_mode(btn_save_spec.clicks, :export) do _
         spawn_safely() do
             ext = String(something(fmt_menu.selection[], "png"))
             base = get_box_str(fname_box)
@@ -2461,17 +2628,11 @@ function _view_cube(
         end
     end
 
-    function current_animation_request()
-        a = axis[]; amax = siz[a]
-        parse_gif_request(
-            get_box_str(start_box),
-            get_box_str(stop_box),
-            get_box_str(step_box),
-            get_box_str(fps_box),
-            amax;
-            pingpong = pingpong_chk.checked[]
-        )
-    end
+    # `current_animation_request` is now a module-level helper in
+    # `src/views/cube/AnimationRequest.jl`. It takes the captured pieces of
+    # state (axis, size, the four textboxes and the pingpong checkbox)
+    # explicitly so the GIF/animation pipeline is decoupled from this
+    # closure.
 
     function start_channel_animation!(frames::Vector{Int}, fps::Int)
         anim_playing[] = true
@@ -2495,14 +2656,16 @@ function _view_cube(
         nothing
     end
 
-    on(play_btn.clicks) do _
+    on_mode(play_btn.clicks, :export) do _
         if anim_playing[]
             anim_playing[] = false
             play_btn.label[] = "Play"
             set_status!("Animation paused.")
             return
         end
-        ok, frames, fps, msg = current_animation_request()
+        ok, frames, fps, msg = current_animation_request(
+            axis[], siz, start_box, stop_box, step_box, fps_box, pingpong_chk,
+        )
         set_status!(ok ? "Interactive animation playing at $(fps) FPS." : msg)
         ok || return
         start_channel_animation!(frames, fps)
@@ -2510,9 +2673,11 @@ function _view_cube(
 
 
     # ---------- GIF export  ----------
-    on(anim_btn.clicks) do _
+    on_mode(anim_btn.clicks, :export) do _
         a = axis[]; amax = siz[a]
-        ok, frames, fps, msg = current_animation_request()
+        ok, frames, fps, msg = current_animation_request(
+            a, siz, start_box, stop_box, step_box, fps_box, pingpong_chk,
+        )
         set_status!(msg)
         if !ok
             @warn "Invalid GIF parameters" msg axis=a amax=amax
@@ -2705,33 +2870,25 @@ function _view_cube(
                 empty!(last_1d_k); empty!(last_1d_p)
                 return
             end
-            res = power_spectrum_2d(sub;
-                                    window      = ps_window[],
-                                    pad_pow2    = ps_pad[],
-                                    apodize_nan = ps_nanapo[])
-            P2d = res.P2d
-            ny, nx = res.ny_eff, res.nx_eff
             src_label = ps_src[] === :full ? "full" : "zoom"
             use_phys = ps_units[] === :physical && physical_available()
             dx, dy = pixel_scales()
             k_unit_lbl = use_phys ? "1/$(physical_unit_label())" : "cycles/pixel"
-
-            meta = (; ny_in = res.ny_in, nx_in = res.nx_in,
-                      ny_eff = ny, nx_eff = nx,
-                      padded = res.padded, window = res.window,
-                      apodized = res.apodized, f_sky = res.f_sky,
-                      w_norm = res.w_norm,
-                      k_phys = use_phys, src = src_label)
+            # why: factored computation shared with render_power_spectrum_layout!
+            bundle = _cube_ps_bundle(sub;
+                                     window = ps_window[],
+                                     pad_pow2 = ps_pad[],
+                                     apodize_nan = ps_nanapo[],
+                                     use_phys = use_phys, dx = dx, dy = dy)
+            P2d = bundle.P2d
+            ny, nx = bundle.meta.ny_eff, bundle.meta.nx_eff
+            meta = (; bundle.meta..., k_phys = use_phys, src = src_label)
             last_meta = meta
 
             if ps_mode[] === :two_d
                 empty!(last_1d_k); empty!(last_1d_p)
                 last_1d_units = k_unit_lbl
-                # log10 with floor relative to the spectrum max so DC bin etc.
-                # never blow the colormap downward.
-                pmax = maximum(P2d)
-                floor_val = max(eps(Float64), pmax * 1e-12)
-                vis = log10.(max.(P2d, floor_val))
+                vis = bundle.P2d_log10
                 ax = Axis(
                     plot_grid[1, 1];
                     title  = latexstring("\\text{2D power spectrum (log10) — ", latex_safe(src_label), "}"),
@@ -2745,12 +2902,8 @@ function _view_cube(
                     xtickformat = latex_tick_formatter,
                     ytickformat = latex_tick_formatter,
                 )
-                kx = collect(Float32, (-nx / 2):(nx / 2 - 1)) ./ Float32(nx)
-                ky = collect(Float32, (-ny / 2):(ny / 2 - 1)) ./ Float32(ny)
-                if use_phys
-                    kx ./= Float32(dx)
-                    ky ./= Float32(dy)
-                end
+                kx = bundle.kx
+                ky = bundle.ky
                 hm = heatmap!(ax, kx, ky, vis; colormap = cm_obs[])
                 cb = Colorbar(
                     plot_grid[1, 2],
@@ -2763,16 +2916,9 @@ function _view_cube(
                 )
                 push!(ps_blocks, ax); push!(ps_blocks, cb)
             else
-                radii, prof = power_spectrum_1d_radial(P2d)
-                k_cyc = radii ./ Float32(min(ny, nx))      # cycles/pixel
-                k = if use_phys
-                    Float32.(k_cyc ./ Float32(sqrt(dx * dy)))
-                else
-                    k_cyc
-                end
-                pmax = isempty(prof) ? 1.0f0 : maximum(prof)
-                floor_val = Float32(max(eps(Float32), pmax * 1f-12))
-                p_floored = max.(prof, floor_val)
+                prof = bundle.prof
+                k = bundle.k
+                p_floored = bundle.prof_floored
                 resize!(last_1d_k, length(k));  copyto!(last_1d_k, k)
                 resize!(last_1d_p, length(prof)); copyto!(last_1d_p, prof)
                 last_1d_units = k_unit_lbl
@@ -2908,6 +3054,17 @@ function _view_cube(
     # ---------- Init ----------
     refresh_all!()
     refresh_hist_axes!()
+    # Optional preload of a comparison cube passed via the `compare=` kwarg
+    # (used by scripted invocations and headless tests). Silently no-ops if
+    # the path can't be loaded — `load_compare_cube!` already logs through
+    # `set_status!` so we don't double-report here.
+    if compare !== nothing
+        try
+            load_compare_cube!(String(compare))
+        catch e
+            @warn "Failed to preload comparison cube" path=compare exception=e
+        end
+    end
     keepalive!(fig)
 
     on(fig.scene.events.window_open) do is_open

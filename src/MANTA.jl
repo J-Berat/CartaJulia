@@ -38,7 +38,13 @@ include("datasets/LoadDataset.jl")
 
 # ---- views ----
 include("views/HealpixMapView.jl")
+# Cube-viewer support: pure helpers shared by `_view_cube` and any future
+# cube-related entry points. Included before CubeView.jl so the symbols
+# are available when the closure-heavy view body is compiled.
+include("views/cube/PowerSpectrumBundle.jl")
+include("views/cube/AnimationRequest.jl")
 include("views/CubeView.jl")
+include("views/VectorView.jl")
 
 export load_dataset
 export AbstractMANTADataset, AbstractCartaDataset
@@ -115,6 +121,8 @@ function manta(
     moment_threshold::Real = 0.0,
     moment_nsigma::Union{Nothing,Real} = nothing,
     moment_channels::Union{Nothing,AbstractVector{<:Integer}} = nothing,
+    # Cube-only: preload a second FITS cube for side-by-side comparison.
+    compare::Union{Nothing,AbstractString} = nothing,
     )
     ds = load_dataset(filepath; column = column, v0 = v0, dv = dv, vunit = vunit)
 
@@ -151,7 +159,8 @@ function manta(
             rgb = rgb,
             moment_threshold = moment_threshold,
             moment_nsigma = moment_nsigma,
-            moment_channels = moment_channels)
+            moment_channels = moment_channels,
+            compare = compare)
     elseif ds isa ImageDataset
         return manta(ds;
             cmap = cmap, vmin = vmin, vmax = vmax, invert = invert,
@@ -663,6 +672,7 @@ function manta(
     moment_threshold::Real = 0.0,
     moment_nsigma::Union{Nothing,Real} = nothing,
     moment_channels::Union{Nothing,AbstractVector{<:Integer}} = nothing,
+    compare::Union{Nothing,AbstractString} = nothing,
 )
     if rgb
         return manta(as_rgb_image(ds.data);
@@ -681,13 +691,28 @@ function manta(
         spec_ylimits = spec_ylimits,
         moment_threshold = moment_threshold,
         moment_nsigma = moment_nsigma,
-        moment_channels = moment_channels)
+        moment_channels = moment_channels,
+        compare = compare)
 end
 
-function manta(ds::VectorDataset; kwargs...)
-    throw(ErrorException(
-        "MANTA: viewing a VectorDataset is not implemented yet. " *
-        "Plot the vector externally with `lines(ds.data)` for now."))
+function manta(
+    ds::VectorDataset;
+    title::Union{Nothing,AbstractString} = nothing,
+    xscale::Symbol = :lin,
+    yscale::Symbol = :lin,
+    xlimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
+    ylimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
+    figsize::Union{Nothing,Tuple{Int,Int}} = nothing,
+    save_dir::Union{Nothing,AbstractString} = nothing,
+    activate_gl::Bool = true,
+    display_fig::Bool = true,
+)
+    return _view_vector(ds;
+        title = title,
+        xscale = xscale, yscale = yscale,
+        xlimits = xlimits, ylimits = ylimits,
+        figsize = figsize, save_dir = save_dir,
+        activate_gl = activate_gl, display_fig = display_fig)
 end
 
 function manta(ds::MultiChannelDataset; kwargs...)
@@ -713,5 +738,78 @@ manta(x::Healpix.HealpixMap; kwargs...) = manta(load_dataset(x); kwargs...)
 # spectra, moments, comparison, power spectrum, exports) without ever
 # touching disk.
 manta(x::AbstractArray{<:Real,3}; kwargs...) = manta(load_dataset(x); kwargs...)
+
+# 1D numeric arrays: route through load_dataset → VectorDataset → _view_vector.
+# A plain `AbstractVector{<:Real}` thus becomes a fully interactive line plot
+# (scale toggles, selection-based stats, PNG/PDF/CSV export) with no FITS file
+# required. Real numbers only; for complex/RGB data the user should compute
+# magnitudes / channels first and pass a regular numeric vector.
+manta(x::AbstractVector{<:Real}; kwargs...) = manta(load_dataset(x); kwargs...)
+
+# ---- Precompile workload --------------------------------------------------
+#
+# Exercises the main public entry points in headless mode so that Julia bakes
+# the specialized methods into the package's pkgimage cache. This wipes out
+# most of the TTFP (Time-To-First-Plot) on every subsequent launch.
+#
+# Every call uses `activate_gl=false, display_fig=false` — the same headless
+# mode that `test/runtests.jl` relies on. No GL context is required during
+# precompilation, so this stays compatible with the Docker build and CI.
+#
+# Inputs are tiny in-memory arrays: nothing is written to disk, and the
+# `forget!` calls release the keep-alive references that the viewers attach
+# to figures.
+using PrecompileTools: @setup_workload, @compile_workload
+
+@setup_workload begin
+    # Small in-memory datasets covering the public viewer paths.
+    _pc_vec1d  = rand(Float32, 32)
+    _pc_img2d  = rand(Float32, 8, 8)
+    _pc_cube3d = rand(Float32, 6, 6, 4)
+    _pc_hpix_map_ds  = load_dataset(
+        Healpix.HealpixMap{Float64,Healpix.RingOrder,Vector{Float64}}(
+            collect(1.0:12.0)))
+    _pc_hpix_cube_ds = HealpixCubeDataset(
+        reshape(Float32.(1:48), 12, 4);
+        nside = 1,
+        source_id = "precompile_hpix_cube")
+
+    @compile_workload begin
+        # 1D vector → line plot + stats + selection path.
+        let fig = manta(_pc_vec1d;
+                        activate_gl = false, display_fig = false,
+                        figsize = (500, 360))
+            forget!(fig)
+        end
+
+        # 2D image (Float32 matrix) → vue 2D simple.
+        let fig = manta(_pc_img2d;
+                        activate_gl = false, display_fig = false,
+                        figsize = (500, 360))
+            forget!(fig)
+        end
+
+        # 3D cube → slice + spectrum + histogram + moments path.
+        let fig = manta(_pc_cube3d;
+                        activate_gl = false, display_fig = false,
+                        figsize = (700, 450))
+            forget!(fig)
+        end
+
+        # HEALPix map → Mollweide projection path.
+        let fig = manta(_pc_hpix_map_ds;
+                        activate_gl = false, display_fig = false,
+                        nx = 60, ny = 30, figsize = (500, 320))
+            forget!(fig)
+        end
+
+        # HEALPix PPV cube → per-channel map + spectrum path.
+        let fig = manta(_pc_hpix_cube_ds;
+                        activate_gl = false, display_fig = false,
+                        nx = 60, ny = 30, figsize = (600, 380))
+            forget!(fig)
+        end
+    end
+end
 
 end # module

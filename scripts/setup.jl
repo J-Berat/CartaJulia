@@ -20,6 +20,7 @@ runtime_dep_names = [
     "LaTeXStrings",
     "FITSIO",
     "GLFW",
+    "PrecompileTools",
 ]
 
 project_deps = Set(keys(Pkg.project().dependencies))

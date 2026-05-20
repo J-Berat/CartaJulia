@@ -30,8 +30,11 @@ function _view_healpix_map(
     unit_label_tex = latexstring("\\text{", latex_safe(unit_label), "}")
 
     # ---------- Reprojection (une seule fois, conservée en mémoire) ----------
-    img_raw = mollweide_grid(m; nx=nx, ny=ny)
+    # why: project once, then gather into both the displayed image and the
+    # pixel-index grid used for region selection. Avoids running the
+    # Mollweide trig + ang2pixRing twice.
     ipix_grid = mollweide_pixel_index(m.resolution, nx, ny)
+    img_raw   = mollweide_apply_index(ipix_grid, m)
 
     # ---------- État ----------
     cmap_name   = Observable(cmap)
