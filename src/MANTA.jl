@@ -23,6 +23,12 @@ include("helpers/UITheme.jl")
 # ---- datasets ----
 include("datasets/Datasets.jl")
 
+# ---- masking ----
+# Persistent mask system shared by the cube viewer and the pure helpers
+# (`moment_map`, `mean_region_spectrum`). Declared early so the symbols are
+# in scope when CubeView.jl is compiled.
+include("masking/Mask.jl")
+
 # ---- HEALPix viewer ----
 import Statistics: quantile
 include("MANTAHealpix.jl")
@@ -31,6 +37,7 @@ export manta_healpix, manta_healpix_cube, is_healpix_fits,
        valid_healpix_npix, manta_healpix_panels
 
 # ---- loaders ----
+include("loaders/LazyFITS.jl")
 include("loaders/FITSLoader.jl")
 include("loaders/HDF5Loader.jl")
 include("loaders/InMemoryLoader.jl")
@@ -41,6 +48,11 @@ include("views/HealpixMapView.jl")
 # Cube-viewer support: pure helpers shared by `_view_cube` and any future
 # cube-related entry points. Included before CubeView.jl so the symbols
 # are available when the closure-heavy view body is compiled.
+include("views/cube/MaskBundle.jl")
+include("views/cube/CompareBundle.jl")
+include("views/cube/KeyboardBundle.jl")
+include("views/cube/ExportBundle.jl")
+include("views/cube/PSWindowBundle.jl")
 include("views/cube/PowerSpectrumBundle.jl")
 include("views/cube/AnimationRequest.jl")
 include("views/CubeView.jl")
@@ -53,6 +65,10 @@ export MultiChannelDataset, HealpixMapDataset, HealpixCubeDataset
 export get_slice_view, get_slice_copy, as_float32, parse_path_spec
 export stable_source_id
 export view_cube
+# Mask system (persistent voxel masks for cube viewers)
+export MaskSource, NoMaskSource, FiniteSource, ThresholdSource, RectangleSource
+export MANTAMask, make_mask, build_mask, mask_count, mask_total, mask_fraction
+export mask_source_to_toml, mask_source_from_toml
 
 spawn_safely(f::Function) = @async try f() catch e
     @error "Background task failed" exception=(e, catch_backtrace())
@@ -123,8 +139,17 @@ function manta(
     moment_channels::Union{Nothing,AbstractVector{<:Integer}} = nothing,
     # Cube-only: preload a second FITS cube for side-by-side comparison.
     compare::Union{Nothing,AbstractString} = nothing,
+    # Cube-only: declarative viewer state, as produced by "Copy code" or
+    # `save_viewer_settings`.
+    state = nothing,
+    # FITS-only: choose the HDU (1 = primary, 0 = auto-pick first non-empty).
+    hdu::Integer = 1,
+    # FITS-only: memory-map the pixels (read each slice on demand instead of
+    # the whole cube up-front). Quietly ignored for non-FITS inputs.
+    lazy::Bool = false,
     )
-    ds = load_dataset(filepath; column = column, v0 = v0, dv = dv, vunit = vunit)
+    ds = load_dataset(filepath; column = column, v0 = v0, dv = dv, vunit = vunit,
+                      hdu = hdu, lazy = lazy)
 
     if ds isa HealpixMapDataset
         return manta(ds;
@@ -160,7 +185,8 @@ function manta(
             moment_threshold = moment_threshold,
             moment_nsigma = moment_nsigma,
             moment_channels = moment_channels,
-            compare = compare)
+            compare = compare,
+            state = state)
     elseif ds isa ImageDataset
         return manta(ds;
             cmap = cmap, vmin = vmin, vmax = vmax, invert = invert,
@@ -251,12 +277,15 @@ function manta(
 
     ui_theme = default_ui_theme()
     fig_bg_panels = ui_theme.background
-    activate_gl ? GLMakie.activate!() : CairoMakie.activate!()
+    pick_backend!(activate_gl)
     fig = Figure(size = _pick_fig_size(figsize), backgroundcolor = fig_bg_panels)
     grid = fig[1, 1] = GridLayout()
     colgap!(grid, 16); rowgap!(grid, 14)
-    img_grid = grid[1, 1] = GridLayout()
+    # halign/tellwidth : empêche img_grid de s'élargir au-delà de son contenu
+    # naturel (image + colorbar) quand les contrôles en dessous sont plus larges.
+    img_grid = grid[1, 1] = GridLayout(; halign = :center, tellwidth = false)
     colgap!(img_grid, -8)
+    rowgap!(img_grid, 14)   # espace entre image et histogramme (même valeur que rowgap de grid)
     ax = Axis(
         img_grid[1, 1];
         title = make_main_title(title),
@@ -278,8 +307,10 @@ function manta(
     ui_accent = ui_theme.accent
     ui_text_muted = ui_theme.text_muted
 
+    # Histogramme placé dans img_grid[2, 1:2] : il hérite automatiquement
+    # de la même largeur que le couple image+colorbar (colonnes 1 et 2).
     ax_hist = Axis(
-        grid[2, 1];
+        img_grid[2, 1:2];
         title = L"\text{Image histogram}",
         xlabel = unit_label_tex,
         ylabel = hist_ylabel_obs,
@@ -289,13 +320,14 @@ function manta(
     lines!(ax_hist, hist_x_obs, hist_y_obs; color = ui_accent, linewidth = 1.8, visible = hist_kde_visible)
     vlines!(ax_hist, lift(lim -> [first(lim), last(lim)], clims_safe); color = (ui_text_muted, 0.65), linewidth = 1.1, linestyle = :dash)
 
-    ctrl = grid[3, 1] = GridLayout(; alignmode = Outside())
+    ctrl = grid[2, 1] = GridLayout(; alignmode = Outside())
     Label(ctrl[1, 1], text = "Image", halign = :left, tellwidth = false, fontsize = 14, color = ui_text_muted)
     scale_menu = Menu(ctrl[1, 2]; options = ["lin", "log10", "ln"], prompt = String(scale), width = 96)
     Label(ctrl[1, 3], text = "Colormap", halign = :left, tellwidth = false, fontsize = 14, color = ui_text_muted)
     cmap_menu = Menu(ctrl[1, 4]; options = ui_colormap_options(), prompt = String(cmap), width = 112)
     invert_chk = Checkbox(ctrl[1, 5])
     Label(ctrl[1, 6], text = "Invert", halign = :left, tellwidth = false, fontsize = 14, color = ui_theme.text)
+    help_btn = Button(ctrl[1, 7]; label = "Help", width = 78, height = 32)
     Label(ctrl[2, 1], text = "Contrast", halign = :left, tellwidth = false, fontsize = 14, color = ui_text_muted)
     clim_min_box = Textbox(ctrl[2, 2]; placeholder = "min", width = 110, height = 32)
     clim_max_box = Textbox(ctrl[2, 3]; placeholder = "max", width = 110, height = 32)
@@ -316,9 +348,9 @@ function manta(
     hist_y_apply_btn = Button(ctrl[4, 6]; label = "Apply y", width = 82, height = 32)
     hist_y_auto_btn = Button(ctrl[4, 7]; label = "Auto y", width = 82, height = 32)
     ui_status = Observable(" ")
-    grid[4, 1] = Label(grid[4, 1]; text = ui_status, halign = :left, tellwidth = false)
+    grid[3, 1] = Label(grid[3, 1]; text = ui_status, halign = :left, tellwidth = false)
 
-    foreach(w -> manta_style_button!(w, ui_theme), (apply_btn, auto_btn, p1_btn, p5_btn, save_btn, hist_apply_btn, hist_auto_btn, hist_y_apply_btn, hist_y_auto_btn))
+    foreach(w -> manta_style_button!(w, ui_theme), (apply_btn, auto_btn, p1_btn, p5_btn, save_btn, help_btn, hist_apply_btn, hist_auto_btn, hist_y_apply_btn, hist_y_auto_btn))
     foreach(w -> manta_style_menu!(w, ui_theme), (scale_menu, cmap_menu, hist_mode_menu))
     foreach(w -> manta_style_textbox!(w, ui_theme), (clim_min_box, clim_max_box, hist_bins_box, hist_xmin_box, hist_xmax_box, hist_ymin_box, hist_ymax_box))
     manta_style_checkbox!(invert_chk, ui_theme)
@@ -500,6 +532,57 @@ function manta(
         end
     end
 
+    # ---------- Keyboard shortcuts (2D image view) ----------
+    _trigger_button_2d!(btn) = (btn.clicks[] = btn.clicks[] + 1)
+    function _cycle_log_scale_2d!()
+        next = scale_mode[] === :lin   ? :log10 :
+               scale_mode[] === :log10 ? :ln    : :lin
+        scale_menu.selection[] = String(next)
+        set_status!("Image scale: $(String(next)).")
+    end
+    shortcuts_2d = ShortcutBinding[
+        ShortcutBinding(Keyboard.i,  () -> (invert_cmap[] = !invert_cmap[]);
+                        description = "invert cmap"),
+        ShortcutBinding(Keyboard.a,  () -> _trigger_button_2d!(auto_btn);
+                        description = "auto contrast"),
+        ShortcutBinding(Keyboard._1, () -> apply_percentile_clims!(1, 99);
+                        description = "p1-p99"),
+        ShortcutBinding(Keyboard._5, () -> apply_percentile_clims!(5, 95);
+                        description = "p5-p95"),
+        ShortcutBinding(Keyboard.r,  () -> autolimits!(ax);
+                        description = "reset zoom"),
+        ShortcutBinding(Keyboard.s,  () -> _trigger_button_2d!(save_btn);
+                        description = "save image"),
+        ShortcutBinding(Keyboard.l,  () -> _cycle_log_scale_2d!();
+                        description = "cycle scale"),
+    ]
+    # Help window — both the Shift+/ binding and the Help button open a
+    # dedicated Makie figure listing every documented shortcut. The status
+    # bar still gets a one-line recap so headless / scripted users keep a
+    # textual trace.
+    function _open_help_2d!()
+        try
+            open_shortcut_help_window(shortcuts_2d;
+                title = "MANTA — 2D image shortcuts", theme = ui_theme)
+        catch e
+            @warn "Could not open shortcut help window" exception = (e, catch_backtrace())
+        end
+        set_status!(shortcut_help_message(shortcuts_2d))
+    end
+    push!(shortcuts_2d,
+          ShortcutBinding(Keyboard.slash,
+                          _open_help_2d!;
+                          description = "this help",
+                          modifier = :shift))
+    on(help_btn.clicks) do _
+        _open_help_2d!()
+    end
+    register_shortcuts!(fig, shortcuts_2d;
+        textboxes = (clim_min_box, clim_max_box,
+                     hist_bins_box, hist_xmin_box, hist_xmax_box,
+                     hist_ymin_box, hist_ymax_box),
+    )
+
     keepalive!(fig)
     refresh_hist_axes!()
     on(fig.scene.events.window_open) do is_open
@@ -519,7 +602,7 @@ function manta(
     display_fig::Bool = true,
 )
     rgb_img = as_rgb_image(img)
-    activate_gl ? GLMakie.activate!() : CairoMakie.activate!()
+    pick_backend!(activate_gl)
     fig = Figure(size = _pick_fig_size(figsize))
     ax = Axis(
         fig[1, 1];
@@ -548,7 +631,7 @@ function manta_panels(
     display_fig::Bool = true,
 ) where {N}
     N >= 1 || throw(ArgumentError("Provide at least one panel."))
-    activate_gl ? GLMakie.activate!() : CairoMakie.activate!()
+    pick_backend!(activate_gl)
     fig = Figure(size = _pick_fig_size(figsize))
     title_at(i) = titles === nothing ? "panel $(i)" : String(titles[i])
     cmap_at(i) = cmaps === nothing ? :viridis : cmaps[i]
@@ -673,6 +756,7 @@ function manta(
     moment_nsigma::Union{Nothing,Real} = nothing,
     moment_channels::Union{Nothing,AbstractVector{<:Integer}} = nothing,
     compare::Union{Nothing,AbstractString} = nothing,
+    state = nothing,
 )
     if rgb
         return manta(as_rgb_image(ds.data);
@@ -692,7 +776,8 @@ function manta(
         moment_threshold = moment_threshold,
         moment_nsigma = moment_nsigma,
         moment_channels = moment_channels,
-        compare = compare)
+        compare = compare,
+        state = state)
 end
 
 function manta(

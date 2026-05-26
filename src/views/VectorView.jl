@@ -276,7 +276,7 @@ function _view_vector(
     ui_accent_dim  = ui_theme.accent_dim
     ui_selection   = ui_theme.selection
 
-    activate_gl ? GLMakie.activate!() : CairoMakie.activate!()
+    pick_backend!(activate_gl)
     fig = Figure(size = _pick_fig_size(figsize), backgroundcolor = fig_bg)
     grid = fig[1, 1] = GridLayout()
     colgap!(grid, 16); rowgap!(grid, 14)

@@ -3,8 +3,8 @@
 # Cube → slice mapping primitives (`ijk_to_uv`, `uv_to_ijk`, `get_slice_view`,
 # `get_slice_copy`, `get_slice`), region selection (`region_uv_indices`,
 # `mean_region_spectrum`), small stats helper (`finite_mean_std`) and the
-# dual-view comparison product (`dual_view_product`). Extracted from
-# helpers/Helpers.jl.
+# dual-view comparison product (`dual_view_product`) and visual resampling
+# helpers. Extracted from helpers/Helpers.jl.
 
 
 ############################
@@ -119,34 +119,69 @@ function region_uv_indices(
 end
 
 """
-    mean_region_spectrum(data, axis, uv_indices) -> Vector{Float32}
+    mean_region_spectrum(data, axis, uv_indices; mask=nothing) -> Vector{Float32}
 
 Average the spectrum along `axis` over a set of `(u, v)` pixels in the
 current slice plane. Non-finite voxels are ignored channel by channel.
+
+When `mask` is provided, it must be a 3-D `AbstractArray{Bool}` with the
+same shape as `data`. Voxels where the mask is `false` are skipped
+(treated identically to a non-finite value), so the returned average only
+incorporates voxels accepted by both the finiteness test AND the mask.
+Passing `nothing` (the default) preserves the legacy unmasked behaviour
+exactly.
 """
-function mean_region_spectrum(data::AbstractArray{T,3}, axis::Integer, uv_indices) where {T}
+function mean_region_spectrum(data::AbstractArray{T,3}, axis::Integer, uv_indices;
+                              mask::Union{Nothing,AbstractArray{Bool,3}} = nothing) where {T}
     1 <= axis <= 3 || throw(ArgumentError("axis must be 1, 2, or 3"))
+    if mask !== nothing && size(mask) != size(data)
+        throw(DimensionMismatch(
+            "mean_region_spectrum: mask size $(size(mask)) does not match data size $(size(data))"))
+    end
     n = size(data, axis)
     y = fill(Float32(NaN), n)
     isempty(uv_indices) && return y
-    @inbounds for chan in 1:n
-        acc = 0.0
-        cnt = 0
-        for (u, v) in uv_indices
-            val = if axis == 1
-                data[chan, u, v]
-            elseif axis == 2
-                data[u, chan, v]
-            else
-                data[u, v, chan]
+    if mask === nothing
+        @inbounds for chan in 1:n
+            acc = 0.0
+            cnt = 0
+            for (u, v) in uv_indices
+                val = if axis == 1
+                    data[chan, u, v]
+                elseif axis == 2
+                    data[u, chan, v]
+                else
+                    data[u, v, chan]
+                end
+                fv = Float32(val)
+                if isfinite(fv)
+                    acc += Float64(fv)
+                    cnt += 1
+                end
             end
-            fv = Float32(val)
-            if isfinite(fv)
-                acc += Float64(fv)
-                cnt += 1
-            end
+            y[chan] = cnt == 0 ? Float32(NaN) : Float32(acc / cnt)
         end
-        y[chan] = cnt == 0 ? Float32(NaN) : Float32(acc / cnt)
+    else
+        @inbounds for chan in 1:n
+            acc = 0.0
+            cnt = 0
+            for (u, v) in uv_indices
+                m, val = if axis == 1
+                    (mask[chan, u, v], data[chan, u, v])
+                elseif axis == 2
+                    (mask[u, chan, v], data[u, chan, v])
+                else
+                    (mask[u, v, chan], data[u, v, chan])
+                end
+                m || continue
+                fv = Float32(val)
+                if isfinite(fv)
+                    acc += Float64(fv)
+                    cnt += 1
+                end
+            end
+            y[chan] = cnt == 0 ? Float32(NaN) : Float32(acc / cnt)
+        end
     end
     return y
 end
@@ -179,28 +214,30 @@ end
 
 Compute the right-hand dual-view product from primary slice `a` and secondary
 slice `b`. `mode` accepts `:A`, `:B`, `:diff`, `:ratio`, or `:residuals`.
+When the slices have different sizes, `b` is linearly resampled to `a`'s
+grid for visual comparison.
 """
 function dual_view_product(a::AbstractMatrix, b::AbstractMatrix, mode::Symbol)
-    size(a) == size(b) || throw(DimensionMismatch("dual slices must have the same size"))
+    b_view = size(a) == size(b) ? b : resample_matrix_linear(b, size(a))
     out = similar(Float32.(a))
     if mode === :A
         copyto!(out, Float32.(a))
     elseif mode === :B
-        copyto!(out, Float32.(b))
+        copyto!(out, Float32.(b_view))
     elseif mode === :diff
-        @inbounds for i in eachindex(out, a, b)
-            out[i] = Float32(a[i]) - Float32(b[i])
+        @inbounds for i in eachindex(out, a, b_view)
+            out[i] = Float32(a[i]) - Float32(b_view[i])
         end
     elseif mode === :ratio
-        @inbounds for i in eachindex(out, a, b)
-            den = Float32(b[i])
+        @inbounds for i in eachindex(out, a, b_view)
+            den = Float32(b_view[i])
             num = Float32(a[i])
             out[i] = isfinite(num) && isfinite(den) && den != 0f0 ? num / den : NaN32
         end
     elseif mode === :residuals
         diff = similar(out)
-        @inbounds for i in eachindex(diff, a, b)
-            diff[i] = Float32(a[i]) - Float32(b[i])
+        @inbounds for i in eachindex(diff, a, b_view)
+            diff[i] = Float32(a[i]) - Float32(b_view[i])
         end
         μ, σ = finite_mean_std(diff)
         if !isfinite(σ) || σ <= 0
@@ -215,4 +252,146 @@ function dual_view_product(a::AbstractMatrix, b::AbstractMatrix, mode::Symbol)
         throw(ArgumentError("unknown dual view mode: $(mode)"))
     end
     return out
+end
+
+"""
+    resample_matrix_linear(A, target_size) -> Matrix{Float32}
+
+Linearly resample a 2-D array to `target_size`, matching endpoints along
+each axis. Non-finite source pixels are ignored and yield `NaN32` only when
+all contributing pixels are non-finite or the sampled coordinate falls
+outside the source image.
+"""
+function resample_matrix_linear(A::AbstractMatrix{<:Real}, target_size::Tuple{<:Integer,<:Integer})
+    tx, ty = Int.(target_size)
+    tx >= 1 && ty >= 1 || throw(ArgumentError("target_size entries must be positive"))
+    sx, sy = size(A)
+    out = Matrix{Float32}(undef, tx, ty)
+    @inbounds for j in 1:ty
+        y = _resample_coord(j, sy, ty)
+        for i in 1:tx
+            x = _resample_coord(i, sx, tx)
+            out[i, j] = _linear_sample_2d(A, x, y)
+        end
+    end
+    return out
+end
+
+"""
+    resample_cube_linear(A, target_size) -> Array{Float32,3}
+
+Trilinearly resample a cube to `target_size`, matching endpoints along every
+axis. This is intended for visual comparison products, not flux-conserving
+scientific reprojection.
+"""
+function resample_cube_linear(A::AbstractArray{<:Real,3}, target_size::NTuple{3,<:Integer})
+    tx, ty, tz = Int.(target_size)
+    tx >= 1 && ty >= 1 && tz >= 1 || throw(ArgumentError("target_size entries must be positive"))
+    sx, sy, sz = size(A)
+    out = Array{Float32,3}(undef, tx, ty, tz)
+    @inbounds for k in 1:tz
+        z = _resample_coord(k, sz, tz)
+        for j in 1:ty
+            y = _resample_coord(j, sy, ty)
+            for i in 1:tx
+                x = _resample_coord(i, sx, tx)
+                out[i, j, k] = _linear_sample_3d(A, x, y, z)
+            end
+        end
+    end
+    return out
+end
+
+"""
+    reproject_cube_linear(A, source_wcs, reference_wcs, target_size)
+
+Resample `A` onto the reference cube's pixel grid using the lightweight
+per-axis linear WCS (`CRVAL/CRPIX/CDELT`). This deliberately ignores CD/PC
+cross-terms; callers should use it only when the axes are separable.
+"""
+function reproject_cube_linear(
+    A::AbstractArray{<:Real,3},
+    source_wcs,
+    reference_wcs,
+    target_size::NTuple{3,<:Integer},
+)
+    tx, ty, tz = Int.(target_size)
+    tx >= 1 && ty >= 1 && tz >= 1 || throw(ArgumentError("target_size entries must be positive"))
+    out = Array{Float32,3}(undef, tx, ty, tz)
+    @inbounds for k in 1:tz
+        z = source_pixel_coord(source_wcs, 3, world_coord(reference_wcs, 3, k))
+        for j in 1:ty
+            y = source_pixel_coord(source_wcs, 2, world_coord(reference_wcs, 2, j))
+            for i in 1:tx
+                x = source_pixel_coord(source_wcs, 1, world_coord(reference_wcs, 1, i))
+                out[i, j, k] = _linear_sample_3d(A, x, y, z)
+            end
+        end
+    end
+    return out
+end
+
+source_pixel_coord(wcs, dim::Integer, world::Real) =
+    has_wcs(wcs, dim) ? (Float64(world) - wcs[dim].crval) / wcs[dim].cdelt + wcs[dim].crpix : Float64(world)
+
+function _resample_coord(i::Integer, source_n::Integer, target_n::Integer)
+    source_n <= 1 && return 1.0
+    target_n <= 1 && return 1.0
+    return 1.0 + (Float64(i) - 1.0) * (Float64(source_n) - 1.0) / (Float64(target_n) - 1.0)
+end
+
+function _linear_sample_2d(A, x::Real, y::Real)
+    sx, sy = size(A)
+    (1.0 <= x <= sx && 1.0 <= y <= sy) || return NaN32
+    x0 = clamp(Int(floor(x)), 1, sx)
+    y0 = clamp(Int(floor(y)), 1, sy)
+    x1 = min(x0 + 1, sx)
+    y1 = min(y0 + 1, sy)
+    fx = Float64(x) - x0
+    fy = Float64(y) - y0
+    acc = 0.0
+    wsum = 0.0
+    @inbounds for (ii, wx) in ((x0, 1.0 - fx), (x1, fx))
+        wx == 0.0 && continue
+        for (jj, wy) in ((y0, 1.0 - fy), (y1, fy))
+            w = wx * wy
+            w == 0.0 && continue
+            v = Float64(A[ii, jj])
+            isfinite(v) || continue
+            acc += w * v
+            wsum += w
+        end
+    end
+    return wsum == 0.0 ? NaN32 : Float32(acc / wsum)
+end
+
+function _linear_sample_3d(A, x::Real, y::Real, z::Real)
+    sx, sy, sz = size(A)
+    (1.0 <= x <= sx && 1.0 <= y <= sy && 1.0 <= z <= sz) || return NaN32
+    x0 = clamp(Int(floor(x)), 1, sx)
+    y0 = clamp(Int(floor(y)), 1, sy)
+    z0 = clamp(Int(floor(z)), 1, sz)
+    x1 = min(x0 + 1, sx)
+    y1 = min(y0 + 1, sy)
+    z1 = min(z0 + 1, sz)
+    fx = Float64(x) - x0
+    fy = Float64(y) - y0
+    fz = Float64(z) - z0
+    acc = 0.0
+    wsum = 0.0
+    @inbounds for (ii, wx) in ((x0, 1.0 - fx), (x1, fx))
+        wx == 0.0 && continue
+        for (jj, wy) in ((y0, 1.0 - fy), (y1, fy))
+            wy == 0.0 && continue
+            for (kk, wz) in ((z0, 1.0 - fz), (z1, fz))
+                w = wx * wy * wz
+                w == 0.0 && continue
+                v = Float64(A[ii, jj, kk])
+                isfinite(v) || continue
+                acc += w * v
+                wsum += w
+            end
+        end
+    end
+    return wsum == 0.0 ? NaN32 : Float32(acc / wsum)
 end

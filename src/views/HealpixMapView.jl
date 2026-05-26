@@ -139,8 +139,18 @@ function _view_healpix_map(
     ui_text_muted = ui_theme.text_muted
 
     # ---------- Figure ----------
-    activate_gl ? GLMakie.activate!() : CairoMakie.activate!()
-    fig = Figure(size = _pick_fig_size(figsize), backgroundcolor = ui_theme.background)
+    pick_backend!(activate_gl)
+    fig_size = _pick_fig_size(figsize)
+    # Layout responsive : mêmes seuils que CubeView pour rester cohérent
+    # quand on bascule d'une vue à l'autre. Sans ça, les hauteurs fixes
+    # poussent la barre d'info / histogramme / contrôles hors fenêtre sur
+    # les petites tailles (≤ 1500×950).
+    compact_layout  = fig_size[1] <= 1500 || fig_size[2] <= 950
+    cbar_h_px       = compact_layout ? 38  : 52
+    info_h_px       = compact_layout ? 22  : 30
+    hist_h_px       = compact_layout ? 70  : 105
+    font_sz         = compact_layout ? 13  : 15
+    fig = Figure(size = fig_size, backgroundcolor = ui_theme.background)
 
     main_grid = fig[1, 1] = GridLayout()
     colgap!(main_grid, -8)
@@ -206,12 +216,12 @@ function _view_healpix_map(
         halign = :center,
     )
     rowsize!(main_grid, 1, Relative(1))
-    rowsize!(main_grid, 2, Fixed(52))
+    rowsize!(main_grid, 2, Fixed(cbar_h_px))
 
     # Bandeau info
     info_obs = Observable(latexstring("\\text{move cursor over the map}"))
-    Label(main_grid[3, 1], info_obs; halign=:left, fontsize=15)
-    rowsize!(main_grid, 3, Fixed(30))
+    Label(main_grid[3, 1], info_obs; halign=:left, fontsize=font_sz)
+    rowsize!(main_grid, 3, Fixed(info_h_px))
 
     # Contrôles
     ax_hist = Axis(
@@ -228,65 +238,207 @@ function _view_healpix_map(
     lines!(ax_hist, hist_x_obs, hist_y_obs; color=ui_accent, linewidth=1.8, visible=hist_kde_visible)
     vlines!(ax_hist, lift(lim -> [first(lim), last(lim)], clims_safe);
             color=(ui_text_muted, 0.65), linewidth=1.0, linestyle=:dash)
-    rowsize!(main_grid, 4, Fixed(105))
+    rowsize!(main_grid, 4, Fixed(hist_h_px))
 
-    ctrl = main_grid[5, 1] = GridLayout(; alignmode=Outside())
-    rowsize!(main_grid, 5, Fixed(225))
-    Label(ctrl[1,1], text=L"\text{Scale}", halign=:left, tellwidth=false, fontsize=15)
-    scale_menu = Menu(ctrl[1,2]; options=["lin","log10","ln"],
-                     prompt = String(scale), width=92)
-    Label(ctrl[1,3], text=L"\text{Colormap}", halign=:left, tellwidth=false, fontsize=15)
-    cmap_menu = Menu(ctrl[1,4]; options=ui_colormap_options(), prompt=String(cmap), width=112)
-    invert_chk = Checkbox(ctrl[1,5])
-    Label(ctrl[1,6], text="Invert", halign=:left, tellwidth=false, fontsize=15)
+    # ---------- Controls (card-based modal layout, mirrors CubeView) ----------
+    ctrl_row_h   = compact_layout ? (36, 168, 130) : (42, 188, 150)
+    ctrl_gap     = compact_layout ? 6 : 10
+    ctrl_total_h = sum(ctrl_row_h) + 2 * ctrl_gap
+    card_pad     = compact_layout ? 9 : 12
+    card_gap     = compact_layout ? 7 : 10
+
+    ctrl_grid = main_grid[5, 1] = GridLayout(; alignmode = Outside())
+    rowsize!(main_grid, 5, Fixed(ctrl_total_h))
+    colgap!(ctrl_grid, ctrl_gap)
+    rowgap!(ctrl_grid, ctrl_gap)
+
+    # -- block/layout visibility helpers (verbatim from CubeView) --
+    set_block_visible!(block, visible::Bool) = begin
+        try; block.visible[] = visible;            catch; end
+        try; block.scene.visible[] = visible;      catch; end
+        try; block.blockscene.visible[] = visible; catch; end
+        nothing
+    end
+    function set_layout_contents_visible!(layout, visible::Bool)
+        for block in try; contents(layout); catch; Any[]; end
+            set_block_visible!(block, visible)
+            block isa GridLayout && set_layout_contents_visible!(block, visible)
+        end
+        nothing
+    end
+
+    # -- card factory (verbatim from CubeView) --
+    function control_card!(parent, row, col, title::AbstractString; rows::Int = 4, cols::Int = 4)
+        card = parent[row, col] = GridLayout(;
+            alignmode = Outside(card_pad), tellwidth = false, tellheight = false)
+        body_rows = rows + 1
+        Box(card[1:body_rows, 1:cols]; color = ui_theme.panel, strokecolor = ui_theme.border,
+            strokewidth = 1.0, cornerradius = 8, z = -6)
+        Box(card[1, 1:cols]; color = ui_theme.panel_header, strokecolor = (:transparent, 0.0),
+            strokewidth = 0.0, cornerradius = 8, z = -5)
+        Label(card[1, 1:cols]; text = uppercase(title), halign = :left, tellwidth = false,
+            fontsize = 13, font = :bold, color = ui_theme.accent_strong,
+            padding = (10, 10, 6, 6))
+        Box(card[body_rows, 1:cols]; color = :transparent, strokewidth = 0, z = -7)
+        rowsize!(card, body_rows, Fixed(compact_layout ? 10 : 12))
+        rowgap!(card, card_gap)
+        colgap!(card, card_gap)
+        return card
+    end
+    ctrl_lbl!(layout, pos, txt) = Label(layout[pos...]; text = txt, halign = :left,
+        tellwidth = false, fontsize = 13, color = ui_theme.text_muted)
+
+    # ── Mode bar (row 1, full width) ──────────────────────────────────────
+    mode_bar = ctrl_grid[1, 1:3] = GridLayout(; alignmode = Outside(0))
+    colgap!(mode_bar, compact_layout ? 6 : 10)
+    mode_nav_btn      = Button(mode_bar[1, 1]; label = "Navigation", width = 130, height = 32)
+    mode_analysis_btn = Button(mode_bar[1, 2]; label = "Analysis",   width = 112, height = 32)
+    mode_export_btn   = Button(mode_bar[1, 3]; label = "Export",     width = 96,  height = 32)
+    help_btn          = Button(mode_bar[1, 4]; label = "Help",       width = 74,  height = 32)
+    foreach(c -> colsize!(mode_bar, c, Auto()), 1:4)
+    control_mode = Observable(:navigation)
+
+    # ── NAVIGATION: Display card (row 2 col 1) ────────────────────────────
+    display_card = control_card!(ctrl_grid, 2, 1, "Display"; rows = 4, cols = 5)
+    ctrl_lbl!(display_card, (2, 1), "Scale")
+    scale_menu = Menu(display_card[2, 2:3]; options = ["lin", "log10", "ln"],
+                      prompt = String(scale), width = compact_layout ? 88 : 102)
+    invert_chk = Checkbox(display_card[2, 4])
+    Label(display_card[2, 5]; text = "Invert", halign = :left, tellwidth = false,
+          fontsize = 13, color = ui_theme.text)
     invert_chk.checked[] = invert_cmap[]
+    ctrl_lbl!(display_card, (3, 1), "Colormap")
+    cmap_menu = Menu(display_card[3, 2:5]; options = ui_colormap_options(),
+                     prompt = String(cmap), width = compact_layout ? 144 : 164)
+    gauss_chk = Checkbox(display_card[4, 1])
+    Label(display_card[4, 2]; text = "Smoothing", halign = :left, tellwidth = false,
+          fontsize = 13, color = ui_theme.text)
+    sigma_label = Label(display_card[4, 3];
+        text = latexstring("\\sigma = 1.5\\,\\text{px}"),
+        fontsize = 13, halign = :left, tellwidth = false, color = ui_theme.text)
+    sigma_slider = Slider(display_card[4, 4:5];
+        range = LinRange(0, 10, 101), startvalue = 1.5,
+        width = compact_layout ? 128 : 158, height = 24)
+    foreach(c -> colsize!(display_card, c, Auto()), 1:5)
 
-    Label(ctrl[2,1], text=L"\text{Contrast}", halign=:left, tellwidth=false, fontsize=15)
-    clim_min_box = Textbox(ctrl[2,2]; placeholder="min", width=110, height=30)
-    clim_max_box = Textbox(ctrl[2,3]; placeholder="max", width=110, height=30)
-    apply_btn    = Button(ctrl[2,4]; label="Apply", width=80, height=30)
-    auto_btn     = Button(ctrl[2,5]; label="Auto", width=76, height=30)
-    p1_btn       = Button(ctrl[2,6]; label="p1-p99", width=88, height=30)
-    p5_btn       = Button(ctrl[2,7]; label="p5-p95", width=88, height=30)
-
-    graticule_chk = Checkbox(ctrl[3,1])
-    Label(ctrl[3,2], text="Graticule", halign=:left, tellwidth=false, fontsize=15)
+    # ── NAVIGATION: View card (row 2 col 2) ───────────────────────────────
+    nav_view_card = control_card!(ctrl_grid, 2, 2, "View"; rows = 3, cols = 4)
+    graticule_chk = Checkbox(nav_view_card[2, 1])
+    Label(nav_view_card[2, 2]; text = "Graticule", halign = :left, tellwidth = false,
+          fontsize = 13, color = ui_theme.text)
     graticule_chk.checked[] = show_graticule[]
-    reset_zoom_btn = Button(ctrl[3,3]; label="Reset zoom", width=120, height=30)
-    save_btn       = Button(ctrl[3,4]; label="Save PNG", width=120, height=30)
+    reset_zoom_btn = Button(nav_view_card[3, 1:2]; label = "Reset zoom", width = 122, height = 32)
+    foreach(c -> colsize!(nav_view_card, c, Auto()), 1:4)
 
-    gauss_chk = Checkbox(ctrl[3,5])
-    Label(ctrl[3,6], text="Smoothing", halign=:left, tellwidth=false, fontsize=15)
-    sigma_label = Label(ctrl[3,7], text=latexstring("\\sigma = 1.5\\,\\text{px}"), fontsize=15, halign=:left, tellwidth=false)
-    sigma_slider = Slider(ctrl[3,8:10]; range=LinRange(0, 10, 101), startvalue=1.5, width=210, height=14)
+    # ── ANALYSIS: Contrast card (row 2 col 1) ────────────────────────────
+    contrast_card = control_card!(ctrl_grid, 2, 1, "Contrast"; rows = 4, cols = 5)
+    clim_min_box  = Textbox(contrast_card[2, 1]; placeholder = "min", width = 110, height = 32)
+    clim_max_box  = Textbox(contrast_card[2, 2]; placeholder = "max", width = 110, height = 32)
+    apply_btn     = Button(contrast_card[2, 3]; label = "Apply",  width = 78, height = 32)
+    auto_btn      = Button(contrast_card[2, 4]; label = "Auto",   width = 72, height = 32)
+    p1_btn        = Button(contrast_card[3, 1]; label = "p1-p99", width = 86, height = 32)
+    p5_btn        = Button(contrast_card[3, 2]; label = "p5-p95", width = 86, height = 32)
+    foreach(c -> colsize!(contrast_card, c, Auto()), 1:5)
 
-    Label(ctrl[4,1], text=L"\text{Selection}", halign=:left, tellwidth=false, fontsize=15)
-    region_mode_menu = Menu(ctrl[4,2]; options=["point", "box", "circle"], prompt="point", width=108)
-    region_clear_btn = Button(ctrl[4,3]; label="Clear selection", width=138, height=30)
-    region_count_label = Label(ctrl[4,4]; text="0 pix", halign=:left, tellwidth=false, fontsize=15)
-    Label(ctrl[5,1], text=L"\text{Contours}", halign=:left, tellwidth=false, fontsize=15)
-    contour_chk = Checkbox(ctrl[5,2])
-    Label(ctrl[5,3], text="Show", halign=:left, tellwidth=false, fontsize=15)
-    contour_levels_box = Textbox(ctrl[5,4:6]; placeholder="auto or 1:red, 2:#00ffaa", width=250, height=30)
-    contour_apply_btn = Button(ctrl[5,7]; label="Apply", width=80, height=30)
+    # ── ANALYSIS: Selection card (row 2 col 2) ───────────────────────────
+    selection_card = control_card!(ctrl_grid, 2, 2, "Selection"; rows = 3, cols = 4)
+    region_mode_menu = Menu(selection_card[2, 1]; options = ["point", "box", "circle"],
+                            prompt = "point", width = compact_layout ? 100 : 116)
+    region_clear_btn = Button(selection_card[2, 2]; label = "Clear",
+                              width = compact_layout ? 84 : 96, height = 32)
+    region_count_label = Label(selection_card[2, 3:4]; text = "0 pix", halign = :left,
+                               tellwidth = false, fontsize = 13, color = ui_theme.text_muted)
+    foreach(c -> colsize!(selection_card, c, Auto()), 1:4)
+
+    # ── ANALYSIS: Contours card (row 2 col 3) ────────────────────────────
+    contour_card = control_card!(ctrl_grid, 2, 3, "Contours"; rows = 3, cols = 5)
+    contour_chk = Checkbox(contour_card[2, 1])
+    Label(contour_card[2, 2]; text = "Show", halign = :left, tellwidth = false,
+          fontsize = 13, color = ui_theme.text)
+    contour_levels_box = Textbox(contour_card[2, 3:4];
+        placeholder = "auto or 1:red, 2:#00ffaa",
+        width = compact_layout ? 174 : 202, height = 32)
+    contour_apply_btn = Button(contour_card[2, 5]; label = "Apply", width = 74, height = 32)
     contour_chk.checked[] = show_contours[]
-    Label(ctrl[6,1], text=L"\text{Histogram}", halign=:left, tellwidth=false, fontsize=15)
-    hist_mode_menu = Menu(ctrl[6,2]; options=["bars", "kde"], prompt=String(hist_mode_obs[]), width=92)
-    hist_bins_box = Textbox(ctrl[6,3]; placeholder="bins", width=80, height=30)
-    hist_xmin_box = Textbox(ctrl[6,4]; placeholder="x min", width=100, height=30)
-    hist_xmax_box = Textbox(ctrl[6,5]; placeholder="x max", width=100, height=30)
-    hist_apply_btn = Button(ctrl[6,6]; label="Apply x", width=88, height=30)
-    hist_auto_btn = Button(ctrl[6,7]; label="Auto x", width=82, height=30)
-    hist_ymin_box = Textbox(ctrl[6,8]; placeholder="y min", width=100, height=30)
-    hist_ymax_box = Textbox(ctrl[6,9]; placeholder="y max", width=100, height=30)
-    hist_y_apply_btn = Button(ctrl[6,10]; label="Apply y", width=88, height=30)
-    hist_y_auto_btn = Button(ctrl[6,11]; label="Auto y", width=82, height=30)
+    foreach(c -> colsize!(contour_card, c, Auto()), 1:5)
 
-    foreach(w -> manta_style_menu!(w, ui_theme), (scale_menu, cmap_menu, region_mode_menu, hist_mode_menu))
-    foreach(w -> manta_style_button!(w, ui_theme), (apply_btn, auto_btn, p1_btn, p5_btn, reset_zoom_btn, save_btn, region_clear_btn, contour_apply_btn, hist_apply_btn, hist_auto_btn, hist_y_apply_btn, hist_y_auto_btn))
-    foreach(w -> manta_style_checkbox!(w, ui_theme), (invert_chk, graticule_chk, gauss_chk, contour_chk))
-    foreach(w -> manta_style_textbox!(w, ui_theme), (clim_min_box, clim_max_box, contour_levels_box, hist_bins_box, hist_xmin_box, hist_xmax_box, hist_ymin_box, hist_ymax_box))
+    # ── ANALYSIS bottom: Histogram card (row 3, centred) ─────────────────
+    analysis_bottom = ctrl_grid[3, 1:3] = GridLayout(; alignmode = Outside(0))
+    colgap!(analysis_bottom, ctrl_gap)
+    hist_card = control_card!(analysis_bottom, 1, 2, "Histogram"; rows = 3, cols = 6)
+    hist_mode_menu   = Menu(hist_card[2, 1]; options = ["bars", "kde"],
+                            prompt = String(hist_mode_obs[]), width = compact_layout ? 88 : 98)
+    hist_bins_box    = Textbox(hist_card[2, 2]; placeholder = "bins",  width = 68, height = 32)
+    hist_xmin_box    = Textbox(hist_card[2, 3]; placeholder = "x min", width = 84, height = 32)
+    hist_xmax_box    = Textbox(hist_card[2, 4]; placeholder = "x max", width = 84, height = 32)
+    hist_apply_btn   = Button(hist_card[2, 5]; label = "Apply x", width = 74, height = 32)
+    hist_auto_btn    = Button(hist_card[2, 6]; label = "Auto x",  width = 74, height = 32)
+    hist_ymin_box    = Textbox(hist_card[3, 3]; placeholder = "y min", width = 84, height = 32)
+    hist_ymax_box    = Textbox(hist_card[3, 4]; placeholder = "y max", width = 84, height = 32)
+    hist_y_apply_btn = Button(hist_card[3, 5]; label = "Apply y", width = 74, height = 32)
+    hist_y_auto_btn  = Button(hist_card[3, 6]; label = "Auto y",  width = 74, height = 32)
+    foreach(c -> colsize!(hist_card, c, Auto()), 1:6)
+    Box(analysis_bottom[1, 1]; color = :transparent, strokewidth = 0)
+    Box(analysis_bottom[1, 3]; color = :transparent, strokewidth = 0)
+    colsize!(analysis_bottom, 1, Relative(1))
+    colsize!(analysis_bottom, 2, Fixed(compact_layout ? 480 : 560))
+    colsize!(analysis_bottom, 3, Relative(1))
+
+    # ── EXPORT: Output card (row 2 col 1) ────────────────────────────────
+    output_card = control_card!(ctrl_grid, 2, 1, "Output"; rows = 3, cols = 3)
+    save_btn = Button(output_card[2, 1]; label = "Save PNG", width = 110, height = 32)
+    foreach(c -> colsize!(output_card, c, Auto()), 1:3)
+
+    # ── Grid sizing ───────────────────────────────────────────────────────
+    foreach(c -> colsize!(ctrl_grid, c, Relative(1 / 3)), 1:3)
+    rowsize!(ctrl_grid, 1, Fixed(ctrl_row_h[1]))
+    rowsize!(ctrl_grid, 2, Fixed(ctrl_row_h[2]))
+    rowsize!(ctrl_grid, 3, Fixed(ctrl_row_h[3]))
+
+    # ── Style ─────────────────────────────────────────────────────────────
+    foreach(w -> manta_style_menu!(w, ui_theme),
+            (scale_menu, cmap_menu, region_mode_menu, hist_mode_menu))
+    foreach(w -> manta_style_button!(w, ui_theme),
+            (mode_nav_btn, mode_analysis_btn, mode_export_btn, help_btn,
+             apply_btn, auto_btn, p1_btn, p5_btn, reset_zoom_btn, save_btn,
+             region_clear_btn, contour_apply_btn,
+             hist_apply_btn, hist_auto_btn, hist_y_apply_btn, hist_y_auto_btn))
+    foreach(w -> manta_style_checkbox!(w, ui_theme),
+            (invert_chk, graticule_chk, gauss_chk, contour_chk))
+    foreach(w -> manta_style_textbox!(w, ui_theme),
+            (clim_min_box, clim_max_box, contour_levels_box,
+             hist_bins_box, hist_xmin_box, hist_xmax_box,
+             hist_ymin_box, hist_ymax_box))
     manta_style_slider!(sigma_slider, ui_theme)
+
+    # ── Mode switching ────────────────────────────────────────────────────
+    nav_cards_hp      = (display_card, nav_view_card)
+    analysis_cards_hp = (contrast_card, selection_card, contour_card, hist_card)
+    export_cards_hp   = (output_card,)
+
+    function set_mode_button_active!(btn, active::Bool)
+        btn.buttoncolor[]       = active ? ui_theme.surface_active : ui_theme.surface
+        btn.buttoncolor_hover[] = active ? ui_theme.surface_active : ui_theme.surface_hover
+        btn.labelcolor[]        = active ? ui_theme.accent_strong  : ui_theme.text
+        btn.labelcolor_hover[]  = ui_theme.accent_strong
+        btn.strokecolor[]       = active ? ui_theme.accent : ui_theme.border
+        nothing
+    end
+    function refresh_control_mode!()
+        mode = control_mode[]
+        for card in nav_cards_hp;      set_layout_contents_visible!(card, mode === :navigation); end
+        for card in analysis_cards_hp; set_layout_contents_visible!(card, mode === :analysis);   end
+        for card in export_cards_hp;   set_layout_contents_visible!(card, mode === :export);     end
+        set_mode_button_active!(mode_nav_btn,      mode === :navigation)
+        set_mode_button_active!(mode_analysis_btn, mode === :analysis)
+        set_mode_button_active!(mode_export_btn,   mode === :export)
+        nothing
+    end
+    refresh_control_mode!()
+
+    on(mode_nav_btn.clicks)      do _; control_mode[] = :navigation; refresh_control_mode!(); end
+    on(mode_analysis_btn.clicks) do _; control_mode[] = :analysis;   refresh_control_mode!(); end
+    on(mode_export_btn.clicks)   do _; control_mode[] = :export;     refresh_control_mode!(); end
 
     if use_manual[]
         a, b = clims_manual[]
@@ -564,6 +716,65 @@ function _view_healpix_map(
             @error "Failed to save" exception=(e, catch_backtrace())
         end
     end
+
+    # ---------- Keyboard shortcuts (HEALPix Mollweide map) ----------
+    _set_status_hp!(msg::AbstractString) =
+        (info_obs[] = latexstring("\\text{", latex_safe(msg), "}"); nothing)
+    _trigger_btn_hp!(btn) = (btn.clicks[] = btn.clicks[] + 1)
+    function _toggle_contours_hp!()
+        new_val = !show_contours[]
+        contour_chk.checked[] = new_val
+        _set_status_hp!(new_val ? "Contours enabled." : "Contours hidden.")
+    end
+    function _cycle_log_scale_hp!()
+        next = scale_mode[] === :lin   ? :log10 :
+               scale_mode[] === :log10 ? :ln    : :lin
+        scale_menu.selection[] = String(next)
+        _set_status_hp!("Image scale: $(String(next)).")
+    end
+    shortcuts_hp = ShortcutBinding[
+        ShortcutBinding(Keyboard.i,  () -> (invert_cmap[] = !invert_cmap[]);
+                        description = "invert cmap"),
+        ShortcutBinding(Keyboard.a,  () -> _trigger_btn_hp!(auto_btn);
+                        description = "auto contrast"),
+        ShortcutBinding(Keyboard._1, () -> apply_percentile_clims!(1, 99);
+                        description = "p1-p99"),
+        ShortcutBinding(Keyboard._5, () -> apply_percentile_clims!(5, 95);
+                        description = "p5-p95"),
+        ShortcutBinding(Keyboard.r,  () -> _trigger_btn_hp!(reset_zoom_btn);
+                        description = "reset zoom"),
+        ShortcutBinding(Keyboard.s,  () -> _trigger_btn_hp!(save_btn);
+                        description = "save image"),
+        ShortcutBinding(Keyboard.c,  () -> _toggle_contours_hp!();
+                        description = "contours"),
+        ShortcutBinding(Keyboard.l,  () -> _cycle_log_scale_hp!();
+                        description = "cycle scale"),
+    ]
+    # Help: Shift+/ and the Help button open a dedicated Makie figure
+    # with the full binding list; status bar keeps the one-line recap.
+    function _open_help_hp!()
+        try
+            open_shortcut_help_window(shortcuts_hp;
+                title = "MANTA — HEALPix map shortcuts", theme = ui_theme)
+        catch e
+            @warn "Could not open shortcut help window" exception = (e, catch_backtrace())
+        end
+        _set_status_hp!(shortcut_help_message(shortcuts_hp))
+    end
+    push!(shortcuts_hp,
+          ShortcutBinding(Keyboard.slash,
+                          _open_help_hp!;
+                          description = "this help",
+                          modifier = :shift))
+    on(help_btn.clicks) do _
+        _open_help_hp!()
+    end
+    register_shortcuts!(fig, shortcuts_hp;
+        textboxes = (clim_min_box, clim_max_box, contour_levels_box,
+                     hist_bins_box, hist_xmin_box, hist_xmax_box,
+                     hist_ymin_box, hist_ymax_box),
+        is_blocked = () -> zoom_drag_active[] || region_drag_active[],
+    )
 
     refresh_hist_axes!()
     keepalive!(fig)

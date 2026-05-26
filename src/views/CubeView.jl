@@ -50,6 +50,7 @@ function _view_cube(
     moment_nsigma::Union{Nothing,Real} = nothing,
     moment_channels::Union{Nothing,AbstractVector{<:Integer}} = nothing,
     compare::Union{Nothing,AbstractString} = nothing,
+    state = nothing,
 )
     data = as_float32(ds.data)
     siz  = size(data)
@@ -126,22 +127,24 @@ function _view_cube(
     compare_data = Observable{Any}(nothing)
     compare_visible = Observable(false)
     compare_name = Observable("")
+    compare_path_current = Observable("")
     compare_mode = Observable(:B)
     view_product = Observable(:slice)
     moment_order = Observable(0)
     layout_mode = Observable(:base)
     anim_playing = Observable(false)
 
-    # why: read-only display path — view avoids per-frame allocation of the slice
-    # buffer. Mutating consumers downstream must clone; current ones build their
-    # own output (`apply_scale`, `imfilter(Float32.(s), ...)`, `dual_view_product`).
+    # Keep raw slice observables on a single concrete array type. Observables.jl
+    # stores the concrete type of the initial lifted value; returning views here
+    # makes later updates fail when smoothing / moment products emit Matrix
+    # buffers or when the active axis changes the concrete SubArray type.
     slice_raw = lift(axis, idx) do a, id
-        get_slice_view(data, a, clamp(id, 1, siz[a]))
+        get_slice_copy(data, a, clamp(id, 1, siz[a]))
     end
 
     compare_slice_raw = lift(compare_data, axis, idx) do cmp, a, id
         cmp === nothing && return fill(NaN32, slice_dims(a))
-        get_slice_view(cmp, a, clamp(id, 1, siz[a]))
+        get_slice_copy(cmp, a, clamp(id, 1, siz[a]))
     end
 
     gauss_on = Observable(false)
@@ -170,6 +173,17 @@ function _view_cube(
     zoom_drag_active = Observable(false)
     zoom_drag_start  = Observable(Point2f(NaN32, NaN32))
     zoom_drag_end    = Observable(Point2f(NaN32, NaN32))
+
+    # ---------- Mask state ----------
+    # The mask system keeps a *declarative* source (a `MaskSource` subtype that
+    # describes how the mask was built) alongside the concretized
+    # `BitArray{3}`. The bits drive runtime kernels (moments / spectra /
+    # histogram); the source is what gets persisted to viewer_settings.toml so
+    # the mask can be regenerated on reload — we never serialize the BitArray
+    # itself.
+    mask_source_obs = Observable{MaskSource}(NoMaskSource())
+    mask_bits_obs   = Observable{Union{Nothing,BitArray{3}}}(nothing)
+    mask_status_obs = Observable("No mask applied")
 
     ui_theme = default_ui_theme()
     ui_accent = ui_theme.accent
@@ -208,17 +222,21 @@ function _view_cube(
     moment_dx_for(a::Integer) = has_wcs(wcs, a) ? abs(Float64(wcs[a].cdelt)) : 1.0
 
     # why: data is immutable during a viewer session and threshold / nsigma /
-    # channels are passed once at construction. Cache by (axis, order) so
-    # toggling axis or moment order doesn't recompute the whole map. Up to
-    # 3 axes × 3 orders = 9 entries.
+    # channels are passed once at construction. Cache by (axis, order, mask)
+    # so toggling axis or moment order doesn't recompute the whole map.
+    # Changing the persistent mask invalidates the cache entirely (see
+    # `apply_mask_source!`) — we don't try to key by mask identity here
+    # because that would force a fresh entry per BitArray instance even
+    # when the bits are identical.
     _moment_cache = Dict{Tuple{Int,Int}, Matrix{Float32}}()
-    moment_raw = lift(axis, moment_order) do a, ord
+    moment_raw = lift(axis, moment_order, mask_bits_obs) do a, ord, mbits
         get!(_moment_cache, (Int(a), Int(ord))) do
             moment_map(data, a, ord; coords = spectral_coords(a),
                        threshold = moment_threshold,
                        nsigma = moment_nsigma,
                        channels = moment_channels === nothing ? (1:siz[a]) : moment_channels,
-                       dx = moment_dx_for(a))
+                       dx = moment_dx_for(a),
+                       mask = mbits)
         end
     end
 
@@ -256,6 +274,35 @@ function _view_cube(
 
     compare_slice_disp = lift(compare_product_proc, img_scale_mode) do s, m
         apply_scale_display(s, m)
+    end
+
+    # ---------- Mask slice / histogram input ----------
+    # Pull the 2-D slice of the mask aligned with the current (axis, idx).
+    # Returns `nothing` when no mask is active, so downstream lifts can
+    # short-circuit to the unmasked path.
+    mask_slice = lift(mask_bits_obs, axis, idx) do bits, a, id
+        bits === nothing && return nothing
+        id_safe = clamp(id, 1, size(bits, a))
+        if a == 1
+            collect(@view bits[id_safe, :, :])
+        elseif a == 2
+            collect(@view bits[:, id_safe, :])
+        else
+            collect(@view bits[:, :, id_safe])
+        end
+    end
+
+    # Histogram input: when a mask is active, NaN-out the rejected voxels so
+    # `histogram_profile` (which is binning a single 2-D matrix) excludes
+    # them naturally — its internal `histogram_counts` already ignores
+    # non-finite samples.
+    hist_slice_obs = lift(slice_disp, mask_slice) do s, ms
+        ms === nothing && return s
+        out = Matrix{Float32}(undef, size(s))
+        @inbounds for i in eachindex(s, out, ms)
+            out[i] = ms[i] ? Float32(s[i]) : Float32(NaN)
+        end
+        out
     end
 
     clims_auto = lift(slice_disp) do s
@@ -313,7 +360,7 @@ function _view_cube(
         manual ? xlim : clim
     end
 
-    hist_pair_obs = lift(slice_disp, hist_limits_obs, hist_bins_obs, hist_mode_obs) do s, lim, bins, mode
+    hist_pair_obs = lift(hist_slice_obs, hist_limits_obs, hist_bins_obs, hist_mode_obs) do s, lim, bins, mode
         histogram_profile(s; bins = bins, limits = lim, mode = mode)
     end
     hist_x_obs = lift(p -> p.x, hist_pair_obs)
@@ -369,11 +416,7 @@ function _view_cube(
     spec_ylimits_source = Observable(spec_ylimits === nothing ? (use_manual[] ? :contrast : :auto) : :manual)
 
     # ---------- Figure & layout ----------
-    if activate_gl
-        GLMakie.activate!()
-    else
-        CairoMakie.activate!()
-    end
+    pick_backend!(activate_gl)
     fig_size = _pick_fig_size(figsize)
     compact_layout = fig_size[1] <= 1500 || fig_size[2] <= 950
     spec_axis_height = compact_layout ? 185 : 320
@@ -396,7 +439,14 @@ function _view_cube(
     colgap!(main_grid, 18)
     rowgap!(main_grid, main_row_gap)
     # Image + contrast scale
-    img_grid  = main_grid[1, 1] = GridLayout()
+    # valign=:center : centre le bloc image+colorbar verticalement dans sa
+    # cellule de main_grid. Sans ce réglage, la row 1 est aussi haute que
+    # spec_grid (spectre + histo + info ≈ 550 px) et l'espace vide s'accumule
+    # au-dessus de l'image pour les cartes non carrées (DataAspect).
+    # NB : on ne met PAS tellwidth=false ici — CompareBundle redimensionne
+    # les colonnes 2/4 de img_grid dynamiquement et doit pouvoir propager
+    # la largeur totale vers main_grid col 1.
+    img_grid  = main_grid[1, 1] = GridLayout(; valign = :center)
     colgap!(img_grid, -8)
 
     xlab0, ylab0 = slice_axis_labels(axis[])
@@ -719,7 +769,8 @@ function _view_cube(
     mode_nav_btn = Button(mode_bar[1, 1]; label = "Navigation", width = 140, height = 32)
     mode_analysis_btn = Button(mode_bar[1, 2]; label = "Analysis", width = 126, height = 32)
     mode_export_btn = Button(mode_bar[1, 3]; label = "Export", width = 104, height = 32)
-    foreach(c -> colsize!(mode_bar, c, Auto()), 1:3)
+    help_btn = Button(mode_bar[1, 4]; label = "Help", width = 78, height = 32)
+    foreach(c -> colsize!(mode_bar, c, Auto()), 1:4)
     control_mode = Observable(:navigation)
 
     view_card = control_card!(controls_grid, 2, 1, "View"; rows = 5, cols = 4)
@@ -776,6 +827,7 @@ function _view_cube(
     btn_save_spec = Button(output_card[3, 2]; label = "Save spectrum", width = 138, height = 32)
     btn_save_state = Button(output_card[3, 3]; label = "Save state", width = 112, height = 32)
     btn_load_state = Button(output_card[3, 4]; label = "Load state", width = 112, height = 32)
+    btn_copy_code = Button(output_card[3, 5]; label = "Copy code", width = 112, height = 32)
     btn_show_compare = Button(output_card[4, 1]; label = "Compare cube...", width = 138, height = 32)
     compare_path_box = Textbox(output_card[4, 2:4]; placeholder = "", width = 0, height = 32)
     btn_load_compare = Button(output_card[4, 5]; label = "", width = 0, height = 32)
@@ -806,7 +858,7 @@ function _view_cube(
     analysis_bottom = controls_grid[3, 1:3] = GridLayout(; alignmode = Outside(0))
     colgap!(analysis_bottom, controls_gap)
 
-    hist_card = control_card!(analysis_bottom, 1, 4, "Histogram"; rows = 5, cols = 5)
+    hist_card = control_card!(analysis_bottom, 1, 6, "Histogram"; rows = 5, cols = 5)
     hist_mode_menu = Menu(hist_card[2, 1]; options = ["bars", "kde"], prompt = String(hist_mode_obs[]), width = 96)
     hist_bins_box = Textbox(hist_card[2, 2]; placeholder = "bins", width = 76, height = 32)
     hist_apply_btn = Button(hist_card[3, 3]; label = "Apply x", width = 82, height = 32)
@@ -840,26 +892,49 @@ function _view_cube(
     pingpong_chk = Checkbox(display_card[5, 3]); Label(display_card[5, 4], text = "Ping-pong", halign = :left, tellwidth = false, fontsize = 14, color = ui_text)
     foreach(c -> colsize!(display_card, c, Auto()), 1:4)
 
-    moment_card = control_card!(analysis_bottom, 1, 2, "Products"; rows = 4, cols = 5)
+    moment_card = control_card!(analysis_bottom, 1, 4, "Products"; rows = 4, cols = 5)
     moment_menu = Menu(moment_card[2, 1]; options = ["M0 integrated", "M1 mean", "M2 dispersion"], prompt = "M0 integrated", width = compact_layout ? 124 : 138)
     btn_show_moment = Button(moment_card[2, 2]; label = "Show", width = compact_layout ? 72 : 82, height = 32)
     btn_show_slice = Button(moment_card[2, 3]; label = "Slice", width = compact_layout ? 72 : 82, height = 32)
     btn_moment_png = Button(moment_card[2, 4]; label = "PNG", width = compact_layout ? 64 : 74, height = 32)
     btn_moment_fits = Button(moment_card[2, 5]; label = "FITS", width = compact_layout ? 64 : 74, height = 32)
-    fits_product_menu = Menu(moment_card[3, 1:2]; options = ["slice", "region", "moment", "filtered cube"], prompt = "slice", width = compact_layout ? 136 : 150)
+    fits_product_menu = Menu(moment_card[3, 1:2]; options = ["slice", "region", "moment", "filtered cube", "mask"], prompt = "slice", width = compact_layout ? 136 : 150)
     btn_save_fits = Button(moment_card[3, 3]; label = "Export FITS", width = compact_layout ? 104 : 118, height = 32)
     foreach(c -> colsize!(moment_card, c, Auto()), 1:5)
 
+    # ---- Mask card ----
+    # Lives in analysis_bottom alongside Products/Histogram so the user can
+    # build masks while inspecting moments and the histogram. Widget layout:
+    #   row 2 : Source menu | Op menu | lo  | hi
+    #   row 3 : i range box | j range | k range
+    #   row 4 : Apply | Reset | Stats label
+    mask_card = control_card!(analysis_bottom, 1, 2, "Mask"; rows = 4, cols = 5)
+    control_label!(mask_card, (2, 1), "Source")
+    mask_source_menu = Menu(mask_card[2, 2]; options = ["none", "finite", "threshold", "rectangle"], prompt = "none", width = compact_layout ? 114 : 128)
+    mask_op_menu = Menu(mask_card[2, 3]; options = ["≥", "≤", "range", "outside"], prompt = "≥", width = compact_layout ? 88 : 100)
+    mask_lo_box = Textbox(mask_card[2, 4]; placeholder = "lo", width = compact_layout ? 64 : 74, height = 32)
+    mask_hi_box = Textbox(mask_card[2, 5]; placeholder = "hi", width = compact_layout ? 64 : 74, height = 32)
+    mask_i_box = Textbox(mask_card[3, 1:2]; placeholder = "i range a:b", width = compact_layout ? 130 : 150, height = 32)
+    mask_j_box = Textbox(mask_card[3, 3]; placeholder = "j range a:b", width = compact_layout ? 92 : 108, height = 32)
+    mask_k_box = Textbox(mask_card[3, 4]; placeholder = "k range a:b", width = compact_layout ? 92 : 108, height = 32)
+    mask_apply_btn = Button(mask_card[4, 1]; label = "Apply", width = compact_layout ? 72 : 82, height = 32)
+    mask_reset_btn = Button(mask_card[4, 2]; label = "Reset", width = compact_layout ? 72 : 82, height = 32)
+    mask_status_label = Label(mask_card[4, 3:5]; text = mask_status_obs[], halign = :left, tellwidth = false, fontsize = 13, color = ui_text_muted)
+    foreach(c -> colsize!(mask_card, c, Auto()), 1:5)
+
     # Finalise analysis_bottom: transparent Boxes force spacer columns to exist
-    # so colsize! can address them. Cards live in cols 2 and 4.
+    # so colsize! can address them. Cards live in cols 2, 4, 6.
     Box(analysis_bottom[1, 1]; color = :transparent, strokewidth = 0)
     Box(analysis_bottom[1, 3]; color = :transparent, strokewidth = 0)
     Box(analysis_bottom[1, 5]; color = :transparent, strokewidth = 0)
+    Box(analysis_bottom[1, 7]; color = :transparent, strokewidth = 0)
     colsize!(analysis_bottom, 1, Relative(1))
-    colsize!(analysis_bottom, 2, Fixed(compact_layout ? 460 : 520))
-    colsize!(analysis_bottom, 3, Fixed(compact_layout ? 28 : 36))
-    colsize!(analysis_bottom, 4, Fixed(compact_layout ? 430 : 500))
-    colsize!(analysis_bottom, 5, Relative(1))
+    colsize!(analysis_bottom, 2, Fixed(compact_layout ? 360 : 420))   # Mask
+    colsize!(analysis_bottom, 3, Fixed(compact_layout ? 14 : 22))
+    colsize!(analysis_bottom, 4, Fixed(compact_layout ? 460 : 520))   # Products
+    colsize!(analysis_bottom, 5, Fixed(compact_layout ? 14 : 22))
+    colsize!(analysis_bottom, 6, Fixed(compact_layout ? 430 : 500))   # Histogram
+    colsize!(analysis_bottom, 7, Relative(1))
 
     foreach(c -> colsize!(controls_grid, c, Relative(1 / 3)), 1:3)
     rowsize!(controls_grid, 1, Fixed(controls_row_heights[1]))
@@ -897,6 +972,7 @@ function _view_cube(
     style_button!(mode_nav_btn)
     style_button!(mode_analysis_btn)
     style_button!(mode_export_btn)
+    style_button!(help_btn)
     style_button!(reset_zoom_btn)
     style_button!(reset_zoom_analysis_btn)
     style_button!(reset_zoom_export_btn)
@@ -911,6 +987,7 @@ function _view_cube(
     style_button!(btn_save_spec)
     style_button!(btn_save_state)
     style_button!(btn_load_state)
+    style_button!(btn_copy_code)
     style_button!(btn_show_compare)
     style_button!(btn_load_compare)
     style_button!(play_btn)
@@ -943,24 +1020,34 @@ function _view_cube(
     style_button!(btn_moment_png)
     style_button!(btn_moment_fits)
     style_button!(btn_save_fits)
+    style_menu!(mask_source_menu)
+    style_menu!(mask_op_menu)
+    style_textbox!(mask_lo_box)
+    style_textbox!(mask_hi_box)
+    style_textbox!(mask_i_box)
+    style_textbox!(mask_j_box)
+    style_textbox!(mask_k_box)
+    style_button!(mask_apply_btn)
+    style_button!(mask_reset_btn)
     style_slider!(slice_slider)
     style_slider!(sigma_slider)
 
     if compact_layout
-        for btn in (reset_zoom_btn, reset_zoom_analysis_btn, reset_zoom_export_btn,
+        for btn in (help_btn, reset_zoom_btn, reset_zoom_analysis_btn, reset_zoom_export_btn,
                     ps_btn, base_layout_btn, ps_refresh_btn, ps_popout_btn,
-                    btn_save_img, btn_save_spec, btn_save_state, btn_load_state,
+                    btn_save_img, btn_save_spec, btn_save_state, btn_load_state, btn_copy_code,
                     btn_show_compare, btn_load_compare, play_btn, anim_btn, clim_apply_btn,
                     clim_auto_btn, clim_p1_btn, clim_p5_btn, region_clear_btn, contour_apply_btn,
                     spec_y_apply_btn, spec_y_auto_btn, hist_apply_btn, hist_auto_btn, hist_y_apply_btn, hist_y_auto_btn,
-                    btn_show_moment, btn_show_slice, btn_moment_png, btn_moment_fits, btn_save_fits)
+                    btn_show_moment, btn_show_slice, btn_moment_png, btn_moment_fits, btn_save_fits,
+                    mask_apply_btn, mask_reset_btn)
             btn.height[] = 30
             btn.fontsize[] = 13
             btn.padding[] = (9, 9, 5, 5)
         end
         for menu in (img_scale_menu, spec_scale_menu, cmap_menu, ps_src_menu, ps_win_menu,
                      ps_unit_menu, fmt_menu, compare_mode_menu, axis_menu, region_mode_menu, hist_mode_menu,
-                     moment_menu, fits_product_menu)
+                     moment_menu, fits_product_menu, mask_source_menu, mask_op_menu)
             menu.height[] = 30
             menu.fontsize[] = 13
             menu.textpadding[] = (8, 8, 5, 5)
@@ -969,7 +1056,8 @@ function _view_cube(
         for tb in (ps_kmin_box, ps_kmax_box, clim_min_box, clim_max_box, fname_box,
                    compare_path_box, contour_levels_box, spec_ymin_box, spec_ymax_box,
                    hist_bins_box, hist_xmin_box, hist_xmax_box, hist_ymin_box, hist_ymax_box,
-                   start_box, stop_box, step_box, fps_box)
+                   start_box, stop_box, step_box, fps_box,
+                   mask_lo_box, mask_hi_box, mask_i_box, mask_j_box, mask_k_box)
             tb.height[] = 30
             tb.fontsize[] = 13
             tb.textpadding[] = (8, 8, 5, 5)
@@ -1066,7 +1154,7 @@ function _view_cube(
     end
 
     nav_cards = (view_card, slice_card, display_card)
-    analysis_cards = (contrast_card, region_card, contour_card, hist_card, moment_card)
+    analysis_cards = (contrast_card, region_card, contour_card, hist_card, moment_card, mask_card)
     export_cards = (output_card, anim_card)
 
     function set_mode_button_active!(btn, active::Bool)
@@ -1114,161 +1202,112 @@ function _view_cube(
 
     set_block_visible!(ax_cmp, false)
 
-    function show_compare_loader!()
-        btn_show_compare.label[] = ""
-        btn_show_compare.width[] = 0
-        compare_mode_menu.width[] = 0
-        compare_path_box.placeholder[] = "second cube FITS path"
-        compare_path_box.width[] = 310
-        btn_load_compare.label[] = "Load cube"
-        btn_load_compare.width[] = 104
-        compare_state_label.text[] = "Comparison: waiting for cube path"
-        compare_state_label.color[] = ui_text_muted
-        set_status!("Enter the second cube FITS path, then click Load cube.")
-        nothing
-    end
-
-    function hide_compare_loader!()
-        btn_show_compare.label[] = ""
-        btn_show_compare.width[] = 0
-        compare_path_box.placeholder[] = ""
-        compare_path_box.width[] = 0
-        btn_load_compare.label[] = ""
-        btn_load_compare.width[] = 0
-        compare_mode_menu.width[] = compare_visible[] ? 150 : 0
-        if !compare_visible[]
-            btn_show_compare.label[] = "Compare cube..."
-            btn_show_compare.width[] = 138
-            compare_state_label.text[] = "Comparison: no cube loaded"
-            compare_state_label.color[] = ui_text_muted
+    # ---------- Spectrum helpers (defined early — used by CompareBundle below) ----------
+    function refresh_spec_ylim!()
+        x_max = Float32(max(0, length(spec_y_buf) - 1))
+        if spec_ylimits_source[] === :manual || spec_ylimits_source[] === :contrast
+            vmin_, vmax_ = spec_ylimits_value[]
+            limits!(ax_spec, nothing, nothing, vmin_, vmax_)
+            xlims!(ax_spec, 0f0, x_max)
+        else
+            autolimits!(ax_spec)
+            xlims!(ax_spec, 0f0, x_max)
         end
-        nothing
     end
 
-    function resolve_compare_path(path_txt::AbstractString)
-        p = strip(String(path_txt))
-        isempty(p) && return ""
-        isfile(p) && return p
-        beside_primary = joinpath(dirname(abspath(filepath)), p)
-        isfile(beside_primary) && return beside_primary
-        return p
-    end
-
-    # Native OS file picker. Tries platform-appropriate tools without
-    # adding a Julia dep. Returns "" when the user cancels or no backend
-    # is available — the caller then falls back to the legacy textbox loader.
-    function pick_compare_path()
-        initial = filepath != "" ? dirname(abspath(filepath)) : pwd()
-        out = ""
-        try
-            if Sys.isapple()
-                script = "POSIX path of (choose file with prompt \"Select FITS cube to compare\" default location POSIX file \"$(initial)\")"
-                out = readchomp(`osascript -e $script`)
-            elseif Sys.islinux()
-                zenity = Sys.which("zenity")
-                if zenity !== nothing
-                    out = readchomp(`$zenity --file-selection --title=Select\ FITS\ cube\ to\ compare --filename=$(initial)/`)
-                else
-                    kdialog = Sys.which("kdialog")
-                    if kdialog !== nothing
-                        out = readchomp(`$kdialog --getopenfilename $initial "FITS (*.fits *.fits.gz)"`)
+    function refresh_spectrum!()
+        mbits = mask_bits_obs[]
+        if !isempty(region_uvs[])
+            spec_x_raw[] = spec_x_axes[axis[]]
+            y = mean_region_spectrum(data, axis[], region_uvs[]; mask = mbits)
+            resize!(spec_y_buf, length(y))
+            copyto!(spec_y_buf, y)
+            ax_spec.title[] = latexstring("\\text{Mean spectrum in selected region}")
+        elseif axis[] == 1
+            spec_x_raw[] = spec_x_axes[1]
+            resize!(spec_y_buf, siz[1])
+            @views copyto!(spec_y_buf, data[:, j_idx[], k_idx[]])
+            if mbits !== nothing
+                @inbounds for c in 1:siz[1]
+                    mbits[c, j_idx[], k_idx[]] || (spec_y_buf[c] = NaN32)
+                end
+            end
+            ax_spec.title[] = L"\text{Spectrum at selected pixel}"
+        elseif axis[] == 2
+            spec_x_raw[] = spec_x_axes[2]
+            resize!(spec_y_buf, siz[2])
+            @views copyto!(spec_y_buf, data[i_idx[], :, k_idx[]])
+            if mbits !== nothing
+                @inbounds for c in 1:siz[2]
+                    mbits[i_idx[], c, k_idx[]] || (spec_y_buf[c] = NaN32)
+                end
+            end
+            ax_spec.title[] = L"\text{Spectrum at selected pixel}"
+        else
+            spec_x_raw[] = spec_x_axes[3]
+            resize!(spec_y_buf, siz[3])
+            @views copyto!(spec_y_buf, data[i_idx[], j_idx[], :])
+            if mbits !== nothing
+                @inbounds for c in 1:siz[3]
+                    mbits[i_idx[], j_idx[], c] || (spec_y_buf[c] = NaN32)
+                end
+            end
+            ax_spec.title[] = L"\text{Spectrum at selected pixel}"
+        end
+        spec_y_raw[] = spec_y_buf
+        # Mirror the cube-A extraction on the comparison cube when loaded.
+        # Same axis, same voxel / region — only the source array changes.
+        cmp = compare_data[]
+        if cmp !== nothing
+            cmp_mask = (mbits !== nothing && size(cmp) == size(data)) ? mbits : nothing
+            if !isempty(region_uvs[])
+                y2 = mean_region_spectrum(cmp, axis[], region_uvs[]; mask = cmp_mask)
+                resize!(spec_y_compare_buf, length(y2))
+                copyto!(spec_y_compare_buf, y2)
+            elseif axis[] == 1
+                resize!(spec_y_compare_buf, siz[1])
+                @views copyto!(spec_y_compare_buf, cmp[:, j_idx[], k_idx[]])
+                if cmp_mask !== nothing
+                    @inbounds for c in 1:siz[1]
+                        cmp_mask[c, j_idx[], k_idx[]] || (spec_y_compare_buf[c] = NaN32)
                     end
                 end
-            elseif Sys.iswindows()
-                ps = """
-                Add-Type -AssemblyName System.Windows.Forms | Out-Null;
-                \$f = New-Object System.Windows.Forms.OpenFileDialog;
-                \$f.Filter = 'FITS (*.fits;*.fits.gz)|*.fits;*.fits.gz|All files (*.*)|*.*';
-                \$f.InitialDirectory = '$initial';
-                if (\$f.ShowDialog() -eq 'OK') { Write-Output \$f.FileName }
-                """
-                out = readchomp(`powershell -NoProfile -Command $ps`)
+            elseif axis[] == 2
+                resize!(spec_y_compare_buf, siz[2])
+                @views copyto!(spec_y_compare_buf, cmp[i_idx[], :, k_idx[]])
+                if cmp_mask !== nothing
+                    @inbounds for c in 1:siz[2]
+                        cmp_mask[i_idx[], c, k_idx[]] || (spec_y_compare_buf[c] = NaN32)
+                    end
+                end
+            else
+                resize!(spec_y_compare_buf, siz[3])
+                @views copyto!(spec_y_compare_buf, cmp[i_idx[], j_idx[], :])
+                if cmp_mask !== nothing
+                    @inbounds for c in 1:siz[3]
+                        cmp_mask[i_idx[], j_idx[], c] || (spec_y_compare_buf[c] = NaN32)
+                    end
+                end
             end
-        catch e
-            @debug "Native file dialog failed; falling back to textbox." exception=e
-            return ""
+        else
+            resize!(spec_y_compare_buf, length(spec_y_buf))
+            fill!(spec_y_compare_buf, NaN32)
         end
-        return strip(String(out))
+        spec_y_compare_raw[] = spec_y_compare_buf
+        refresh_spec_ylim!()
     end
 
-    # Lightweight WCS compatibility check: when both cubes declare a WCS on a
-    # given axis, CTYPE base / CRVAL / CRPIX / CDELT must agree (relative
-    # tolerance 1e-6). Axes where neither cube has WCS are accepted. Axes
-    # where only one cube has WCS are rejected — that asymmetry would break
-    # tick formatting and world-coordinate readouts on `ax_cmp`.
-    wcs_axes_compatible(a::AbstractVector, b::AbstractVector) = begin
-        length(a) == length(b) || return false
-        for (xa, xb) in zip(a, b)
-            if !xa.available && !xb.available
-                continue
-            end
-            xa.available == xb.available || return false
-            xa.ctype_base == xb.ctype_base || return false
-            isapprox(xa.crval, xb.crval; rtol = 1e-6, atol = 0.0) || return false
-            isapprox(xa.cdelt, xb.cdelt; rtol = 1e-6, atol = 0.0) || return false
-            isapprox(xa.crpix, xb.crpix; rtol = 0.0, atol = 1e-6) || return false
-        end
-        return true
-    end
-
-    function load_compare_cube!(path_txt::AbstractString)
-        cmp_path = resolve_compare_path(path_txt)
-        if isempty(cmp_path)
-            set_status!("Provide a second cube FITS path before enabling dual view.")
-            return false
-        end
-        if !isfile(cmp_path)
-            set_status!("Second cube not found: $(cmp_path)")
-            return false
-        end
-        raw_cmp, cmp_header = try
-            FITS(cmp_path) do f
-                (read(f[1]), read_header(f[1]))
-            end
-        catch e
-            msg = "Failed to read second cube: $(sprint(showerror, e))"
-            set_status!(msg)
-            @error msg exception=(e, catch_backtrace())
-            return false
-        end
-        if ndims(raw_cmp) != 3
-            set_status!("Second cube must be 3D, got ndims=$(ndims(raw_cmp)).")
-            return false
-        end
-        if size(raw_cmp) != siz
-            set_status!("Second cube size $(size(raw_cmp)) does not match primary cube size $(siz).")
-            return false
-        end
-        # WCS compatibility check — required since axes/colorbar/spectrum
-        # ticks on `ax_cmp` reuse the primary cube's `wcs`.
-        cmp_wcs = try
-            read_simple_wcs(cmp_header, 3)
-        catch
-            SimpleWCSAxis[]
-        end
-        if !wcs_axes_compatible(wcs, cmp_wcs)
-            set_status!("Second cube WCS does not match primary cube WCS.")
-            return false
-        end
-        compare_data[] = Float32.(raw_cmp)
-        compare_name[] = String(replace(basename(cmp_path), r"\.fits(\.gz)?$" => ""))
-        compare_visible[] = true
-        colsize!(img_grid, 2, Auto())
-        colsize!(img_grid, 4, Auto())
-        set_block_visible!(ax_cmp, true)
-        set_block_visible!(img_colorbar_cmp, true)
-        ax_cmp.xgridvisible[] = show_grid[]
-        ax_cmp.ygridvisible[] = show_grid[]
-        autolimits!(ax_cmp)
-        hide_compare_loader!()
-        compare_state_label.text[] = "Comparison: cube loaded ($(compare_name[]))"
-        compare_state_label.color[] = ui_success
-        # Pull the spectrum line in immediately so the user sees overlay
-        # without having to click anything.
-        refresh_spectrum!()
-        set_status!("Comparison cube loaded: $(cmp_path).")
-        return true
-    end
+    # ---------- Compare: loader UI + cube alignment ----------
+    # See src/views/cube/CompareBundle.jl
+    (; show_compare_loader!, hide_compare_loader!, resolve_compare_path, pick_compare_path, load_compare_cube!) =
+        _cube_compare_bundle(;
+            filepath, wcs, data, siz,
+            compare_data, compare_visible, compare_name, compare_path_current,
+            btn_show_compare, compare_mode_menu, compare_path_box, btn_load_compare,
+            compare_state_label, ax_cmp, img_colorbar_cmp, img_grid,
+            show_grid, ui_text_muted, ui_success,
+            refresh_spectrum!, set_status!, set_block_visible!, set_box_text!,
+        )
 
     function world_info_string()
         any(has_wcs(wcs, dim) for dim in 1:3) || return ""
@@ -1283,13 +1322,27 @@ function _view_cube(
     function selection_info_tex()
         if isempty(region_uvs[])
             val = data[i_idx[], j_idx[], k_idx[]]
-            base = String(make_info_tex(i_idx[], j_idx[], k_idx[], u_idx[], v_idx[], val))
+            # Reconstruction inline plutôt que de re-concat un LaTeXString déjà
+            # entouré de $...$ : sinon LaTeXStrings.latexstring détecte les $
+            # de tête/queue et insère la suite hors mode math, ce qui fait
+            # planter MathTeXEngine (\quad, \mathbf, \^{} hors $$).
+            info = string(
+                "\\mathbf{pixel}\\,(i,j,k)=(",
+                i_idx[], ",", j_idx[], ",", k_idx[], ")",
+                "\\quad\\mathbf{slice}\\,(\\text{row},\\text{col})=(",
+                u_idx[], ",", v_idx[], ")",
+                "\\quad\\mathbf{intensity}= ",
+                isnan(val) ? "NaN" : string(round(Float32(val); digits = 4)),
+            )
             winfo = world_info_string()
-            isempty(winfo) && return latexstring(base)
-            return latexstring(base, "\\quad\\mathbf{WCS}\\,(", latex_safe(winfo), ")")
+            isempty(winfo) && return latexstring(info)
+            # On enveloppe le bloc WCS dans \text{} pour que les échappements
+            # text-mode produits par latex_safe (\^{}, \_, ...) soient interprétés
+            # dans le bon contexte plutôt qu'envoyés bruts en mode math.
+            return latexstring(info, "\\quad\\mathbf{WCS}\\,(\\text{", latex_safe(winfo), "})")
         else
             npx = length(region_uvs[])
-            y = mean_region_spectrum(data, axis[], region_uvs[])
+            y = mean_region_spectrum(data, axis[], region_uvs[]; mask = mask_bits_obs[])
             chan = clamp(idx[], 1, length(y))
             val = y[chan]
             shape = region_shape[] === :circle ? "circle" : "box"
@@ -1353,68 +1406,6 @@ function _view_cube(
     function refresh_labels!()
         lab_info.text[] = selection_info_tex()
         status_label.text[] = latexstring("\\text{axis } $(axis[]),\\, \\text{index } $(idx[])")
-    end
-
-    function refresh_spec_ylim!()
-        x_max = Float32(max(0, length(spec_y_buf) - 1))
-        if spec_ylimits_source[] === :manual || spec_ylimits_source[] === :contrast
-            vmin_, vmax_ = spec_ylimits_value[]
-            limits!(ax_spec, nothing, nothing, vmin_, vmax_)
-            xlims!(ax_spec, 0f0, x_max)
-        else
-            autolimits!(ax_spec)
-            xlims!(ax_spec, 0f0, x_max)
-        end
-    end
-
-    function refresh_spectrum!()
-        if !isempty(region_uvs[])
-            spec_x_raw[] = spec_x_axes[axis[]]
-            y = mean_region_spectrum(data, axis[], region_uvs[])
-            resize!(spec_y_buf, length(y))
-            copyto!(spec_y_buf, y)
-            ax_spec.title[] = latexstring("\\text{Mean spectrum in selected region}")
-        elseif axis[] == 1
-            spec_x_raw[] = spec_x_axes[1]
-            resize!(spec_y_buf, siz[1])
-            @views copyto!(spec_y_buf, data[:, j_idx[], k_idx[]])
-            ax_spec.title[] = L"\text{Spectrum at selected pixel}"
-        elseif axis[] == 2
-            spec_x_raw[] = spec_x_axes[2]
-            resize!(spec_y_buf, siz[2])
-            @views copyto!(spec_y_buf, data[i_idx[], :, k_idx[]])
-            ax_spec.title[] = L"\text{Spectrum at selected pixel}"
-        else
-            spec_x_raw[] = spec_x_axes[3]
-            resize!(spec_y_buf, siz[3])
-            @views copyto!(spec_y_buf, data[i_idx[], j_idx[], :])
-            ax_spec.title[] = L"\text{Spectrum at selected pixel}"
-        end
-        spec_y_raw[] = spec_y_buf
-        # Mirror the cube-A extraction on the comparison cube when loaded.
-        # Same axis, same voxel / region — only the source array changes.
-        cmp = compare_data[]
-        if cmp !== nothing
-            if !isempty(region_uvs[])
-                y2 = mean_region_spectrum(cmp, axis[], region_uvs[])
-                resize!(spec_y_compare_buf, length(y2))
-                copyto!(spec_y_compare_buf, y2)
-            elseif axis[] == 1
-                resize!(spec_y_compare_buf, siz[1])
-                @views copyto!(spec_y_compare_buf, cmp[:, j_idx[], k_idx[]])
-            elseif axis[] == 2
-                resize!(spec_y_compare_buf, siz[2])
-                @views copyto!(spec_y_compare_buf, cmp[i_idx[], :, k_idx[]])
-            else
-                resize!(spec_y_compare_buf, siz[3])
-                @views copyto!(spec_y_compare_buf, cmp[i_idx[], j_idx[], :])
-            end
-        else
-            resize!(spec_y_compare_buf, length(spec_y_buf))
-            fill!(spec_y_compare_buf, NaN32)
-        end
-        spec_y_compare_raw[] = spec_y_compare_buf
-        refresh_spec_ylim!()
     end
 
     function refresh_hist_axes!()
@@ -1806,6 +1797,42 @@ function _view_cube(
         contour_chk.checked[] = true
     end
 
+    # ---------- Mask: parsing helpers + apply/reset ----------
+    # See src/views/cube/MaskBundle.jl
+    (; _parse_int_range, _set_mask_status!, apply_mask_source!, reset_mask!, build_mask_source_from_ui) =
+        _cube_mask_bundle(;
+            data, _moment_cache,
+            mask_source_obs, mask_bits_obs, mask_status_obs,
+            mask_status_label,
+            mask_lo_box, mask_hi_box, mask_i_box, mask_j_box, mask_k_box,
+            mask_source_menu, mask_op_menu,
+            refresh_spectrum!, set_status!, set_box_text!,
+        )
+
+    on_mode(mask_apply_btn.clicks, :analysis) do _
+        src, err = build_mask_source_from_ui()
+        if src === nothing
+            set_status!("Mask not applied: $(err)")
+            return
+        end
+        try
+            apply_mask_source!(src)
+            if src isa NoMaskSource
+                set_status!("Mask cleared (source = none).")
+            else
+                set_status!("Mask applied. " * mask_status_obs[])
+            end
+        catch e
+            msg = "Failed to build mask: $(sprint(showerror, e))"
+            set_status!(msg)
+            @error msg exception=(e, catch_backtrace())
+        end
+    end
+
+    on_mode(mask_reset_btn.clicks, :analysis) do _
+        reset_mask!()
+    end
+
     on_mode(moment_menu.selection, :analysis) do sel
         sel === nothing && return
         label = String(sel)
@@ -1827,165 +1854,6 @@ function _view_cube(
         use_manual[] = false
         autolimits!(ax_img)
         set_status!("Slice view restored.")
-    end
-
-    # Keyboard navigation (+ invert)
-    on(events(fig).keyboardbutton) do ev
-        ev.action == Keyboard.press || return
-        u_max, v_max = slice_dims(axis[])
-        if ev.key == Keyboard.i
-            invert_cmap[] = !invert_cmap[]
-        elseif ev.key == Keyboard.left
-            v_idx[] = max(1, v_idx[] - 1)
-        elseif ev.key == Keyboard.right
-            v_idx[] = min(v_max, v_idx[] + 1)
-        elseif ev.key == Keyboard.up
-            u_idx[] = min(u_max, u_idx[] + 1)
-        elseif ev.key == Keyboard.down
-            u_idx[] = max(1, u_idx[] - 1)
-        else
-            return
-        end
-        ii, jj, kk = uv_to_ijk(u_idx[], v_idx[], axis[], idx[])
-        i_idx[] = clamp(ii, 1, siz[1]); j_idx[] = clamp(jj, 1, siz[2]); k_idx[] = clamp(kk, 1, siz[3])
-        refresh_labels!(); refresh_spectrum!()
-        uv_point[] = Point2f(v_idx[], u_idx[])
-    end
-
-    # Mouse pick
-    on(events(ax_img).mousebutton) do ev
-        if ev.button == Mouse.right && ev.action == Mouse.press
-            p = mouseposition(ax_img)
-            if any(isnan, p)
-                return
-            end
-            zoom_drag_start[] = Point2f(p[1], p[2])
-            zoom_drag_end[] = Point2f(p[1], p[2])
-            zoom_drag_active[] = true
-            set_status!("Zoom box: right-drag and release to apply.")
-            return
-        elseif ev.button == Mouse.right && ev.action == Mouse.release
-            if !zoom_drag_active[]
-                return
-            end
-            p = mouseposition(ax_img)
-            if !any(isnan, p)
-                zoom_drag_end[] = Point2f(p[1], p[2])
-            end
-            p0 = zoom_drag_start[]
-            p1 = zoom_drag_end[]
-            zoom_drag_active[] = false
-            zoom_drag_start[] = Point2f(NaN32, NaN32)
-            zoom_drag_end[] = Point2f(NaN32, NaN32)
-            if !(isfinite(p0[1]) && isfinite(p0[2]) && isfinite(p1[1]) && isfinite(p1[2]))
-                return
-            end
-            x0, y0 = p0
-            x1, y1 = p1
-            xmin, xmax = minmax(x0, x1)
-            ymin, ymax = minmax(y0, y1)
-            if abs(xmax - xmin) < 1e-3 || abs(ymax - ymin) < 1e-3
-                set_status!("Zoom canceled: draw a larger rectangle.")
-                return
-            end
-            limits!(ax_img, xmin, xmax, ymin, ymax)
-            compare_visible[] && limits!(ax_cmp, xmin, xmax, ymin, ymax)
-            set_status!("Zoom applied.")
-            return
-        elseif ev.button == Mouse.left && ev.action == Mouse.press && selection_mode[] != :point
-            p = mouseposition(ax_img)
-            if any(isnan, p)
-                return
-            end
-            u_max, v_max = slice_dims(axis[])
-            p0 = Point2f(clamp(p[1], 1, v_max), clamp(p[2], 1, u_max))
-            region_start[] = p0
-            region_end[] = p0
-            region_drag_active[] = true
-            region_uvs[] = Tuple{Int,Int}[]
-            region_count_label.text[] = "0 px"
-            set_status!("Drawing $(String(selection_mode[])) region.")
-            return
-        elseif ev.button == Mouse.left && ev.action == Mouse.release && region_drag_active[]
-            p = mouseposition(ax_img)
-            u_max, v_max = slice_dims(axis[])
-            if !any(isnan, p)
-                region_end[] = Point2f(clamp(p[1], 1, v_max), clamp(p[2], 1, u_max))
-            end
-            p0 = region_start[]
-            p1 = region_end[]
-            region_drag_active[] = false
-            if !(isfinite(p0[1]) && isfinite(p0[2]) && isfinite(p1[1]) && isfinite(p1[2]))
-                clear_region!()
-                return
-            end
-            update_region_from_drag!(p0, p1)
-            refresh_labels!()
-            refresh_spectrum!()
-            return
-        elseif ev.button == Mouse.left && ev.action == Mouse.press
-            p = mouseposition(ax_img)
-            if any(isnan, p)
-                return
-            end
-            clear_region!()
-            u_max, v_max = slice_dims(axis[])
-            u = Int(round(clamp(p[2], 1, u_max)))
-            v = Int(round(clamp(p[1], 1, v_max)))
-            u_idx[] = u; v_idx[] = v
-            ii, jj, kk = uv_to_ijk(u, v, axis[], idx[])
-            i_idx[] = clamp(ii, 1, siz[1]); j_idx[] = clamp(jj, 1, siz[2]); k_idx[] = clamp(kk, 1, siz[3])
-            refresh_labels!(); refresh_spectrum!()
-            uv_point[] = Point2f(v, u)
-        end
-    end
-
-    on(events(ax_img).mouseposition) do p
-        if zoom_drag_active[] && !any(isnan, p)
-            zoom_drag_end[] = Point2f(p[1], p[2])
-        elseif region_drag_active[] && !any(isnan, p)
-            u_max, v_max = slice_dims(axis[])
-            region_end[] = Point2f(clamp(p[1], 1, v_max), clamp(p[2], 1, u_max))
-        end
-    end
-
-    # ---------- Saving ----------
-    default_desktop = joinpath(homedir(), "Desktop")
-    save_root = if save_dir === nothing
-        isdir(default_desktop) ? default_desktop : pwd()
-    else
-        path = String(save_dir)
-        if !isdir(path)
-            mkpath(path)
-        end
-        path
-    end
-    resolved_settings_path = settings_path === nothing ?
-        joinpath(save_root, "$(fname)_viewer_settings.toml") :
-        abspath(String(settings_path))
-
-    current_settings() = Dict{String,Any}(
-        "axis" => axis[],
-        "index" => idx[],
-        "img_scale" => String(img_scale_mode[]),
-        "spec_scale" => String(spec_scale_mode[]),
-        "colormap" => String(cmap_name[]),
-        "invert_colormap" => invert_cmap[],
-        "show_crosshair" => show_crosshair[],
-        "show_marker" => show_marker[],
-        "show_grid" => show_grid[],
-        "show_contours" => show_contours[],
-        "contour_use_manual" => contour_use_manual[],
-        "contour_levels" => collect(contour_manual_levels[]),
-        "contour_colors" => collect(contour_manual_colors[]),
-        "use_manual_clims" => use_manual[],
-        "clim_min" => use_manual[] ? first(clims_manual[]) : first(clims_auto[]),
-        "clim_max" => use_manual[] ? last(clims_manual[]) : last(clims_auto[]),
-    )
-
-    make_name = function (base::AbstractString, ext::AbstractString)
-        b = isempty(base) ? fname : base
-        return "$(b)_axis$(axis[])_idx$(idx[])_i$(i_idx[])_j$(j_idx[])_k$(k_idx[])_img$(String(img_scale_mode[]))_spec$(String(spec_scale_mode[])).$(ext)"
     end
 
     # ---------- Embedded power-spectrum layout ----------
@@ -2194,6 +2062,154 @@ function _view_cube(
         nothing
     end
 
+    # ---------- Keyboard shortcuts + mouse pick ----------
+    # See src/views/cube/KeyboardBundle.jl
+    _cube_keyboard_bundle!(fig, ax_img;
+        axis, idx, siz, u_idx, v_idx, i_idx, j_idx, k_idx, uv_point,
+        slice_dims, uv_to_ijk,
+        invert_cmap, img_scale_mode, show_contours, compare_visible, layout_mode,
+        zoom_drag_active, zoom_drag_start, zoom_drag_end,
+        region_drag_active, region_start, region_end, region_uvs, selection_mode, anim_playing,
+        slice_slider, axis_menu, axes_labels, img_scale_menu, contour_chk,
+        clim_auto_btn, btn_save_img, help_btn, region_count_label, ax_cmp,
+        refresh_labels!, refresh_spectrum!, apply_percentile_clims!,
+        render_power_spectrum_layout!, reset_zoom!, clear_region!, update_region_from_drag!,
+        set_status!, bypass_mode_gate, syncing_slice_controls,
+        textboxes = (clim_min_box, clim_max_box, fname_box, compare_path_box,
+                     spec_ymin_box, spec_ymax_box, contour_levels_box,
+                     hist_bins_box, hist_xmin_box, hist_xmax_box,
+                     hist_ymin_box, hist_ymax_box,
+                     start_box, stop_box, step_box, fps_box,
+                     mask_lo_box, mask_hi_box, ps_kmin_box, ps_kmax_box),
+        ui_theme,
+    )
+
+    # ---------- Saving ----------
+    default_desktop = joinpath(homedir(), "Desktop")
+    save_root = if save_dir === nothing
+        isdir(default_desktop) ? default_desktop : pwd()
+    else
+        path = String(save_dir)
+        if !isdir(path)
+            mkpath(path)
+        end
+        path
+    end
+    resolved_settings_path = settings_path === nothing ?
+        joinpath(save_root, "$(fname)_viewer_settings.toml") :
+        abspath(String(settings_path))
+
+    current_settings() = Dict{String,Any}(
+        "axis" => axis[],
+        "index" => idx[],
+        "img_scale" => String(img_scale_mode[]),
+        "spec_scale" => String(spec_scale_mode[]),
+        "colormap" => String(cmap_name[]),
+        "invert_colormap" => invert_cmap[],
+        "show_crosshair" => show_crosshair[],
+        "show_marker" => show_marker[],
+        "show_grid" => show_grid[],
+        "show_contours" => show_contours[],
+        "contour_use_manual" => contour_use_manual[],
+        "contour_levels" => collect(contour_manual_levels[]),
+        "contour_colors" => collect(contour_manual_colors[]),
+        "use_manual_clims" => use_manual[],
+        "clim_min" => use_manual[] ? first(clims_manual[]) : first(clims_auto[]),
+        "clim_max" => use_manual[] ? last(clims_manual[]) : last(clims_auto[]),
+        # The mask source is the *declarative* description (kind + params);
+        # the materialised BitArray is regenerated from `data` on reload.
+        "mask" => mask_source_to_toml(mask_source_obs[]),
+    )
+
+    state_get(st, key::AbstractString, fallback) = begin
+        if st isa AbstractDict
+            return get(st, key, get(st, Symbol(key), fallback))
+        elseif st isa NamedTuple
+            sym = Symbol(key)
+            return hasproperty(st, sym) ? getproperty(st, sym) : fallback
+        else
+            return fallback
+        end
+    end
+
+    function apply_inline_state!(st; announce::Bool = true)
+        st === nothing && return nothing
+
+        axis_val = clamp(Int(state_get(st, "axis", axis[])), 1, 3)
+        axis_menu.selection[] = axes_labels[axis_val]
+
+        idx_val = clamp(Int(state_get(st, "index", idx[])), 1, siz[axis_val])
+        slice_slider.value[] = idx_val
+
+        img_scale_val = String(state_get(st, "img_scale", String(img_scale_mode[])))
+        img_scale_val in ("lin", "log10", "ln") && (img_scale_menu.selection[] = img_scale_val)
+
+        spec_scale_val = String(state_get(st, "spec_scale", String(spec_scale_mode[])))
+        spec_scale_val in ("lin", "log10", "ln") && (spec_scale_menu.selection[] = spec_scale_val)
+
+        cmap_val = Symbol(String(state_get(st, "colormap", String(cmap_name[]))))
+        try
+            to_cmap(cmap_val)
+            cmap_name[] = cmap_val
+            String(cmap_val) in MANTA_COLORMAP_OPTIONS && (cmap_menu.selection[] = String(cmap_val))
+        catch
+            @warn "Ignoring invalid colormap in inline state" colormap=cmap_val
+        end
+
+        invert_chk.checked[] = Bool(state_get(st, "invert_colormap", invert_cmap[]))
+        crosshair_chk.checked[] = Bool(state_get(st, "show_crosshair", show_crosshair[]))
+        marker_chk.checked[] = Bool(state_get(st, "show_marker", show_marker[]))
+        grid_chk.checked[] = Bool(state_get(st, "show_grid", show_grid[]))
+        contour_chk.checked[] = Bool(state_get(st, "show_contours", show_contours[]))
+
+        use_manual_val = Bool(state_get(st, "use_manual_clims", use_manual[]))
+        if use_manual_val
+            cmin = Float32(state_get(st, "clim_min", first(clims_manual[])))
+            cmax = Float32(state_get(st, "clim_max", last(clims_manual[])))
+            ok, new_manual, parsed_clims, _ = parse_manual_clims(string(cmin), string(cmax); fallback = clims_manual[])
+            if ok && new_manual
+                clims_manual[] = parsed_clims
+                use_manual[] = true
+                set_box_text!(clim_min_box, string(first(parsed_clims)))
+                set_box_text!(clim_max_box, string(last(parsed_clims)))
+            end
+        else
+            use_manual[] = false
+            set_box_text!(clim_min_box, "")
+            set_box_text!(clim_max_box, "")
+        end
+
+        mask_dict = state_get(st, "mask", nothing)
+        if mask_dict isa AbstractDict
+            try
+                apply_mask_source!(mask_source_from_toml(mask_dict))
+            catch e
+                @warn "Could not restore mask from inline state" exception=(e, catch_backtrace())
+            end
+        end
+
+        announce && set_status!("Applied inline viewer state.")
+        return nothing
+    end
+
+    function current_recipe_snippet()
+        source_arg = filepath != "" ? filepath : JuliaExpr("data")
+        kwargs_pairs = Pair{Symbol,Any}[
+            :cmap => cmap_name[],
+            :invert => invert_cmap[],
+            :state => current_settings(),
+        ]
+        if compare_visible[] && !isempty(compare_path_current[])
+            push!(kwargs_pairs, :compare => compare_path_current[])
+        end
+        return manta_recipe(source_arg; kwargs_pairs...)
+    end
+
+    make_name = function (base::AbstractString, ext::AbstractString)
+        b = isempty(base) ? fname : base
+        return "$(b)_axis$(axis[])_idx$(idx[])_i$(i_idx[])_j$(j_idx[])_k$(k_idx[])_img$(String(img_scale_mode[]))_spec$(String(spec_scale_mode[])).$(ext)"
+    end
+
     function apply_layout_mode!()
         if layout_mode[] === :power_spectrum
             colsize!(main_grid, 1, Relative(1 / 2))
@@ -2300,129 +2316,26 @@ function _view_cube(
         layout_mode[] === :power_spectrum && render_power_spectrum_layout!()
     end
 
-    # Unified export (let Makie/Cairo choose the backend)
-    save_with_format(path::AbstractString, fig) = CairoMakie.save(String(path), fig)
-
-    moment_label() = moment_order[] == 0 ? "moment0" : moment_order[] == 1 ? "moment1" : "moment2"
-
-    # Write a Float32 array to a FITS primary HDU, optionally preserving the
-    # cube's original header (WCS / BUNIT / provenance) via FITSIO.
-    function write_fits_array(path::AbstractString, arr; header = nothing)
-        FITS(String(path), "w") do f
-            if header === nothing
-                write(f, Float32.(arr))
-            else
-                write(f, Float32.(arr); header = header)
-            end
-        end
-        nothing
-    end
-
-    function save_moment_png!(out::AbstractString)
-        f_mom = CairoMakie.Figure(size = (700, 560))
-        colgap!(f_mom.layout, -8)
-        xlab_s, ylab_s = slice_axis_labels(axis[])
-        axM = CairoMakie.Axis(
-            f_mom[1, 1];
-            title = latexstring("\\text{", latex_safe(fname), " ", latex_safe(moment_label()), " axis $(axis[])}"),
-            xlabel = xlab_s,
-            ylabel = ylab_s,
-            aspect = CairoMakie.DataAspect(),
-            yreversed = true,
-            xtickformat = latex_tick_formatter,
-            ytickformat = latex_tick_formatter,
-        )
-        lim = clamped_extrema(moment_raw[])
-        hmM = CairoMakie.heatmap!(axM, moment_raw[]; colormap = cm_obs[], colorrange = lim)
-        CairoMakie.Colorbar(
-            f_mom[1, 2],
-            hmM;
-            label = moment_label(),
-            width = 20,
-            height = _axis_render_height(axM),
-            tellheight = false,
-            valign = :center,
-        )
-        CairoMakie.save(String(out), f_mom; backend = CairoMakie)
-        nothing
-    end
-
-    function export_fits_product!(product::AbstractString, out::AbstractString)
-        src_id = String(ds.source_id)
-        if product == "slice"
-            hdr = fits_header_for_slice(header, axis[], idx[]; source_id = src_id)
-            write_fits_array(out, get_slice(data, axis[], idx[]); header = hdr)
-        elseif product == "region"
-            if isempty(region_uvs[])
-                throw(ArgumentError("select a box or circle region before exporting the averaged region FITS"))
-            end
-            spec = mean_region_spectrum(data, axis[], region_uvs[])
-            hdr = fits_header_for_region_spectrum(header, axis[], length(region_uvs[]);
-                                                  source_id = src_id)
-            write_fits_array(out, spec; header = hdr)
-        elseif product == "moment"
-            hdr = fits_header_for_moment(header, axis[], moment_order[]; source_id = src_id)
-            write_fits_array(out, moment_raw[]; header = hdr)
-        elseif product == "filtered cube"
-            hdr = fits_header_for_filtered_cube(header, axis[], sigma[]; source_id = src_id)
-            write_fits_array(out, filtered_cube_by_slice(data, axis[], sigma[]); header = hdr)
-        else
-            throw(ArgumentError("unknown FITS product: $(product)"))
-        end
-        nothing
-    end
-
-    on_mode(btn_moment_png.clicks, :analysis) do _
-        spawn_safely() do
-            base = get_box_str(fname_box)
-            base = isempty(base) ? "$(fname)_$(moment_label())" : base
-            out = joinpath(save_root, make_name(base, "png"))
-            try
-                save_moment_png!(out)
-                set_status!("Saved moment PNG to $(out).")
-            catch e
-                msg = "Failed to save moment PNG $(out): $(sprint(showerror, e))"
-                set_status!(msg)
-                @error msg exception=(e, catch_backtrace())
-            end
-        end
-    end
-
-    on_mode(btn_moment_fits.clicks, :analysis) do _
-        spawn_safely() do
-            base = get_box_str(fname_box)
-            base = isempty(base) ? "$(fname)_$(moment_label())" : base
-            out = joinpath(save_root, make_name(base, "fits"))
-            try
-                hdr = fits_header_for_moment(header, axis[], moment_order[];
-                                             source_id = String(ds.source_id))
-                write_fits_array(out, moment_raw[]; header = hdr)
-                set_status!("Saved moment FITS to $(out).")
-            catch e
-                msg = "Failed to save moment FITS $(out): $(sprint(showerror, e))"
-                set_status!(msg)
-                @error msg exception=(e, catch_backtrace())
-            end
-        end
-    end
-
-    on_mode(btn_save_fits.clicks, :analysis) do _
-        spawn_safely() do
-            product = String(something(fits_product_menu.selection[], "slice"))
-            clean_product = replace(product, " " => "_")
-            base = get_box_str(fname_box)
-            base = isempty(base) ? "$(fname)_$(clean_product)" : base
-            out = joinpath(save_root, make_name(base, "fits"))
-            try
-                export_fits_product!(product, out)
-                set_status!("Saved $(product) FITS to $(out).")
-            catch e
-                msg = "Failed to save $(product) FITS $(out): $(sprint(showerror, e))"
-                set_status!(msg)
-                @error msg exception=(e, catch_backtrace())
-            end
-        end
-    end
+    # ---------- Export: write_fits_array, save_moment_png!, export_fits_product!,
+    # analysis/export mode callbacks (save image, spectrum, animation, GIF)
+    # See src/views/cube/ExportBundle.jl
+    _cube_export_bundle!(;
+        ds, header, data, fname, save_root, make_name,
+        axis, idx, siz, moment_order, sigma,
+        moment_raw, slice_disp, slice_proc, cm_obs, clims_obs,
+        contour_levels_obs, contour_colors_obs,
+        region_uvs, mask_bits_obs, region_start, region_end, region_shape,
+        u_idx, v_idx, uv_point, show_crosshair, show_marker, show_grid, show_contours,
+        spec_x_raw, spec_y_disp, i_idx, j_idx, k_idx, spec_y_buf,
+        unit_label, unit_label_tex, slice_axis_labels, slice_dims,
+        anim_playing,
+        btn_moment_png, btn_moment_fits, btn_save_fits, fits_product_menu,
+        btn_save_img, btn_save_spec, play_btn, anim_btn,
+        fmt_menu, fname_box, start_box, stop_box, step_box, fps_box,
+        pingpong_chk, loop_chk, slice_slider, ax_spec,
+        region_segments_from_points,
+        on_mode, set_status!,
+    )
 
     on_mode(btn_save_state.clicks, :export) do _
         try
@@ -2433,6 +2346,27 @@ function _view_cube(
             msg = "Failed to save settings: $(sprint(showerror, e))"
             set_status!(msg)
             @error msg exception=(e, catch_backtrace())
+        end
+    end
+
+    on_mode(btn_copy_code.clicks, :export) do _
+        snippet = current_recipe_snippet()
+        if copy_text_to_clipboard(snippet)
+            btn_copy_code.labelcolor[] = ui_success
+            set_status!("Copied reproducible MANTA.manta(...) recipe to clipboard.")
+        else
+            out = joinpath(save_root, "$(fname)_manta_recipe.jl")
+            try
+                open(out, "w") do io
+                    write(io, snippet)
+                    write(io, "\n")
+                end
+                set_status!("Clipboard unavailable; wrote recipe to $(out).")
+            catch e
+                msg = "Failed to copy recipe: $(sprint(showerror, e))"
+                set_status!(msg)
+                @error msg exception=(e, catch_backtrace())
+            end
         end
     end
 
@@ -2494,6 +2428,38 @@ function _view_cube(
                 set_box_text!(contour_levels_box, "")
             end
 
+            mask_dict = get(st, "mask", nothing)
+            try
+                if mask_dict isa AbstractDict
+                    src = mask_source_from_toml(mask_dict)
+                    apply_mask_source!(src)
+                    # Sync UI widgets to reflect the restored source so
+                    # subsequent edits start from the right state.
+                    if src isa NoMaskSource
+                        mask_source_menu.selection[] = "none"
+                    elseif src isa FiniteSource
+                        mask_source_menu.selection[] = "finite"
+                    elseif src isa ThresholdSource
+                        mask_source_menu.selection[] = "threshold"
+                        mask_op_menu.selection[] = src.op === :ge ? "≥" :
+                                                   src.op === :le ? "≤" :
+                                                   src.op === :range ? "range" : "outside"
+                        set_box_text!(mask_lo_box, string(src.lo))
+                        set_box_text!(mask_hi_box, string(src.hi))
+                    elseif src isa RectangleSource
+                        mask_source_menu.selection[] = "rectangle"
+                        _rng(a, b) = (a === nothing && b === nothing) ? "" :
+                                     "$(a === nothing ? "" : a):$(b === nothing ? "" : b)"
+                        set_box_text!(mask_i_box, _rng(src.i1, src.i2))
+                        set_box_text!(mask_j_box, _rng(src.j1, src.j2))
+                        set_box_text!(mask_k_box, _rng(src.k1, src.k2))
+                    end
+                end
+            catch e
+                @warn "Could not restore mask from settings" exception=(e, catch_backtrace())
+                apply_mask_source!(NoMaskSource())
+            end
+
             use_manual_val = Bool(get(st, "use_manual_clims", use_manual[]))
             if use_manual_val
                 cmin = Float32(get(st, "clim_min", first(clims_manual[])))
@@ -2525,521 +2491,19 @@ function _view_cube(
         end
     end
 
-    # ---------- Save image (slice + colorbar + crosshair) ----------
-    on_mode(btn_save_img.clicks, :export) do _
-        spawn_safely() do
-            ext  = String(something(fmt_menu.selection[], "png"))
-            out  = joinpath(save_root, make_name(get_box_str(fname_box), ext))
-            try
-                f_slice = CairoMakie.Figure(size = (700, 560))
-                colgap!(f_slice.layout, -8)
-                xlab_s, ylab_s = slice_axis_labels(axis[])
-                axS = CairoMakie.Axis(
-                    f_slice[1, 1];
-                    title     = make_slice_title(fname, axis[], idx[]),
-                    xlabel    = xlab_s,
-                    ylabel    = ylab_s,
-                    aspect    = CairoMakie.DataAspect(),
-                    yreversed = true,
-                    xtickformat = latex_tick_formatter,
-                    ytickformat = latex_tick_formatter,
-                )
-                hmS = CairoMakie.heatmap!(axS, slice_disp[]; colormap = cm_obs[], colorrange = clims_obs[])
-                if show_contours[] && !isempty(contour_levels_obs[])
-                    CairoMakie.contour!(axS, slice_disp[]; levels = contour_levels_obs[], color = contour_colors_obs[], linewidth = 1.2)
-                end
-                axS.xgridvisible[] = show_grid[]
-                axS.ygridvisible[] = show_grid[]
-                if show_crosshair[]
-                    u_max, v_max = slice_dims(axis[])
-                    u, v = u_idx[], v_idx[]
-                    CairoMakie.linesegments!(
-                        axS,
-                        Point2f[
-                            Point2f(1, u), Point2f(v_max, u),
-                            Point2f(v, 1), Point2f(v, u_max),
-                        ];
-                        color = (:white, 0.9),
-                        linewidth = 1.6,
-                        linestyle = :dot,
-                    )
-                end
-                if show_marker[]
-                    CairoMakie.scatter!(axS, [Point2f(uv_point[]...)], markersize = 10)
-                end
-                if !isempty(region_uvs[])
-                    CairoMakie.lines!(
-                        axS,
-                        region_segments_from_points(region_start[], region_end[], region_shape[]);
-                        color = (RGBf(1.0, 0.78, 0.18), 0.98),
-                        linewidth = 2.4,
-                    )
-                end
-                CairoMakie.Colorbar(
-                    f_slice[1, 2],
-                    hmS;
-                    label = unit_label,
-                    width = 20,
-                    height = _axis_render_height(axS),
-                    tellheight = false,
-                    valign = :center,
-                )
-
-                CairoMakie.save(String(out), f_slice; backend = CairoMakie)
-                @info "Saved image" out
-                set_status!("Saved image to $(out).")
-            catch e
-                msg = "Failed to save image $(out): $(sprint(showerror, e))"
-                set_status!(msg)
-                @error msg exception=(e, catch_backtrace())
-            end
-        end
-    end
-
-    # ---------- Save spectrum (lines plot) ----------
-    on_mode(btn_save_spec.clicks, :export) do _
-        spawn_safely() do
-            ext = String(something(fmt_menu.selection[], "png"))
-            base = get_box_str(fname_box)
-            base = isempty(base) ? "$(fname)_spectrum" : base
-            out = joinpath(save_root, make_name(base, ext))
-
-            try
-                f_spec = CairoMakie.Figure(size = (600, 400))
-                axP = CairoMakie.Axis(
-                    f_spec[1, 1];
-                    title  = isempty(region_uvs[]) ? make_spec_title(i_idx[], j_idx[], k_idx[]) : L"\text{Mean spectrum in selected region}",
-                    xlabel = L"\text{index along slice axis}",
-                    ylabel = unit_label_tex,
-                    xtickformat = latex_tick_formatter,
-                    ytickformat = latex_tick_formatter,
-                )
-                CairoMakie.lines!(axP, spec_x_raw[], spec_y_disp[])
-                CairoMakie.xlims!(axP, 0f0, Float32(max(0, length(spec_x_raw[]) - 1)))
-
-                CairoMakie.save(String(out), f_spec; backend = CairoMakie)
-                @info "Saved spectrum" out
-                set_status!("Saved spectrum to $(out).")
-            catch e
-                msg = "Failed to save spectrum $(out): $(sprint(showerror, e))"
-                set_status!(msg)
-                @error msg exception=(e, catch_backtrace())
-            end
-        end
-    end
-
-    # `current_animation_request` is now a module-level helper in
-    # `src/views/cube/AnimationRequest.jl`. It takes the captured pieces of
-    # state (axis, size, the four textboxes and the pingpong checkbox)
-    # explicitly so the GIF/animation pipeline is decoupled from this
-    # closure.
-
-    function start_channel_animation!(frames::Vector{Int}, fps::Int)
-        anim_playing[] = true
-        play_btn.label[] = "Pause"
-        spawn_safely() do
-            delay = 1 / max(1, fps)
-            try
-                while anim_playing[]
-                    for fidx in frames
-                        anim_playing[] || break
-                        slice_slider.value[] = fidx
-                        sleep(delay)
-                    end
-                    loop_chk.checked[] || break
-                end
-            finally
-                anim_playing[] = false
-                play_btn.label[] = "Play"
-            end
-        end
-        nothing
-    end
-
-    on_mode(play_btn.clicks, :export) do _
-        if anim_playing[]
-            anim_playing[] = false
-            play_btn.label[] = "Play"
-            set_status!("Animation paused.")
-            return
-        end
-        ok, frames, fps, msg = current_animation_request(
-            axis[], siz, start_box, stop_box, step_box, fps_box, pingpong_chk,
-        )
-        set_status!(ok ? "Interactive animation playing at $(fps) FPS." : msg)
-        ok || return
-        start_channel_animation!(frames, fps)
-    end
-
-
-    # ---------- GIF export  ----------
-    on_mode(anim_btn.clicks, :export) do _
-        a = axis[]; amax = siz[a]
-        ok, frames, fps, msg = current_animation_request(
-            a, siz, start_box, stop_box, step_box, fps_box, pingpong_chk,
-        )
-        set_status!(msg)
-        if !ok
-            @warn "Invalid GIF parameters" msg axis=a amax=amax
-            return
-        end
-
-        # strict name: <fits_name>.gif (e.g., synthetic_cube.gif)
-        outfile = joinpath(save_root, "$(fname).gif")
-        ny, nx = slice_dims(axis[])
-        w_img = 640
-        h_img = Int(round(w_img * ny / nx))
-        extra_for_cb = 80 # colorbar space
-        fig_gif = CairoMakie.Figure(size = (w_img + extra_for_cb, h_img))
-        colgap!(fig_gif.layout, -8)
-        axG = CairoMakie.Axis(fig_gif[1, 1]; aspect = DataAspect(), yreversed = true)
-        Makie.hidedecorations!(axG, grid = false)
-
-        hmG = CairoMakie.heatmap!(axG, slice_disp; colormap = cm_obs, colorrange = clims_obs)
-        CairoMakie.Colorbar(
-            fig_gif[1, 2],
-            hmG;
-            label = "intensity",
-            width = 20,
-            height = _axis_render_height(axG),
-            tellheight = false,
-            valign = :center,
-        )
-
-        try
-            record(fig_gif, outfile, frames; framerate = fps) do fidx
-                idx[] = fidx
-            end
-            @info "Animation saved: $outfile"
-            set_status!("GIF exported to $(outfile).")
-        catch e
-            msg2 = "Failed to export animation $(outfile): $(sprint(showerror, e))"
-            set_status!(msg2)
-            @error msg2 exception=(e, catch_backtrace())
-        end
-    end
-
-
     # ---------- Power spectrum window ----------
     ps_fig_ref = Ref{Any}(nothing)
     ps_alive_ref = Ref(false)
 
-    function open_power_spectrum_window!()
-        if ps_alive_ref[] && ps_fig_ref[] !== nothing
-            try
-                display(ps_fig_ref[])
-                return ps_fig_ref[]
-            catch
-                ps_alive_ref[] = false
-                ps_fig_ref[] = nothing
-            end
-        end
-
-        ps_mode    = Observable(:two_d)   # :two_d | :one_d
-        ps_src     = Observable(:zoom)    # :zoom  | :full
-        ps_window  = Observable(:hann)    # :hann | :hamming | :none
-        ps_pad     = Observable(false)
-        ps_nanapo  = Observable(false)
-        ps_units   = Observable(:pixel)   # :pixel | :physical
-        ps_fit_on  = Observable(false)
-
-        fig_ps = Figure(size = (1000, 760))
-        header = fig_ps[1, 1] = GridLayout(; alignmode = Outside(8))
-
-        # Row 1: mode/source/window/units/refresh
-        Label(header[1, 1]; text = "Mode", halign = :right, fontsize = 13)
-        mode_menu  = Menu(header[1, 2]; options = ["2D", "1D"], prompt = "2D", width = 80)
-        Label(header[1, 3]; text = "Source", halign = :right, fontsize = 13)
-        src_menu   = Menu(header[1, 4]; options = ["zoom", "full"], prompt = "zoom", width = 80)
-        Label(header[1, 5]; text = "Window", halign = :right, fontsize = 13)
-        win_menu   = Menu(header[1, 6]; options = ["Hann", "Hamming", "None"], prompt = "Hann", width = 96)
-        Label(header[1, 7]; text = "Units", halign = :right, fontsize = 13)
-        unit_menu  = Menu(header[1, 8]; options = ["pixel", "physical"], prompt = "pixel", width = 96)
-        refresh_btn = Button(header[1, 9]; label = "Refresh", width = 88, height = 30)
-
-        # Row 2: toggles + fit band
-        pad_chk    = Checkbox(header[2, 1]); Label(header[2, 2]; text = "Pad pow2", halign = :left, fontsize = 13, color = ui_text)
-        nanapo_chk = Checkbox(header[2, 3]); Label(header[2, 4]; text = "NaN apod.", halign = :left, fontsize = 13, color = ui_text)
-        fit_chk    = Checkbox(header[2, 5]); Label(header[2, 6]; text = "Fit slope", halign = :left, fontsize = 13, color = ui_text)
-        Label(header[2, 7]; text = "k range", halign = :right, fontsize = 13)
-        kmin_box   = Textbox(header[2, 8]; placeholder = "k_min", width = 84, height = 28)
-        kmax_box   = Textbox(header[2, 9]; placeholder = "k_max", width = 84, height = 28)
-
-        # Row 3: save buttons
-        save_png_btn = Button(header[3, 1:2]; label = "Save PNG", width = 120, height = 28)
-        save_pdf_btn = Button(header[3, 3:4]; label = "Save PDF", width = 120, height = 28)
-        save_csv_btn = Button(header[3, 5:6]; label = "Save CSV (1D)", width = 140, height = 28)
-
-        ps_status = Observable(" ")
-        Label(header[3, 7:9]; text = ps_status, halign = :left, fontsize = 12, color = ui_text_muted, tellwidth = false)
-
-        style_menu!(mode_menu); style_menu!(src_menu); style_menu!(win_menu); style_menu!(unit_menu)
-        style_button!(refresh_btn); style_button!(save_png_btn); style_button!(save_pdf_btn); style_button!(save_csv_btn)
-        style_checkbox!(pad_chk); style_checkbox!(nanapo_chk); style_checkbox!(fit_chk)
-        style_textbox!(kmin_box); style_textbox!(kmax_box)
-
-        plot_grid = fig_ps[2, 1] = GridLayout()
-        colgap!(plot_grid, -8)
-        rowsize!(fig_ps.layout, 1, Fixed(120))
-
-        # WCS-derived physical pixel scale (for 1D + 2D physical units).
-        u_dim_now() = slice_axis_dims(axis[])[1]
-        v_dim_now() = slice_axis_dims(axis[])[2]
-        physical_available() = has_wcs(wcs, u_dim_now()) && has_wcs(wcs, v_dim_now())
-        pixel_scales() = begin
-            if physical_available()
-                dy = abs(wcs[u_dim_now()].cdelt)
-                dx = abs(wcs[v_dim_now()].cdelt)
-                (dx, dy)
-            else
-                (1.0, 1.0)
-            end
-        end
-        physical_unit_label() = begin
-            if physical_available()
-                u = wcs[v_dim_now()].cunit
-                isempty(u) ? "1" : u
-            else
-                ""
-            end
-        end
-
-        # Cache of the latest 1D points, used by Save CSV and Fit.
-        last_1d_k     = Float32[]
-        last_1d_p     = Float32[]
-        last_1d_units = "cycles/pixel"
-        last_meta     = (; ny_in = 0, nx_in = 0, ny_eff = 0, nx_eff = 0,
-                          padded = false, window = :none, apodized = false,
-                          f_sky = 1.0, w_norm = 0.0, k_phys = false, src = "zoom")
-
-        ps_blocks = Any[]
-        clear_plot!() = begin
-            for b in ps_blocks
-                try
-                    Makie.delete!(b)
-                catch
-                end
-            end
-            empty!(ps_blocks)
-        end
-
-        function ps_subimage()
-            M = slice_proc[]
-            if ps_src[] === :full
-                return M
-            end
-            fl = ax_img.finallimits[]
-            x0 = Float64(fl.origin[1])
-            y0 = Float64(fl.origin[2])
-            x1 = x0 + Float64(fl.widths[1])
-            y1 = y0 + Float64(fl.widths[2])
-            i_lo = clamp(Int(floor(min(x0, x1))), 1, size(M, 1))
-            i_hi = clamp(Int(ceil(max(x0, x1))),  1, size(M, 1))
-            j_lo = clamp(Int(floor(min(y0, y1))), 1, size(M, 2))
-            j_hi = clamp(Int(ceil(max(y0, y1))),  1, size(M, 2))
-            (i_hi <= i_lo || j_hi <= j_lo) && return M
-            return M[i_lo:i_hi, j_lo:j_hi]
-        end
-
-        function format_status(meta)
-            io = IOBuffer()
-            print(io, "size $(meta.ny_in)×$(meta.nx_in)")
-            if meta.padded
-                print(io, " (pad→$(meta.ny_eff)×$(meta.nx_eff))")
-            end
-            print(io, " • $(meta.src) • ")
-            print(io, meta.window === :none ? "none" : titlecase(String(meta.window)))
-            if meta.apodized
-                print(io, " • NaN apod")
-            end
-            if meta.f_sky < 1.0
-                print(io, " • f_sky=$(round(meta.f_sky; digits = 3))")
-            end
-            print(io, " • k=", meta.k_phys ? "1/$(physical_unit_label())" : "cycles/pixel")
-            return String(take!(io))
-        end
-
-        function ps_render!()
-            clear_plot!()
-            sub = ps_subimage()
-            ny0, nx0 = size(sub)
-            if ny0 < 4 || nx0 < 4
-                lab = Label(plot_grid[1, 1]; text = "Selection too small for FFT (need ≥ 4×4).", fontsize = 14)
-                push!(ps_blocks, lab)
-                ps_status[] = " "
-                empty!(last_1d_k); empty!(last_1d_p)
-                return
-            end
-            src_label = ps_src[] === :full ? "full" : "zoom"
-            use_phys = ps_units[] === :physical && physical_available()
-            dx, dy = pixel_scales()
-            k_unit_lbl = use_phys ? "1/$(physical_unit_label())" : "cycles/pixel"
-            # why: factored computation shared with render_power_spectrum_layout!
-            bundle = _cube_ps_bundle(sub;
-                                     window = ps_window[],
-                                     pad_pow2 = ps_pad[],
-                                     apodize_nan = ps_nanapo[],
-                                     use_phys = use_phys, dx = dx, dy = dy)
-            P2d = bundle.P2d
-            ny, nx = bundle.meta.ny_eff, bundle.meta.nx_eff
-            meta = (; bundle.meta..., k_phys = use_phys, src = src_label)
-            last_meta = meta
-
-            if ps_mode[] === :two_d
-                empty!(last_1d_k); empty!(last_1d_p)
-                last_1d_units = k_unit_lbl
-                vis = bundle.P2d_log10
-                ax = Axis(
-                    plot_grid[1, 1];
-                    title  = latexstring("\\text{2D power spectrum (log10) — ", latex_safe(src_label), "}"),
-                    xlabel = use_phys ?
-                        latexstring("k_x\\;(", latex_safe(k_unit_lbl), ")") :
-                        L"k_x\;\text{(cycles/pixel)}",
-                    ylabel = use_phys ?
-                        latexstring("k_y\\;(", latex_safe(k_unit_lbl), ")") :
-                        L"k_y\;\text{(cycles/pixel)}",
-                    aspect = DataAspect(),
-                    xtickformat = latex_tick_formatter,
-                    ytickformat = latex_tick_formatter,
-                )
-                kx = bundle.kx
-                ky = bundle.ky
-                hm = heatmap!(ax, kx, ky, vis; colormap = cm_obs[])
-                cb = Colorbar(
-                    plot_grid[1, 2],
-                    hm;
-                    label = L"\log_{10}|F|^2",
-                    width = 18,
-                    height = _axis_render_height(ax),
-                    tellheight = false,
-                    valign = :center,
-                )
-                push!(ps_blocks, ax); push!(ps_blocks, cb)
-            else
-                prof = bundle.prof
-                k = bundle.k
-                p_floored = bundle.prof_floored
-                resize!(last_1d_k, length(k));  copyto!(last_1d_k, k)
-                resize!(last_1d_p, length(prof)); copyto!(last_1d_p, prof)
-                last_1d_units = k_unit_lbl
-
-                ax = Axis(
-                    plot_grid[1, 1];
-                    title  = latexstring("\\text{1D radial power spectrum — ", latex_safe(src_label), "}"),
-                    xlabel = use_phys ?
-                        latexstring("k\\;(", latex_safe(k_unit_lbl), ")") :
-                        L"k\;\text{(cycles/pixel)}",
-                    ylabel = L"\langle|F|^2\rangle",
-                    yscale = log10,
-                    xtickformat = latex_tick_formatter,
-                )
-                if !isempty(k)
-                    lines!(ax, k, p_floored; color = ui_accent, linewidth = 1.8)
-                end
-                push!(ps_blocks, ax)
-
-                if ps_fit_on[] && length(k) >= 3
-                    kmin_txt = get_box_str(kmin_box)
-                    kmax_txt = get_box_str(kmax_box)
-                    valid_k = filter(>(0), k)
-                    auto_lo = isempty(valid_k) ? 0.0 : Float64(first(valid_k))
-                    auto_hi = isempty(k) ? Inf : Float64(last(k))
-                    kmin_v = isempty(kmin_txt) ? auto_lo : something(tryparse(Float64, kmin_txt), auto_lo)
-                    kmax_v = isempty(kmax_txt) ? auto_hi : something(tryparse(Float64, kmax_txt), auto_hi)
-                    slope, intercept, n_used = fit_loglog_slope(k, prof; kmin = kmin_v, kmax = kmax_v)
-                    if isfinite(slope) && n_used >= 2
-                        kfit = filter(ki -> ki > 0 && ki >= kmin_v && ki <= kmax_v, k)
-                        if !isempty(kfit)
-                            yfit = Float32.(10 .^ (slope .* log10.(Float64.(kfit)) .+ intercept))
-                            lines!(ax, kfit, yfit; color = :red, linestyle = :dash, linewidth = 1.5)
-                            slope_str = "slope=$(round(slope; digits = 3)) [n=$(n_used)]"
-                            ps_status[] = format_status(meta) * " • " * slope_str
-                            return
-                        end
-                    end
-                end
-            end
-            ps_status[] = format_status(meta)
-        end
-
-        on(mode_menu.selection)  do sel; sel === nothing || (ps_mode[] = sel == "1D" ? :one_d : :two_d; ps_render!()); end
-        on(src_menu.selection)   do sel; sel === nothing || (ps_src[] = sel == "full" ? :full : :zoom; ps_render!()); end
-        on(win_menu.selection)   do sel
-            sel === nothing && return
-            ps_window[] = sel == "Hamming" ? :hamming : sel == "None" ? :none : :hann
-            ps_render!()
-        end
-        on(unit_menu.selection)  do sel
-            sel === nothing && return
-            ps_units[] = sel == "physical" ? :physical : :pixel
-            ps_render!()
-        end
-        on(pad_chk.checked)    do v; ps_pad[]    = v; ps_render!(); end
-        on(nanapo_chk.checked) do v; ps_nanapo[] = v; ps_render!(); end
-        on(fit_chk.checked)    do v; ps_fit_on[] = v; ps_render!(); end
-        on(kmin_box.stored_string) do _; ps_fit_on[] && ps_render!(); end
-        on(kmax_box.stored_string) do _; ps_fit_on[] && ps_render!(); end
-        on(refresh_btn.clicks) do _; ps_render!(); end
-
-        ps_window_alive = Ref(true)
-        on(slice_proc) do _
-            ps_window_alive[] && ps_render!()
-        end
-
-        ps_save_path(ext) = joinpath(save_root, make_name(get_box_str(fname_box), "powerspec.$(ext)"))
-        on(save_png_btn.clicks) do _
-            try
-                out = ps_save_path("png")
-                CairoMakie.save(String(out), fig_ps; backend = CairoMakie)
-                set_status!("Saved power spectrum to $(out).")
-            catch e
-                set_status!("Failed to save PNG: $(sprint(showerror, e))")
-            end
-        end
-        on(save_pdf_btn.clicks) do _
-            try
-                out = ps_save_path("pdf")
-                CairoMakie.save(String(out), fig_ps; backend = CairoMakie)
-                set_status!("Saved power spectrum to $(out).")
-            catch e
-                set_status!("Failed to save PDF: $(sprint(showerror, e))")
-            end
-        end
-        on(save_csv_btn.clicks) do _
-            if isempty(last_1d_k)
-                set_status!("No 1D points to save (switch to 1D mode first).")
-                return
-            end
-            try
-                out = ps_save_path("csv")
-                open(String(out), "w") do io
-                    println(io, "# window=$(last_meta.window) pad=$(last_meta.padded) nan_apod=$(last_meta.apodized) f_sky=$(last_meta.f_sky) src=$(last_meta.src)")
-                    println(io, "k_$(replace(last_1d_units, ' ' => '_')),power")
-                    for i in eachindex(last_1d_k)
-                        println(io, last_1d_k[i], ",", last_1d_p[i])
-                    end
-                end
-                set_status!("Saved 1D PS CSV to $(out).")
-            catch e
-                set_status!("Failed to save CSV: $(sprint(showerror, e))")
-            end
-        end
-
-        ps_render!()
-        keepalive!(fig_ps)
-        ps_fig_ref[]   = fig_ps
-        ps_alive_ref[] = true
-        on(fig_ps.scene.events.window_open) do is_open
-            if !is_open
-                ps_window_alive[] = false
-                ps_alive_ref[] = false
-                ps_fig_ref[]   = nothing
-                forget!(fig_ps)
-            end
-        end
-        display(fig_ps)
-        return fig_ps
-    end
+    # See src/views/cube/PSWindowBundle.jl
+    (; open_power_spectrum_window!) = _cube_ps_window_bundle(;
+        ps_fig_ref, ps_alive_ref,
+        slice_proc, wcs, axis, slice_axis_dims,
+        save_root, fname, fname_box, make_name,
+        ui_text, ui_text_muted, ui_accent,
+        style_menu!, style_button!, style_checkbox!, style_textbox!,
+        set_status!, cm_obs,
+    )
 
     on(ps_popout_btn.clicks) do _
         try
@@ -3052,6 +2516,13 @@ function _view_cube(
     end
 
     # ---------- Init ----------
+    if state !== nothing
+        try
+            apply_inline_state!(state; announce = false)
+        catch e
+            @warn "Failed to apply inline MANTA state" exception=(e, catch_backtrace())
+        end
+    end
     refresh_all!()
     refresh_hist_axes!()
     # Optional preload of a comparison cube passed via the `compare=` kwarg

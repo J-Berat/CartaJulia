@@ -20,7 +20,15 @@
 """
     latex_safe(s) -> String
 
-Escape special LaTeX characters.
+Escape special LaTeX characters for MathTeXEngine (the backend used by
+Makie). MathTeXEngine is not a full LaTeX engine: it has no text mode and
+does not understand the standard text-escape commands `\\^{}` / `\\~{}` —
+those would crash the parser even when wrapped inside `\\text{...}`.
+
+We therefore leave `^` and `~` raw: MathTeXEngine interprets them as
+superscript / sim operators in both `\\text{...}` and `\\mathrm{...}`,
+which produces the desired rendering for unit strings like `rad/m^2`
+(rendered as `rad/m²`).
 """
 function latex_safe(s::AbstractString)
     t = String(s)
@@ -32,8 +40,7 @@ function latex_safe(s::AbstractString)
     t = replace(t, "\$" => "\\\$")
     t = replace(t, "{" => "\\{")
     t = replace(t, "}" => "\\}")
-    t = replace(t, "^" => "\\^{}")
-    t = replace(t, "~" => "\\~{}")
+    # NB: `^` and `~` intentionally left raw — see docstring above.
     return t
 end
 
@@ -540,6 +547,70 @@ function parse_gif_request(
         return (true, frames, fpsv, "GIF start/stop were swapped because start > stop.")
     end
     return (true, frames, fpsv, "GIF settings applied.")
+end
+
+############################
+# Reproducible Julia snippets
+############################
+
+"""
+    manta_recipe(source; kwargs...) -> String
+
+Build a copy-pasteable Julia call of the form
+`MANTA.manta(source; kwargs...)`. Values are rendered as Julia literals for
+the scalar, tuple, vector and dictionary types used by viewer state.
+"""
+function manta_recipe(source; kwargs...)
+    pairs = collect(kwargs)
+    isempty(pairs) && return "MANTA.manta($(_julia_literal(source)))"
+    lines = ["MANTA.manta($(_julia_literal(source));"]
+    for (i, (k, v)) in enumerate(pairs)
+        comma = i == length(pairs) ? "" : ","
+        push!(lines, "    $(String(k)) = $(_julia_literal(v))$(comma)")
+    end
+    push!(lines, ")")
+    return join(lines, "\n")
+end
+
+struct JuliaExpr
+    code::String
+end
+
+JuliaExpr(code::AbstractString) = JuliaExpr(String(code))
+
+_julia_literal(x::JuliaExpr) = x.code
+_julia_literal(x::Nothing) = "nothing"
+_julia_literal(x::Bool) = x ? "true" : "false"
+_julia_literal(x::Symbol) = ":" * String(x)
+_julia_literal(x::AbstractString) = repr(String(x))
+_julia_literal(x::Integer) = string(x)
+function _julia_literal(x::AbstractFloat)
+    isnan(x) && return "NaN"
+    isinf(x) && return x > 0 ? "Inf" : "-Inf"
+    return string(x)
+end
+_julia_literal(x::Real) = string(x)
+_julia_literal(x::Tuple) = "(" * join((_julia_literal(v) for v in x), ", ") * (length(x) == 1 ? "," : "") * ")"
+_julia_literal(x::NamedTuple) =
+    "(" * join(("$(String(k)) = $(_julia_literal(v))" for (k, v) in pairs(x)), ", ") * ")"
+_julia_literal(x::AbstractVector) =
+    "Any[" * join((_julia_literal(v) for v in x), ", ") * "]"
+function _julia_literal(x::AbstractDict)
+    entries = ["$(_julia_literal(k)) => $(_julia_literal(v))" for (k, v) in sort!(collect(x); by = p -> string(p.first))]
+    return "Dict{Any,Any}(" * join(entries, ", ") * ")"
+end
+_julia_literal(x) = repr(x)
+
+function copy_text_to_clipboard(txt::AbstractString)
+    try
+        if isdefined(Base, :clipboard)
+            Base.invokelatest(getfield(Base, :clipboard), String(txt))
+            return true
+        end
+    catch e
+        @debug "Clipboard copy failed" exception=e
+    end
+    return false
 end
 
 ############################

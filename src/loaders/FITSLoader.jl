@@ -11,35 +11,74 @@
 using FITSIO
 
 # Public entry. `kwargs` mirror the `manta(filepath)` knobs that the loader
-# itself needs (HEALPix column, spectral-axis defaults). Viewer-only kwargs
-# (cmap, vmin, …) are not handled here.
+# itself needs (HEALPix column, spectral-axis defaults, HDU selection).
+# Viewer-only kwargs (cmap, vmin, …) are not handled here.
+#
+# `hdu` selects which FITS HDU to read (1-indexed). `hdu = 0` means
+# "auto-pick the first HDU that looks like an image/cube" — historical
+# behavior for files that put the data after a header-only primary HDU.
 function load_fits(
     filepath::AbstractString;
     column::Int = 1,
     v0::Real = 0.0,
     dv::Real = 1.0,
     vunit::AbstractString = "km/s",
+    hdu::Integer = 1,
+    lazy::Bool = false,
 )
-    isfile(filepath) || throw(ArgumentError("MANTA: FITS file not found: $(abspath(filepath))"))
+    require_file(filepath;
+        hint = "Vérifie le chemin (cwd = $(pwd())) ou utilise un chemin absolu.")
 
-    # Read primary HDU once. Tolerates an empty primary (HEALPix BinTable
-    # files have no image in HDU 1). We capture the original exception so
-    # that we can surface it later if the file turns out to be neither a
-    # HEALPix BinTable nor a readable image cube.
+    Int(hdu) >= 0 || invalid_kwarg(:hdu, hdu;
+        hint = "Doit être un entier ≥ 0 (1 = HDU primaire, 0 = auto-détection).")
+
+    # Lazy path: shortcut HEALPix detection, hand off to the lazy loader,
+    # and wrap the result in the appropriate dataset (without ever
+    # reading the full data array).
+    if lazy
+        Int(hdu) >= 1 || invalid_kwarg(:hdu, hdu;
+            hint = "Le chargement lazy nécessite un HDU explicite ≥ 1.")
+        header, arr, _ = open_lazy_fits(filepath; hdu = Int(hdu))
+        if arr isa LazyFITSImage
+            return _load_image_fits_lazy(filepath, arr, header)
+        else  # LazyFITSCube
+            return _load_cube_fits_lazy(filepath, arr, header)
+        end
+    end
+
+    # Read selected HDU once. Tolerates an empty/header-only HDU (HEALPix
+    # BinTable files have no image in HDU 1). We capture the original
+    # exception so we can surface it via `UnsupportedFormatError` if needed.
+    hdu_index = max(Int(hdu), 1)   # 0 means "auto" — we still start at 1
+    auto_pick = Int(hdu) == 0
     header = nothing
-    header_error = nothing
     primary_error = nothing
+    n_hdus = 0
     raw = try
         FITS(filepath) do f
-            header = try
-                read_header(f[1])
-            catch e
-                header_error = e
-                nothing
+            n_hdus = length(f)
+            if auto_pick
+                # Walk HDUs and pick the first one that yields a non-empty array.
+                for k in 1:n_hdus
+                    try
+                        cand = read(f[k])
+                        if cand !== nothing && ndims(cand) > 0
+                            hdu_index = k
+                            header = try read_header(f[k]) catch _ nothing end
+                            return cand
+                        end
+                    catch _
+                    end
+                end
+                return nothing
+            else
+                hdu_index <= n_hdus || invalid_hdu(filepath, hdu_index, n_hdus)
+                header = try read_header(f[hdu_index]) catch _ nothing end
+                return read(f[hdu_index])
             end
-            read(f[1])
         end
     catch e
+        e isa MANTAError && rethrow()
         primary_error = e
         nothing
     end
@@ -58,11 +97,19 @@ function load_fits(
         return _load_healpix_map_fits(filepath; column = column)
     end
 
-    # 3) 3D cube. If we never got the primary HDU, surface the original error.
+    # 3) Image / cube / vector. If we never got the HDU, raise a structured
+    #    error pointing at the most likely fix (try another HDU, fix the file).
     if raw === nothing
-        throw(ArgumentError(
-            "MANTA: failed to read FITS primary HDU in $(abspath(filepath)). " *
-            "Original error: $(primary_error === nothing ? "(unknown)" : sprint(showerror, primary_error))"))
+        msg = primary_error === nothing ?
+            "HDU vide ou illisible." :
+            sprint(showerror, primary_error)
+        throw(UnsupportedFormatError(
+            String(filepath),
+            "FITS",
+            "Échec lecture HDU #$(hdu_index)" *
+            (n_hdus > 0 ? " (le fichier en contient $(n_hdus))." : ".") *
+            "\n     Essaie un autre `hdu=...` ou vérifie l'intégrité du fichier." *
+            "\n     Détail: $(msg)"))
     end
     if ndims(raw) == 1
         return _load_vector_fits(filepath, raw, header)
@@ -71,9 +118,11 @@ function load_fits(
         return _load_image_fits(filepath, raw, header)
     end
     if ndims(raw) != 3
-        throw(ArgumentError(
-            "MANTA: Expected a 3D FITS cube, 2D image or 1D vector in $(abspath(filepath)), " *
-            "got ndims=$(ndims(raw)) and size=$(size(raw))."))
+        throw(DatasetShapeError(
+            "tableau FITS de dimension $(ndims(raw)) (taille $(size(raw))) " *
+            "dans $(abspath(filepath)).",
+            "MANTA gère 1D (vecteur), 2D (image) et 3D (cube). " *
+            "Réduis la dimensionnalité ou choisis un autre `hdu=...`."))
     end
     return _load_cube_fits(filepath, raw, header)
 end
@@ -139,6 +188,51 @@ function _load_cube_fits(filepath::AbstractString, raw, header)
                             :fits_path => abspath(String(filepath)))
     wcs_xform === nothing || (meta[:wcs_transform] = wcs_xform)
     return CubeDataset(data;
+        axis_labels = ["axis1", "axis2", "axis3"],
+        wcs = wcs,
+        unit_label = unit_label,
+        source_id = fname,
+        metadata = meta,
+    )
+end
+
+# ---- lazy variants (no eager `as_float32`) ----
+#
+# These mirror the dataset shape of the eager loaders but keep the
+# underlying array as a `LazyFITSImage` / `LazyFITSCube`. The rest of
+# MANTA only touches the data via `get_slice_*` / `view(...)`, so a
+# lazy array is observationally equivalent — modulo per-slice I/O cost.
+
+function _load_image_fits_lazy(filepath::AbstractString, lazy_img::LazyFITSImage,
+                                header)
+    wcs = header === nothing ? SimpleWCSAxis[] : read_simple_wcs(header, 2)
+    wcs_xform = header === nothing ? nothing : read_wcs_transform(header, 2)
+    unit_label = data_unit_label(header; fallback = "value")
+    fname = String(replace(basename(filepath), r"\.fits(\.gz)?$" => ""))
+    meta = Dict{Symbol,Any}(:fits_header => header,
+                            :fits_path => abspath(String(filepath)),
+                            :lazy => true)
+    wcs_xform === nothing || (meta[:wcs_transform] = wcs_xform)
+    return ImageDataset(lazy_img;
+        axis_labels = ["axis1", "axis2"],
+        wcs = wcs,
+        unit_label = unit_label,
+        source_id = fname,
+        metadata = meta,
+    )
+end
+
+function _load_cube_fits_lazy(filepath::AbstractString, lazy_cube::LazyFITSCube,
+                               header)
+    wcs = header === nothing ? SimpleWCSAxis[] : read_simple_wcs(header, 3)
+    wcs_xform = header === nothing ? nothing : read_wcs_transform(header, 3)
+    unit_label = data_unit_label(header; fallback = "value")
+    fname = String(replace(basename(filepath), r"\.fits(\.gz)?$" => ""))
+    meta = Dict{Symbol,Any}(:fits_header => header,
+                            :fits_path => abspath(String(filepath)),
+                            :lazy => true)
+    wcs_xform === nothing || (meta[:wcs_transform] = wcs_xform)
+    return CubeDataset(lazy_cube;
         axis_labels = ["axis1", "axis2", "axis3"],
         wcs = wcs,
         unit_label = unit_label,

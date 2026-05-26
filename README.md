@@ -136,6 +136,8 @@ For a 3D cube, MANTA can:
 - add automatic or manual contours;
 - compare with a second cube of the same size;
 - compute moment 0, 1, and 2 maps;
+- apply a persistent voxel mask (threshold / rectangle / finite) that
+  propagates to moments, histograms, spectra, and FITS exports;
 - export images, spectra, FITS products, and GIFs;
 - save and reload viewer settings.
 
@@ -231,6 +233,68 @@ RGB image:
 rgb = MANTA.rgb_image(U, V, W; normalize=:symmetric)
 MANTA.manta(rgb; title="RGB")
 ```
+
+## Masks
+
+The 3D cube viewer carries an optional persistent voxel mask. A mask is
+declarative: only the source (its kind and parameters) is stored, so it can be
+regenerated from the cube data whenever a viewer is reopened or a settings
+file is reloaded.
+
+Supported sources:
+
+- `NoMaskSource()` — disabled (every voxel is kept).
+- `FiniteSource()` — keep only voxels where `isfinite(data)`.
+- `ThresholdSource(op, lo, hi)` — keep voxels whose value satisfies the
+  predicate selected by `op`:
+  - `:ge` keeps `data >= lo`,
+  - `:le` keeps `data <= hi`,
+  - `:range` keeps `lo <= data <= hi`,
+  - `:outside` keeps `data < lo || data > hi`.
+  Non-finite voxels are always rejected so NaNs never leak into accumulators.
+- `RectangleSource(; i1, i2, j1, j2, k1, k2)` — keep voxels whose 1-based
+  `(i, j, k)` index falls in the closed box. Any bound can be `nothing`
+  meaning "no constraint on that side"; bounds are reordered automatically.
+
+The Mask UI card in the cube viewer (next to the histogram and FITS export
+controls) exposes the same options as a source selector with the relevant
+parameter fields (`lo`/`hi` for thresholds, `i/j/k` range textboxes for
+rectangles), plus Apply / Reset buttons and a live count of kept voxels.
+
+A mask propagates uniformly to:
+
+- moment 0 / 1 / 2 maps (`moment_map` accepts an optional `mask` kwarg and
+  combines it with the existing `moment_threshold` semantics);
+- the histogram of the displayed slice;
+- per-voxel and per-region spectra (`mean_region_spectrum` likewise accepts a
+  `mask` kwarg);
+- FITS exports — selecting the `"mask"` product writes the materialised
+  `BitArray` as an `Int8` HDU, while moments / region exports respect the
+  active mask.
+
+Programmatically:
+
+```julia
+using MANTA
+
+cube = rand(Float32, 64, 64, 32)
+
+# Build a mask from a declarative source.
+src  = ThresholdSource(:ge, 0.5, 0.0)        # keep voxels >= 0.5
+mask = make_mask(src, cube)
+@info "kept" mask_count(mask) "of" mask_total(mask) "voxels"
+
+# moment_map accepts the materialised BitArray directly:
+m0 = moment_map(cube, 3, 1:32, 0; mask = mask.bits)
+
+# Or restore a source from a TOML dict (typically `viewer_settings.toml`):
+d  = mask_source_to_toml(src)
+src2 = mask_source_from_toml(d)              # always returns a MaskSource
+```
+
+The mask source is persisted under the `"mask"` key of `viewer_settings.toml`;
+malformed or unknown entries gracefully degrade to `NoMaskSource()` so a
+corrupted settings file never blocks a viewer launch.
 
 ## Development Commands
 

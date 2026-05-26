@@ -52,7 +52,8 @@ export parse_contour_specs, format_contour_specs, contour_color_values
 export ijk_to_uv, uv_to_ijk, get_slice, get_slice_view, get_slice_copy
 export as_float32, parse_path_spec
 export region_uv_indices, mean_region_spectrum
-export dual_view_product, moments, moments_map, moment_map, moment_vectors, filtered_cube_by_slice
+export dual_view_product, resample_matrix_linear, resample_cube_linear, reproject_cube_linear
+export moments, moments_map, moment_map, moment_vectors, filtered_cube_by_slice
 export make_info_tex
 export MANTA_COLORMAP_OPTIONS, ui_colormap_options
 export to_cmap, get_box_str, _pick_fig_size, _axis_render_height
@@ -60,6 +61,7 @@ export latex_safe, make_main_title, make_slice_title, make_spec_title
 export latex_tick, latex_tick_formatter
 export parse_manual_clims, parse_histogram_bins, parse_histogram_xlimits
 export parse_histogram_ylimits, parse_spectrum_ylimits, parse_gif_request
+export manta_recipe, copy_text_to_clipboard
 export SimpleWCSAxis, read_simple_wcs, has_wcs, world_coord
 export wcs_axis_label, format_world_coord, data_unit_label
 export WCSTransform, read_wcs_transform, pixel_scale, sky_world_coords
@@ -68,6 +70,25 @@ export fits_header_for_slice, fits_header_for_moment
 export fits_header_for_region_spectrum, fits_header_for_filtered_cube
 export save_viewer_settings, load_viewer_settings
 export power_spectrum_2d, power_spectrum_1d_radial, fit_loglog_slope
+export ShortcutBinding, register_shortcuts!, format_shortcut, format_shortcut_help, shortcut_help_message
+export open_shortcut_help_window
+# Errors (actionable, structured)
+export MANTAError, FileNotFoundError, UnsupportedFormatError,
+       HDUSelectionError, InvalidArgumentError, DatasetShapeError
+export require_file, rethrow_actionable, invalid_kwarg, invalid_hdu
+# Progress + cancellation
+export CancelToken, cancel!, is_cancelled
+export ProgressTracker, tick!, set_progress!, finish!, with_progress
+# Display downsampling
+export downsample_factor, downsample_block_mean, downsample_subsample, auto_downsample
+# Undo / redo (`clear!` and `current` are intentionally NOT re-exported —
+# fully qualified `MANTA.clear!` / `MANTA.current` to avoid Base collisions)
+export UndoRedoStack, register_state!, undo!, redo!, with_suppression
+# Plugin extension surface
+export register_plugin!, unregister_plugin!, list_plugins, clear_plugins!
+export plugin_load, plugin_view, run_postprocess!
+# Backend selection (headless robustness)
+export is_headless_env, pick_backend!, with_export_backend
 
 ############################
 # Deps
@@ -93,3 +114,10 @@ include("WCS.jl")           # provides header_has / header_get reused below
 include("FITSHeaders.jl")
 include("UIBits.jl")
 include("PowerSpectrum.jl")
+include("Shortcuts.jl")
+include("Errors.jl")
+include("Progress.jl")
+include("Downsample.jl")
+include("UndoRedo.jl")
+include("Plugins.jl")
+include("Backend.jl")

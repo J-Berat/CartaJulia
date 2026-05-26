@@ -225,12 +225,19 @@ end
 """
     moment_map(data, axis, order; coords=1:size(data, axis),
                channels=1:size(data, axis),
-               threshold=0.0, nsigma=nothing, sigma=nothing, dx=nothing)
+               threshold=0.0, nsigma=nothing, sigma=nothing, dx=nothing,
+               mask=nothing)
 
 Compute moment 0, 1, or 2 along `axis`, returning a 2D map in the same
 orientation as `get_slice`. The moment definition is delegated to
 [`moments`](@ref) — see its docstring for the integration convention and
 the threshold / channel-window options.
+
+`mask`, when provided, is a 3-D `AbstractArray{Bool}` with the same shape
+as `data`. Voxels where the mask is `false` are NaN-ed out before entering
+the moment accumulator, so they are skipped both by the `isfinite` test
+and by the threshold predicate inside [`_pixel_moment`](@ref). Passing
+`nothing` (the default) preserves the legacy unmasked behaviour exactly.
 """
 function moment_map(
     data::AbstractArray{T,3},
@@ -242,9 +249,14 @@ function moment_map(
     nsigma = nothing,
     sigma = nothing,
     dx = nothing,
+    mask::Union{Nothing,AbstractArray{Bool,3}} = nothing,
 ) where {T}
     1 <= axis <= 3 || throw(ArgumentError("axis must be 1, 2, or 3"))
     order in (0, 1, 2) || throw(ArgumentError("moment order must be 0, 1, or 2"))
+    if mask !== nothing && size(mask) != size(data)
+        throw(DimensionMismatch(
+            "mask size $(size(mask)) must match data size $(size(data))"))
+    end
     u_max, v_max = axis == 1 ? (size(data, 2), size(data, 3)) :
                    axis == 2 ? (size(data, 1), size(data, 3)) :
                                (size(data, 1), size(data, 2))
@@ -255,13 +267,32 @@ function moment_map(
     x = Float32[Float32(coords[c]) for c in chan_vec]
     widths = _channel_widths(x, dx)
     y = Vector{Float32}(undef, length(chan_vec))
-    @inbounds for u in 1:u_max, v in 1:v_max
-        for (n, c) in pairs(chan_vec)
-            y[n] = Float32(_channel_value(data, axis, u, v, c))
+    if mask === nothing
+        @inbounds for u in 1:u_max, v in 1:v_max
+            for (n, c) in pairs(chan_vec)
+                y[n] = Float32(_channel_value(data, axis, u, v, c))
+            end
+            # why: only the requested order is computed (one pass for 0/1, two for 2),
+            # instead of always running the full moments() triple and discarding 2/3.
+            out[u, v] = Float32(_pixel_moment(order, y, x, widths, threshold, nsigma, sigma))
         end
-        # why: only the requested order is computed (one pass for 0/1, two for 2),
-        # instead of always running the full moments() triple and discarding 2/3.
-        out[u, v] = Float32(_pixel_moment(order, y, x, widths, threshold, nsigma, sigma))
+    else
+        # Masked path: NaN out voxels rejected by the mask. `_pixel_moment`
+        # already discards non-finite samples, so this is the cheapest way to
+        # honour the mask without forking the inner kernel.
+        @inbounds for u in 1:u_max, v in 1:v_max
+            for (n, c) in pairs(chan_vec)
+                m = if axis == 1
+                    mask[c, u, v]
+                elseif axis == 2
+                    mask[u, c, v]
+                else
+                    mask[u, v, c]
+                end
+                y[n] = m ? Float32(_channel_value(data, axis, u, v, c)) : Float32(NaN)
+            end
+            out[u, v] = Float32(_pixel_moment(order, y, x, widths, threshold, nsigma, sigma))
+        end
     end
     return out
 end

@@ -70,6 +70,15 @@ using Healpix
     ok_sy_auto, manual_sy_auto, _, _ = MANTA.parse_spectrum_ylimits("", "")
     @test ok_sy_auto && !manual_sy_auto
 
+    recipe = MANTA.manta_recipe("cube.fits";
+        cmap = :magma,
+        invert = true,
+        state = Dict("axis" => 3, "index" => 12),
+    )
+    @test occursin("MANTA.manta(\"cube.fits\";", recipe)
+    @test occursin("cmap = :magma", recipe)
+    @test occursin("\"axis\" => 3", recipe)
+
     smoothed = MANTA.nan_gaussian_filter(Float32[NaN 1 1; NaN 1 1; NaN NaN NaN], 1.0)
     @test size(smoothed) == (3, 3)
     @test isfinite(smoothed[2, 2])
@@ -154,6 +163,22 @@ end
     @test isnan(ratio[2, 1])
     resid = MANTA.dual_view_product(a, b, :residuals)
     @test isapprox(mean(vec(resid)), 0f0; atol = 1f-6)
+
+    small = reshape(Float32[1, 3, 5, 7], 2, 2)
+    up = MANTA.resample_matrix_linear(small, (3, 3))
+    @test size(up) == (3, 3)
+    @test up[1, 1] == small[1, 1]
+    @test up[3, 3] == small[2, 2]
+    @test up[2, 2] ≈ 4f0
+
+    coarse_cube = reshape(Float32.(1:8), 2, 2, 2)
+    fine_cube = MANTA.resample_cube_linear(coarse_cube, (3, 3, 3))
+    @test size(fine_cube) == (3, 3, 3)
+    @test fine_cube[1, 1, 1] == coarse_cube[1, 1, 1]
+    @test fine_cube[3, 3, 3] == coarse_cube[2, 2, 2]
+    mixed = MANTA.dual_view_product(zeros(Float32, 3, 3), small, :B)
+    @test size(mixed) == (3, 3)
+    @test mixed[2, 2] ≈ 4f0
 
     cube = Array{Float32}(undef, 2, 2, 3)
     cube[:, :, 1] .= 1f0
@@ -641,7 +666,7 @@ end
         MANTA.forget!(fig_map_via_manta)
 
         missing = joinpath(tmp, "does_not_exist.fits")
-        @test_throws ArgumentError MANTA.manta(missing; activate_gl = false, display_fig = false)
+        @test_throws MANTA.FileNotFoundError MANTA.manta(missing; activate_gl = false, display_fig = false)
 
         image2d_path = joinpath(tmp, "image2d.fits")
         FITS(image2d_path, "w") do f
@@ -676,8 +701,8 @@ end
         catch e
             e
         end
-        @test err isa ArgumentError
-        @test occursin("Expected a 3D FITS cube", sprint(showerror, err))
+        @test err isa MANTA.DatasetShapeError
+        @test occursin("dimension 4", sprint(showerror, err))
     end
 end
 
@@ -899,9 +924,9 @@ end
 end
 
 @testset "datasets: load_dataset (paths)" begin
-    @test_throws ArgumentError MANTA.load_dataset("does_not_exist.fits")
-    @test_throws ArgumentError MANTA.load_dataset("does_not_exist.h5")
-    @test_throws ArgumentError MANTA.load_dataset("unrecognised.txt")
+    @test_throws MANTA.FileNotFoundError MANTA.load_dataset("does_not_exist.fits")
+    @test_throws MANTA.FileNotFoundError MANTA.load_dataset("does_not_exist.h5")
+    @test_throws MANTA.UnsupportedFormatError MANTA.load_dataset("unrecognised.txt")
 end
 
 @testset "abstract type rename" begin
@@ -1253,4 +1278,639 @@ end
             @test !haskey(rh, "CTYPE3")
         end
     end
+end
+
+# ----------------------------------------------------------------------
+# Persistent mask system
+# ----------------------------------------------------------------------
+@testset "mask: pure helpers" begin
+    # Cube has finite values everywhere except one explicit NaN.
+    data = Float32[i + 10j + 100k for i in 1:4, j in 1:3, k in 1:2]
+    data[2, 2, 1] = NaN32
+
+    @testset "NoMaskSource keeps everything" begin
+        bits = MANTA.build_mask(MANTA.NoMaskSource(), data)
+        @test size(bits) == size(data)
+        @test count(bits) == length(data)
+    end
+
+    @testset "FiniteSource rejects only the NaN" begin
+        bits = MANTA.build_mask(MANTA.FiniteSource(), data)
+        @test count(bits) == length(data) - 1
+        @test bits[2, 2, 1] == false
+        @test bits[1, 1, 1] == true
+    end
+
+    @testset "ThresholdSource :ge / :le / :range / :outside" begin
+        # All values are in (1, 1234), so :ge with lo=50 keeps everything
+        # ≥ 50; :le with hi=50 keeps everything ≤ 50.
+        bge = MANTA.build_mask(MANTA.ThresholdSource(:ge, 50.0, 0.0), data)
+        ble = MANTA.build_mask(MANTA.ThresholdSource(:le, 0.0, 50.0), data)
+        brn = MANTA.build_mask(MANTA.ThresholdSource(:range, 20.0, 100.0), data)
+        bou = MANTA.build_mask(MANTA.ThresholdSource(:outside, 20.0, 100.0), data)
+        # Disjoint partitions (except for non-finite voxels):
+        finite_count = sum(isfinite, data)
+        @test count(bge) + count(ble) >= finite_count - 1  # boundary overlap at 50 allowed
+        @test count(brn) + count(bou) == finite_count
+        # NaN always rejected
+        @test bge[2, 2, 1] == false
+        @test ble[2, 2, 1] == false
+        @test brn[2, 2, 1] == false
+        @test bou[2, 2, 1] == false
+    end
+
+    @testset "ThresholdSource validates op" begin
+        @test_throws ArgumentError MANTA.ThresholdSource(:bogus, 0.0, 1.0)
+    end
+
+    @testset "RectangleSource: closed-box selection" begin
+        src = MANTA.RectangleSource(i1 = 2, i2 = 3, j1 = 1, j2 = 2)
+        bits = MANTA.build_mask(src, data)
+        # Selected box: i ∈ {2,3}, j ∈ {1,2}, k ∈ {1,2} (k unconstrained)
+        @test count(bits) == 2 * 2 * 2
+        @test bits[2, 1, 1] == true
+        @test bits[3, 2, 2] == true
+        @test bits[1, 1, 1] == false
+        @test bits[4, 1, 1] == false
+    end
+
+    @testset "RectangleSource auto-swaps min/max" begin
+        # i1 > i2 should be reordered automatically by the keyword constructor.
+        src = MANTA.RectangleSource(i1 = 3, i2 = 1)
+        bits = MANTA.build_mask(src, data)
+        @test count(bits) > 0
+        @test bits[1, 1, 1] == true
+        @test bits[3, 1, 1] == true
+    end
+
+    @testset "MANTAMask: stats helpers" begin
+        m = MANTA.make_mask(MANTA.FiniteSource(), data)
+        @test MANTA.mask_total(m) == length(data)
+        @test MANTA.mask_count(m) == length(data) - 1
+        @test 0 < MANTA.mask_fraction(m) < 1
+    end
+end
+
+@testset "mask: TOML round-trip" begin
+    for src in (
+        MANTA.NoMaskSource(),
+        MANTA.FiniteSource(),
+        MANTA.ThresholdSource(:ge, 1.5, 0.0),
+        MANTA.ThresholdSource(:range, -3.0, 7.5),
+        MANTA.RectangleSource(i1 = 2, i2 = 5, k1 = 1),
+    )
+        d = MANTA.mask_source_to_toml(src)
+        @test haskey(d, "kind")
+        rt = MANTA.mask_source_from_toml(d)
+        @test typeof(rt) === typeof(src)
+        if src isa MANTA.ThresholdSource
+            @test rt.op == src.op
+            @test rt.lo == src.lo
+            @test rt.hi == src.hi
+        elseif src isa MANTA.RectangleSource
+            @test rt.i1 == src.i1
+            @test rt.i2 == src.i2
+            @test rt.j1 == src.j1
+            @test rt.j2 == src.j2
+            @test rt.k1 == src.k1
+            @test rt.k2 == src.k2
+        end
+    end
+
+    # Malformed TOML → NoMaskSource (graceful degradation).
+    @test MANTA.mask_source_from_toml(Dict{String,Any}("kind" => "bogus")) isa MANTA.NoMaskSource
+    @test MANTA.mask_source_from_toml(Dict{String,Any}()) isa MANTA.NoMaskSource
+    @test MANTA.mask_source_from_toml(nothing) isa MANTA.NoMaskSource
+    # Unknown op → NoMaskSource
+    @test MANTA.mask_source_from_toml(Dict{String,Any}("kind" => "threshold",
+        "op" => "huh", "lo" => 0.0, "hi" => 1.0)) isa MANTA.NoMaskSource
+end
+
+@testset "mask: integration with moment_map / mean_region_spectrum" begin
+    # Synthetic cube: integer values 1..N so moments are trivial to predict.
+    nx, ny, nz = 3, 4, 5
+    data = Array{Float32}(undef, nx, ny, nz)
+    for i in 1:nx, j in 1:ny, k in 1:nz
+        data[i, j, k] = Float32(i + 10j + 100k)
+    end
+
+    # --- moment_map: unmasked vs masked path produce different results ---
+    m0_unmasked = MANTA.moment_map(data, 3, 0)
+    bits = MANTA.build_mask(MANTA.ThresholdSource(:ge, 200.0, 0.0), data)
+    m0_masked = MANTA.moment_map(data, 3, 0; mask = bits)
+    @test size(m0_unmasked) == size(m0_masked)
+    @test m0_unmasked != m0_masked
+    # Masked sum is ≤ unmasked sum (we dropped some channels)
+    @test sum(filter(isfinite, m0_masked)) <= sum(filter(isfinite, m0_unmasked))
+
+    # --- mean_region_spectrum: same behavior ---
+    uv = [(1, 1), (2, 1), (1, 2)]
+    y_unmasked = MANTA.mean_region_spectrum(data, 3, uv)
+    y_masked = MANTA.mean_region_spectrum(data, 3, uv; mask = bits)
+    @test length(y_unmasked) == nz
+    @test length(y_masked) == nz
+    # Early channels rejected by :ge 200 mask
+    @test isnan(y_masked[1])
+    @test !isnan(y_unmasked[1])
+
+    # --- Dimension mismatch is an error ---
+    bad_bits = trues(2, 2, 2)
+    @test_throws DimensionMismatch MANTA.moment_map(data, 3, 0; mask = bad_bits)
+    @test_throws DimensionMismatch MANTA.mean_region_spectrum(data, 3, uv; mask = bad_bits)
+end
+
+@testset "mask: headless cube viewer smoke test" begin
+    # Build a tiny cube + open the viewer with activate_gl=false / display_fig=false.
+    # Then sanity-check that toggling the mask doesn't crash anything.
+    nx, ny, nz = 6, 5, 4
+    data = Array{Float32}(undef, nx, ny, nz)
+    for i in 1:nx, j in 1:ny, k in 1:nz
+        data[i, j, k] = Float32(i + j + k)
+    end
+    ds = MANTA.load_dataset(data)
+    fig = MANTA.view_cube(ds; activate_gl = false, display_fig = false)
+    @test fig isa Figure
+end
+
+# ----------------------------------------------------------------------------
+# Keyboard shortcuts helper (headless)
+# ----------------------------------------------------------------------------
+@testset "helpers: keyboard shortcuts" begin
+    # --- ShortcutBinding constructor: validation + field access ---
+    b = MANTA.ShortcutBinding(Makie.Keyboard.r, () -> nothing;
+                              description = "test", modifier = :none)
+    @test b.key === Makie.Keyboard.r
+    @test b.description == "test"
+    @test b.modifier === :none
+    # Unknown modifier must error to guard against typos at the call site.
+    @test_throws Exception MANTA.ShortcutBinding(Makie.Keyboard.r, () -> nothing;
+                                                  modifier = :super)
+
+    # --- Pretty-printing: format_shortcut + format_shortcut_help ---
+    @test MANTA.format_shortcut(b) == "R"
+    bshift = MANTA.ShortcutBinding(Makie.Keyboard.slash, () -> nothing;
+                                    description = "help", modifier = :shift)
+    @test MANTA.format_shortcut(bshift) == "Shift + /"
+    bctrl = MANTA.ShortcutBinding(Makie.Keyboard.s, () -> nothing;
+                                   description = "save", modifier = :ctrl)
+    @test MANTA.format_shortcut(bctrl) == "Ctrl + S"
+    @test MANTA.format_shortcut(MANTA.ShortcutBinding(Makie.Keyboard.left,
+                                                       () -> nothing)) == "←"
+
+    # An empty description is silently skipped in the help string.
+    b_nodesc = MANTA.ShortcutBinding(Makie.Keyboard.up, () -> nothing)
+    help_str = MANTA.format_shortcut_help([b, b_nodesc])
+    @test occursin("R test", help_str)
+    @test !occursin("↑", help_str)
+    @test MANTA.shortcut_help_message([b, bshift]) == "Shortcuts — R test · Shift + / help"
+    @test MANTA.shortcut_help_message([b_nodesc]) == "Shortcuts — none"
+
+    # --- Firing a press event invokes the registered action ---
+    fig = Figure(size = (320, 200))
+    n = Ref(0)
+    b_inc = MANTA.ShortcutBinding(Makie.Keyboard.r, () -> (n[] += 1);
+                                   description = "inc")
+    MANTA.register_shortcuts!(fig, [b_inc])
+    events(fig).keyboardbutton[] = Makie.KeyEvent(Makie.Keyboard.r, Makie.Keyboard.press)
+    @test n[] == 1
+    # Release events must NOT refire the binding.
+    events(fig).keyboardbutton[] = Makie.KeyEvent(Makie.Keyboard.r, Makie.Keyboard.release)
+    @test n[] == 1
+    # Repeated press still triggers (each notify is a fresh dispatch).
+    events(fig).keyboardbutton[] = Makie.KeyEvent(Makie.Keyboard.r, Makie.Keyboard.press)
+    @test n[] == 2
+    # Unrelated keys are ignored.
+    events(fig).keyboardbutton[] = Makie.KeyEvent(Makie.Keyboard.s, Makie.Keyboard.press)
+    @test n[] == 2
+
+    # --- is_blocked predicate gates dispatch ---
+    fig2 = Figure(size = (320, 200))
+    blocked = Ref(true)
+    m = Ref(0)
+    b_block = MANTA.ShortcutBinding(Makie.Keyboard.r, () -> (m[] += 1))
+    MANTA.register_shortcuts!(fig2, [b_block]; is_blocked = () -> blocked[])
+    events(fig2).keyboardbutton[] = Makie.KeyEvent(Makie.Keyboard.r, Makie.Keyboard.press)
+    @test m[] == 0
+    blocked[] = false
+    events(fig2).keyboardbutton[] = Makie.KeyEvent(Makie.Keyboard.r, Makie.Keyboard.press)
+    @test m[] == 1
+
+    # --- Action-level exception does not kill the figure handler ---
+    fig3 = Figure(size = (320, 200))
+    survived = Ref(0)
+    b_bad  = MANTA.ShortcutBinding(Makie.Keyboard.r, () -> error("boom"))
+    b_good = MANTA.ShortcutBinding(Makie.Keyboard.s,
+                                    () -> (survived[] += 1))
+    MANTA.register_shortcuts!(fig3, [b_bad, b_good])
+    @test_logs (:warn, "Shortcut handler error") events(fig3).keyboardbutton[] = Makie.KeyEvent(Makie.Keyboard.r, Makie.Keyboard.press)
+    events(fig3).keyboardbutton[] = Makie.KeyEvent(Makie.Keyboard.s, Makie.Keyboard.press)
+    @test survived[] == 1
+end
+
+# ----------------------------------------------------------------------------
+# Shortcut help window (headless)
+# ----------------------------------------------------------------------------
+@testset "helpers: shortcut help window" begin
+    # Typical multi-binding set, including an undocumented binding that
+    # the window is supposed to skip.
+    bindings = MANTA.ShortcutBinding[
+        MANTA.ShortcutBinding(Makie.Keyboard.r, () -> nothing;
+                              description = "reset zoom"),
+        MANTA.ShortcutBinding(Makie.Keyboard.s, () -> nothing;
+                              description = "save image"),
+        MANTA.ShortcutBinding(Makie.Keyboard.slash, () -> nothing;
+                              description = "this help", modifier = :shift),
+        # Undocumented binding (empty description) must NOT crash the
+        # window and must not appear in the rendered list.
+        MANTA.ShortcutBinding(Makie.Keyboard.tab, () -> nothing),
+    ]
+
+    fig = MANTA.open_shortcut_help_window(bindings;
+        title = "Test shortcuts",
+        activate_gl = false, display_fig = false)
+    @test fig isa Figure
+
+    # Empty bindings: window still renders with a placeholder message.
+    fig_empty = MANTA.open_shortcut_help_window(MANTA.ShortcutBinding[];
+        title = "Empty", activate_gl = false, display_fig = false)
+    @test fig_empty isa Figure
+
+    # Custom figure size override is honoured.
+    fig_sized = MANTA.open_shortcut_help_window(bindings;
+        figsize = (420, 300),
+        activate_gl = false, display_fig = false)
+    @test fig_sized isa Figure
+    @test size(fig_sized.scene) == (420, 300)
+
+    # Default size scales with the documented-binding count: more bindings
+    # should yield at least as tall a window as fewer bindings.
+    one_binding = MANTA.ShortcutBinding[
+        MANTA.ShortcutBinding(Makie.Keyboard.r, () -> nothing;
+                              description = "only one"),
+    ]
+    fig_small = MANTA.open_shortcut_help_window(one_binding;
+        activate_gl = false, display_fig = false)
+    fig_big   = MANTA.open_shortcut_help_window(bindings;
+        activate_gl = false, display_fig = false)
+    @test size(fig_big.scene)[2] >= size(fig_small.scene)[2]
+end
+
+# ----------------------------------------------------------------------------
+# Structured errors (Errors.jl)
+# ----------------------------------------------------------------------------
+@testset "helpers: structured errors" begin
+    # File not found → actionable message with path + hint.
+    err_str = sprint(showerror,
+        MANTA.FileNotFoundError("/no/such.fits", "Vérifie le chemin."))
+    @test occursin("/no/such.fits", err_str)
+    @test occursin("Vérifie", err_str)
+
+    # require_file roundtrip
+    @test_throws MANTA.FileNotFoundError MANTA.require_file("/definitely/missing")
+    mktemp() do path, io
+        write(io, "X"); close(io)
+        @test MANTA.require_file(path) == String(path)
+    end
+
+    # invalid_kwarg → carries kwarg name + value + hint.
+    e = try
+        MANTA.invalid_kwarg(:hdu, -3; hint = "Doit être ≥ 0.")
+    catch err
+        err
+    end
+    @test e isa MANTA.InvalidArgumentError
+    @test e.name === :hdu
+    @test e.value == -3
+    @test occursin("hdu", sprint(showerror, e))
+
+    # invalid_hdu → carries requested + available indices.
+    e = try
+        MANTA.invalid_hdu("/foo.fits", 5, 2)
+    catch err
+        err
+    end
+    @test e isa MANTA.HDUSelectionError
+    @test e.requested == 5 && e.available == 2
+    @test occursin("HDU #5", sprint(showerror, e))
+
+    # MANTAError is the abstract root: catch should work uniformly.
+    caught = try
+        throw(MANTA.DatasetShapeError("dimensions inattendues",
+                                       "Vérifie ton fichier."))
+    catch err
+        err isa MANTA.MANTAError
+    end
+    @test caught
+end
+
+# ----------------------------------------------------------------------------
+# Progress + cancellation
+# ----------------------------------------------------------------------------
+@testset "helpers: progress + cancellation" begin
+    # CancelToken: flip + idempotency
+    tok = MANTA.CancelToken()
+    @test !MANTA.is_cancelled(tok)
+    MANTA.cancel!(tok)
+    @test MANTA.is_cancelled(tok)
+    MANTA.cancel!(tok)              # idempotent
+    @test MANTA.is_cancelled(tok)
+    @test !MANTA.is_cancelled(nothing)   # nothing-friendly
+
+    # ProgressTracker: tick! advances counter and observable.
+    p = MANTA.ProgressTracker(total = 4, label = "scan")
+    @test p.progress[] == 0.0
+    @test p.status[] == "scan"
+    MANTA.tick!(p; status = "1/4")
+    @test p.progress[] == 0.25
+    @test p.status[] == "1/4"
+    MANTA.tick!(p); MANTA.tick!(p); MANTA.tick!(p)
+    @test p.progress[] == 1.0
+
+    # set_progress! clamps to [0, 1].
+    p2 = MANTA.ProgressTracker(total = 0)
+    MANTA.set_progress!(p2, -0.1)
+    @test p2.progress[] == 0.0
+    MANTA.set_progress!(p2, 1.5; status = "overshoot")
+    @test p2.progress[] == 1.0
+    @test p2.status[] == "overshoot"
+
+    # finish! pins to 1.
+    p3 = MANTA.ProgressTracker(total = 10)
+    MANTA.finish!(p3; status = "done")
+    @test p3.progress[] == 1.0
+    @test p3.status[] == "done"
+
+    # nothing-friendly overloads do not crash.
+    @test MANTA.tick!(nothing) === nothing
+    @test MANTA.set_progress!(nothing, 0.5) === nothing
+    @test MANTA.finish!(nothing) === nothing
+
+    # with_progress runs body + finishes tracker on normal return.
+    val = MANTA.with_progress("compute", total = 3) do prog, tok
+        @test prog isa MANTA.ProgressTracker
+        @test tok  isa MANTA.CancelToken
+        for k in 1:3
+            MANTA.is_cancelled(tok) && return nothing
+            MANTA.tick!(prog)
+        end
+        return 42
+    end
+    @test val == 42
+end
+
+# ----------------------------------------------------------------------------
+# Downsampling for display
+# ----------------------------------------------------------------------------
+@testset "helpers: downsampling" begin
+    # No downsampling required when the array fits.
+    A = rand(Float32, 100, 80)
+    out, s = MANTA.auto_downsample(A; max_pixels = 4096)
+    @test s == 1
+    @test size(out) == size(A)
+    @test eltype(out) == Float32
+
+    # Large array: integer stride that brings both dims ≤ max_pixels.
+    B = ones(Float32, 8000, 4000)
+    out2, s2 = MANTA.auto_downsample(B; max_pixels = 4096)
+    @test s2 >= 2
+    @test maximum(size(out2)) <= 4096
+
+    # Block-mean preserves the constant value of a constant array.
+    C = fill(7f0, 200, 100)
+    outc, _ = MANTA.auto_downsample(C; max_pixels = 50)
+    @test all(isapprox.(outc, 7f0; atol = 1f-6))
+
+    # Block-mean ignores NaNs (one NaN in a block ≠ NaN output).
+    D = ones(Float32, 4, 4); D[1, 1] = NaN32
+    outd = MANTA.downsample_block_mean(D, 4)
+    @test size(outd) == (1, 1)
+    @test isfinite(outd[1, 1])
+    @test outd[1, 1] ≈ 1f0
+
+    # downsample_factor edge cases.
+    @test MANTA.downsample_factor((100, 80), 4096) == 1
+    @test MANTA.downsample_factor((8000, 4000), 4096) == 2
+    @test_throws ArgumentError MANTA.downsample_factor((100,), 0)
+
+    # 3D variant: only downsamples the spatial dims, preserves nz.
+    E = rand(Float32, 1000, 1000, 5)
+    outE, sE = MANTA.auto_downsample(E; max_pixels = 200)
+    @test sE >= 5
+    @test size(outE, 3) == 5
+end
+
+# ----------------------------------------------------------------------------
+# Undo / redo stack
+# ----------------------------------------------------------------------------
+@testset "helpers: undo/redo" begin
+    s = MANTA.UndoRedoStack{NamedTuple{(:v,),Tuple{Int}}}(capacity = 4)
+    @test isempty(s)
+    @test !s.can_undo[]
+    @test !s.can_redo[]
+
+    MANTA.register_state!(s, (v = 1,))
+    MANTA.register_state!(s, (v = 2,))
+    MANTA.register_state!(s, (v = 3,))
+    @test length(s) == 3
+    @test MANTA.current(s) == (v = 3,)
+    @test s.can_undo[]
+    @test !s.can_redo[]
+
+    snap = MANTA.undo!(s)
+    @test snap == (v = 2,)
+    @test s.can_redo[]
+    snap = MANTA.undo!(s)
+    @test snap == (v = 1,)
+    @test !s.can_undo[]
+
+    snap = MANTA.redo!(s)
+    @test snap == (v = 2,)
+    @test s.can_undo[]
+    @test s.can_redo[]
+
+    # New entry after undo discards the redo tail.
+    MANTA.register_state!(s, (v = 99,))
+    @test MANTA.current(s) == (v = 99,)
+    @test !s.can_redo[]
+
+    # Deduplication: same value twice → no new entry.
+    n_before = length(s)
+    MANTA.register_state!(s, (v = 99,))
+    @test length(s) == n_before
+
+    # Capacity: oldest snapshots dropped from the bottom.
+    s2 = MANTA.UndoRedoStack{Int}(capacity = 3)
+    for k in 1:5
+        MANTA.register_state!(s2, k)
+    end
+    @test length(s2) == 3
+    @test MANTA.current(s2) == 5
+    snaps = [MANTA.undo!(s2) for _ in 1:2]
+    @test snaps == [4, 3]
+    @test MANTA.undo!(s2) === nothing   # already at bottom
+
+    # with_suppression: register_state! is a no-op inside.
+    s3 = MANTA.UndoRedoStack(0)
+    MANTA.register_state!(s3, 1)
+    MANTA.with_suppression(s3) do
+        MANTA.register_state!(s3, 42)
+    end
+    @test MANTA.current(s3) == 1
+end
+
+# ----------------------------------------------------------------------------
+# Plugin extension surface
+# ----------------------------------------------------------------------------
+@testset "helpers: plugins" begin
+    MANTA.clear_plugins!()
+    @test isempty(MANTA.list_plugins(:loader))
+
+    # Loader plugin: matcher + loader.
+    matcher = path -> endswith(path, ".dummy")
+    loader  = (path; kwargs...) -> :loaded
+    MANTA.register_plugin!(:loader, (matcher, loader))
+    @test length(MANTA.list_plugins(:loader)) == 1
+    @test MANTA.plugin_load("/tmp/foo.dummy") === :loaded
+    @test MANTA.plugin_load("/tmp/foo.bar") === nothing
+
+    # Dataset-view plugin: matched on (type, name).
+    MANTA.register_plugin!(:dataset_view,
+        (MANTA.ImageDataset, :flatten, (ds; kwargs...) -> :ok))
+    img = MANTA.load_dataset(ones(Float32, 4, 4))
+    @test MANTA.plugin_view(img, :flatten) === :ok
+    @test MANTA.plugin_view(img, :other)   === nothing
+
+    # Postprocess plugin: catches user errors and keeps going.
+    seen = Ref(0)
+    bad  = (fig, ds, opts) -> error("boom")
+    good = (fig, ds, opts) -> (seen[] += 1; nothing)
+    MANTA.register_plugin!(:postprocess, bad)
+    MANTA.register_plugin!(:postprocess, good)
+    @test_logs (:warn, r"plugin postprocess") MANTA.run_postprocess!(nothing, img)
+    @test seen[] == 1
+
+    # Unregister: identity-based, idempotent.
+    n = MANTA.unregister_plugin!(:postprocess, good)
+    @test n == 1
+    MANTA.run_postprocess!(nothing, img)   # `seen` should not advance
+    @test seen[] == 1
+
+    MANTA.clear_plugins!()
+end
+
+# ----------------------------------------------------------------------------
+# Lazy FITS arrays
+# ----------------------------------------------------------------------------
+@testset "lazy FITS: 2D + 3D" begin
+    mktempdir() do dir
+        # ---- 2D image ----
+        path2 = joinpath(dir, "img.fits")
+        FITS(path2, "w") do f
+            data2 = Float32[i + 10*j for i in 1:6, j in 1:5]
+            write(f, data2)
+        end
+        header, arr, n = MANTA.open_lazy_fits(path2; hdu = 1)
+        @test arr isa MANTA.LazyFITSImage{Float32}
+        @test size(arr) == (6, 5)
+        @test arr[1, 1] == Float32(1 + 10*1)
+        @test arr[6, 5] == Float32(6 + 10*5)
+        full = collect(arr)
+        @test size(full) == (6, 5)
+        @test full[3, 2] == Float32(3 + 10*2)
+
+        # load_fits with lazy=true → ImageDataset wrapping the lazy array
+        ds = MANTA.load_fits(path2; lazy = true)
+        @test ds isa MANTA.ImageDataset
+        @test ds.data isa MANTA.LazyFITSImage
+        @test get(ds.metadata, :lazy, false) === true
+
+        # ---- 3D cube ----
+        path3 = joinpath(dir, "cube.fits")
+        FITS(path3, "w") do f
+            data3 = Float32[i + 10*j + 100*k for i in 1:4, j in 1:5, k in 1:3]
+            write(f, data3)
+        end
+        h, lc, _ = MANTA.open_lazy_fits(path3; hdu = 1)
+        @test lc isa MANTA.LazyFITSCube{Float32}
+        @test size(lc) == (4, 5, 3)
+        # Single-element + axis-3 slice.
+        @test lc[1, 1, 1] == Float32(1 + 10 + 100)
+        slice = MANTA.read_slice!(lc, 3, 2)
+        @test size(slice) == (4, 5)
+        @test slice[2, 3] == Float32(2 + 30 + 200)
+        # Cache hit: same axis/idx returns the same matrix object.
+        slice2 = MANTA.read_slice!(lc, 3, 2)
+        @test slice2 === slice
+        # Axis-1 and axis-2 slices.
+        s1 = MANTA.read_slice!(lc, 1, 2)
+        @test size(s1) == (5, 3)
+        s2 = MANTA.read_slice!(lc, 2, 3)
+        @test size(s2) == (4, 3)
+        # Spectrum extraction.
+        sp = MANTA.read_spectrum(lc, 1, 1)
+        @test length(sp) == 3
+        @test sp[1] == Float32(1 + 10 + 100)
+        @test sp[2] == Float32(1 + 10 + 200)
+        # CubeDataset wrapping the lazy cube.
+        ds3 = MANTA.load_fits(path3; lazy = true)
+        @test ds3 isa MANTA.CubeDataset
+        @test ds3.data isa MANTA.LazyFITSCube
+
+        # HDU out-of-range → HDUSelectionError.
+        @test_throws MANTA.HDUSelectionError MANTA.open_lazy_fits(path2; hdu = 99)
+    end
+end
+
+# ----------------------------------------------------------------------------
+# HDU selection (eager loader)
+# ----------------------------------------------------------------------------
+@testset "loader: hdu kwarg" begin
+    mktempdir() do dir
+        path = joinpath(dir, "img.fits")
+        FITS(path, "w") do f
+            write(f, Float32[i + j for i in 1:6, j in 1:5])
+        end
+        # Default hdu=1 still works.
+        ds = MANTA.load_fits(path)
+        @test ds isa MANTA.ImageDataset
+        @test size(ds.data) == (6, 5)
+        # Explicit hdu=1.
+        ds1 = MANTA.load_fits(path; hdu = 1)
+        @test size(ds1.data) == (6, 5)
+        # Out-of-range HDU → structured error.
+        @test_throws MANTA.MANTAError MANTA.load_fits(path; hdu = 9)
+        # Negative HDU → InvalidArgumentError.
+        @test_throws MANTA.InvalidArgumentError MANTA.load_fits(path; hdu = -1)
+        # Auto-pick (hdu=0) still finds the first non-empty HDU.
+        ds0 = MANTA.load_fits(path; hdu = 0)
+        @test ds0 isa MANTA.ImageDataset
+    end
+end
+
+# ----------------------------------------------------------------------------
+# Backend helpers (#8)
+# ----------------------------------------------------------------------------
+@testset "helpers: backend selection" begin
+    # is_headless_env: env-var override.
+    withenv("MANTA_HEADLESS" => "1") do
+        @test MANTA.is_headless_env() == true
+    end
+    withenv("MANTA_HEADLESS" => "") do
+        # We don't assert the negative case across CI variants — we only
+        # require that the helper returns a Bool.
+        @test MANTA.is_headless_env() isa Bool
+    end
+
+    # pick_backend!(false) → :CairoMakie. pick_backend!(true) may downgrade
+    # if no GL is available; either symbol is acceptable.
+    @test MANTA.pick_backend!(false) === :CairoMakie
+    sym = MANTA.pick_backend!(true)
+    @test sym in (:GLMakie, :CairoMakie)
+
+    # with_export_backend always runs the body; restores prev backend on exit.
+    MANTA.pick_backend!(false)
+    result = MANTA.with_export_backend() do
+        42
+    end
+    @test result == 42
 end

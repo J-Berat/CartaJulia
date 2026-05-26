@@ -70,7 +70,7 @@ function manta_healpix(
 )
     rgb_pixels = as_rgb_pixels(pixels)
     img = mollweide_color_grid(rgb_pixels; nx=nx, ny=ny)
-    activate_gl ? GLMakie.activate!() : CairoMakie.activate!()
+    pick_backend!(activate_gl)
     fig = Figure(size = _pick_fig_size(figsize))
     ax = Axis(
         fig[1, 1];
@@ -113,8 +113,15 @@ function manta_healpix_panels(
     show_graticule::Bool = true,
 ) where {N}
     N >= 1 || throw(ArgumentError("Provide at least one HEALPix panel."))
-    activate_gl ? GLMakie.activate!() : CairoMakie.activate!()
-    fig = Figure(size = _pick_fig_size(figsize))
+    pick_backend!(activate_gl)
+    fig_size = _pick_fig_size(figsize)
+    # Layout responsive : on rétrécit la colorbar (et son row Fixed) sur les
+    # petites fenêtres pour que la carte reste lisible — même logique que
+    # les vues map / cube HEALPix.
+    compact_layout = fig_size[1] <= 1500 || fig_size[2] <= 950
+    cbar_row_h     = compact_layout ? 32 : 44
+    cbar_height    = compact_layout ? 12 : 16
+    fig = Figure(size = fig_size)
     rowgap!(fig.layout, -8)
     title_at(i) = titles === nothing ? "panel $(i)" : String(titles[i])
     cmap_at(i) = cmaps === nothing ? :inferno : cmaps[i]
@@ -152,12 +159,12 @@ function manta_healpix_panels(
                 fig[2, i],
                 hm;
                 vertical=false,
-                height=16,
+                height=cbar_height,
                 tellwidth=false,
                 halign=:center,
             )
             rowsize!(fig.layout, 1, Relative(1))
-            rowsize!(fig.layout, 2, Fixed(44))
+            rowsize!(fig.layout, 2, Fixed(cbar_row_h))
         end
         set_mollweide_view!(ax, -2.0, 2.0, -1.0, 1.0)
         graticule = draw_mollweide_graticule!(ax)
@@ -661,8 +668,17 @@ function _view_healpix_cube(
     ui_text_muted = ui_theme.text_muted
 
     # ---------- Figure ----------
-    activate_gl ? GLMakie.activate!() : CairoMakie.activate!()
-    fig = Figure(size = _pick_fig_size(figsize), backgroundcolor = ui_theme.background)
+    pick_backend!(activate_gl)
+    fig_size = _pick_fig_size(figsize)
+    # Layout responsive (cf. _view_healpix_map / CubeView). Sans ces seuils,
+    # les Fixed() écrasent la carte ou poussent les contrôles hors fenêtre
+    # quand l'utilisateur ouvre la vue PPV avec figsize ≤ 1500×950.
+    compact_layout = fig_size[1] <= 1500 || fig_size[2] <= 950
+    cbar_h_px      = compact_layout ? 38  : 52
+    spec_h_px      = compact_layout ? 130 : 165
+    hist_h_px      = compact_layout ? 70  : 100
+    font_sz        = compact_layout ? 13  : 15
+    fig = Figure(size = fig_size, backgroundcolor = ui_theme.background)
     main_grid = fig[1, 1] = GridLayout()
 
     # Carte
@@ -735,12 +751,12 @@ function _view_healpix_cube(
         hm;
         label=map_unit_label,
         vertical=false,
-        height=18,
+        height=compact_layout ? 14 : 18,
         tellwidth=false,
         halign=:center,
     )
     rowsize!(map_grid, 1, Relative(1))
-    rowsize!(map_grid, 2, Fixed(52))
+    rowsize!(map_grid, 2, Fixed(cbar_h_px))
 
     # Spectre
     # Affiché dans le même espace que la carte (lin/log10/ln) → cohérence
@@ -813,84 +829,248 @@ function _view_healpix_cube(
     vlines!(ax_hist, lift(lim -> [first(lim), last(lim)], clims_safe);
             color=(ui_text_muted, 0.65), linewidth=1.0, linestyle=:dash)
 
-    # Contrôles
-    ctrl = main_grid[4, 1] = GridLayout(; alignmode=Outside())
-    Label(ctrl[1,1], text=L"\text{Channel}", halign=:left, tellwidth=false, fontsize=15)
-    chan_slider = Slider(ctrl[1,2]; range=1:nv, startvalue=chan_idx[],
-                         width=320, height=14)
-    chan_label  = Label(ctrl[1,3];
-        text=lift(j -> is_channel_axis ?
-                latexstring("j=", j) :
-                latexstring("j=", j, ",\\;v=", string(round(v0_eff+(j-1)*dv_eff; digits=2)),
-                            "\\,\\mathrm{", latex_safe(vunit_eff), "}"), chan_idx),
-        fontsize=15, halign=:left, tellwidth=true, width=160)
+    # Contrôles (card-based modal layout, mirrors CubeView / HealpixMapView)
+    ctrl_row_h   = compact_layout ? (36, 168, 130) : (42, 190, 150)
+    ctrl_gap     = compact_layout ? 6 : 10
+    ctrl_total_h = sum(ctrl_row_h) + 2 * ctrl_gap
+    card_pad     = compact_layout ? 9 : 12
+    card_gap     = compact_layout ? 7 : 10
 
-    Label(ctrl[1,4], text=L"\text{Scale}", halign=:left, tellwidth=false, fontsize=15)
-    scale_menu = Menu(ctrl[1,5]; options=["lin","log10","ln"], prompt=String(scale), width=92)
-    Label(ctrl[1,6], text=L"\text{Colormap}", halign=:left, tellwidth=false, fontsize=15)
-    cmap_menu = Menu(ctrl[1,7]; options=ui_colormap_options(), prompt=String(cmap), width=112)
-    invert_chk = Checkbox(ctrl[1,8]); Label(ctrl[1,9], text="Invert", halign=:left, tellwidth=false, fontsize=15)
+    ctrl_grid = main_grid[4, 1] = GridLayout(; alignmode = Outside())
+
+    # -- Visibility helpers (verbatim from CubeView) --
+    set_block_visible!(block, visible::Bool) = begin
+        try; block.visible[] = visible;            catch; end
+        try; block.scene.visible[] = visible;      catch; end
+        try; block.blockscene.visible[] = visible; catch; end
+        nothing
+    end
+    function set_layout_contents_visible!(layout, visible::Bool)
+        for block in try; contents(layout); catch; Any[]; end
+            set_block_visible!(block, visible)
+            block isa GridLayout && set_layout_contents_visible!(block, visible)
+        end
+        nothing
+    end
+
+    # -- Card factory (mirrors CubeView / HealpixMapView) --
+    function control_card!(parent, row, col, title::AbstractString; rows::Int = 4, cols::Int = 4)
+        card = parent[row, col] = GridLayout(;
+            alignmode = Outside(card_pad), tellwidth = false, tellheight = false)
+        body_rows = rows + 1
+        Box(card[1:body_rows, 1:cols]; color = ui_theme.panel, strokecolor = ui_theme.border,
+            strokewidth = 1.0, cornerradius = 8, z = -6)
+        Box(card[1, 1:cols]; color = ui_theme.panel_header, strokecolor = (:transparent, 0.0),
+            strokewidth = 0.0, cornerradius = 8, z = -5)
+        Label(card[1, 1:cols]; text = uppercase(title), halign = :left, tellwidth = false,
+            fontsize = 13, font = :bold, color = ui_theme.accent_strong, padding = (10, 10, 6, 6))
+        Box(card[body_rows, 1:cols]; color = :transparent, strokewidth = 0, z = -7)
+        rowsize!(card, body_rows, Fixed(compact_layout ? 10 : 12))
+        rowgap!(card, card_gap)
+        colgap!(card, card_gap)
+        return card
+    end
+    ctrl_lbl!(layout, pos, txt) = Label(layout[pos...]; text = txt, halign = :left,
+        tellwidth = false, fontsize = font_sz, color = ui_theme.text_muted)
+
+    # -- Mode bar (row 1, full width) --
+    mode_bar = ctrl_grid[1, 1:3] = GridLayout(; alignmode = Outside(0))
+    colgap!(mode_bar, compact_layout ? 6 : 10)
+    mode_nav_btn      = Button(mode_bar[1, 1]; label = "Navigation", width = 130, height = 32)
+    mode_analysis_btn = Button(mode_bar[1, 2]; label = "Analysis",   width = 112, height = 32)
+    mode_export_btn   = Button(mode_bar[1, 3]; label = "Export",     width = 96,  height = 32)
+    help_btn          = Button(mode_bar[1, 4]; label = "Help",       width = 74,  height = 32)
+    foreach(c -> colsize!(mode_bar, c, Auto()), 1:4)
+    foreach(w -> manta_style_button!(w, ui_theme; compact = compact_layout),
+            (mode_nav_btn, mode_analysis_btn, mode_export_btn, help_btn))
+    control_mode = Observable(:navigation)
+
+    # ---- NAVIGATION cards ----
+
+    # channel_card [nav col 1] — Channel slider + Scale
+    channel_card = control_card!(ctrl_grid, 2, 1, "Channel"; rows = 4, cols = 6)
+    ctrl_lbl!(channel_card, (2, 1), "Channel")
+    chan_slider = Slider(channel_card[2, 2:5]; range = 1:nv, startvalue = chan_idx[])
+    manta_style_slider!(chan_slider, ui_theme; compact = compact_layout)
+    chan_label = Label(channel_card[2, 6];
+        text = lift(j -> is_channel_axis ?
+            latexstring("j=", j) :
+            latexstring("j=", j, ",\\;v=",
+                string(round(v0_eff + (j-1)*dv_eff; digits = 2)),
+                "\\,\\mathrm{", latex_safe(vunit_eff), "}"), chan_idx),
+        fontsize = font_sz, halign = :left, tellwidth = false)
+    ctrl_lbl!(channel_card, (3, 1), "Scale")
+    scale_menu = Menu(channel_card[3, 2:3]; options = ["lin", "log10", "ln"], prompt = String(scale))
+    manta_style_menu!(scale_menu, ui_theme; compact = compact_layout)
+
+    # display_card [nav col 2] — Colormap, Invert, Smoothing
+    display_card = control_card!(ctrl_grid, 2, 2, "Display"; rows = 4, cols = 5)
+    cmap_menu = Menu(display_card[2, 1:3]; options = ui_colormap_options(), prompt = String(cmap))
+    manta_style_menu!(cmap_menu, ui_theme; compact = compact_layout)
+    invert_chk = Checkbox(display_card[2, 4])
     invert_chk.checked[] = invert_cmap[]
+    manta_style_checkbox!(invert_chk, ui_theme; compact = compact_layout)
+    Label(display_card[2, 5]; text = "Invert", halign = :left, tellwidth = false,
+        fontsize = font_sz, color = ui_theme.text_muted)
+    gauss_chk = Checkbox(display_card[3, 1])
+    manta_style_checkbox!(gauss_chk, ui_theme; compact = compact_layout)
+    Label(display_card[3, 2]; text = "Smooth", halign = :left, tellwidth = false,
+        fontsize = font_sz, color = ui_theme.text_muted)
+    sigma_label = Label(display_card[3, 3];
+        text = latexstring("\\sigma = 1.5\\,\\text{px}"),
+        fontsize = font_sz, halign = :left, tellwidth = false)
+    sigma_slider = Slider(display_card[3, 4:5]; range = LinRange(0, 10, 101), startvalue = 1.5)
+    manta_style_slider!(sigma_slider, ui_theme; compact = compact_layout)
 
-    Label(ctrl[2,1], text=L"\text{Contrast}", halign=:left, tellwidth=false, fontsize=15)
-    clim_min_box = Textbox(ctrl[2,2];  placeholder="min", width=100, height=30)
-    clim_max_box = Textbox(ctrl[2,3]; placeholder="max", width=100, height=30)
-    apply_btn    = Button(ctrl[2,4]; label="Apply",      width=80,  height=30)
-    auto_btn     = Button(ctrl[2,5]; label="Auto",       width=76,  height=30)
-    p1_btn       = Button(ctrl[2,6]; label="p1-p99",     width=88,  height=30)
-    p5_btn       = Button(ctrl[2,7]; label="p5-p95",     width=88,  height=30)
-    graticule_chk = Checkbox(ctrl[2,8])
-    Label(ctrl[2,9], text="Graticule", halign=:left, tellwidth=false, fontsize=15)
+    # nav_view_card [nav col 3] — Graticule, Reset zoom
+    nav_view_card = control_card!(ctrl_grid, 2, 3, "View"; rows = 3, cols = 4)
+    graticule_chk = Checkbox(nav_view_card[2, 1])
     graticule_chk.checked[] = show_graticule[]
-    reset_btn    = Button(ctrl[2,10]; label="Reset zoom", width=120, height=30)
-    save_btn     = Button(ctrl[2,11]; label="Save PNG",   width=110, height=30)
+    manta_style_checkbox!(graticule_chk, ui_theme; compact = compact_layout)
+    Label(nav_view_card[2, 2]; text = "Graticule", halign = :left, tellwidth = false,
+        fontsize = font_sz, color = ui_theme.text_muted)
+    reset_btn = Button(nav_view_card[2, 3:4]; label = "Reset zoom", height = 32)
+    manta_style_button!(reset_btn, ui_theme; compact = compact_layout)
 
-    gauss_chk = Checkbox(ctrl[3,1])
-    Label(ctrl[3,2], text="Smoothing", halign=:left, tellwidth=false, fontsize=15)
-    sigma_label = Label(ctrl[3,3], text=latexstring("\\sigma = 1.5\\,\\text{px}"), fontsize=15, halign=:left, tellwidth=false)
-    sigma_slider = Slider(ctrl[3,4:6]; range=LinRange(0, 10, 101), startvalue=1.5, width=220, height=14)
+    # ---- ANALYSIS cards ----
 
-    Label(ctrl[3,7], text=L"\text{Selection}", halign=:left, tellwidth=false, fontsize=15)
-    region_mode_menu = Menu(ctrl[3,8]; options=["point", "box", "circle"], prompt="point", width=108)
-    region_clear_btn = Button(ctrl[3,9]; label="Clear selection", width=138, height=30)
-    region_count_label = Label(ctrl[3,10]; text="0 pix", halign=:left, tellwidth=false, fontsize=15)
-    Label(ctrl[4,1], text=L"\text{Contours}", halign=:left, tellwidth=false, fontsize=15)
-    contour_chk = Checkbox(ctrl[4,2])
-    Label(ctrl[4,3], text="Show", halign=:left, tellwidth=false, fontsize=15)
-    contour_levels_box = Textbox(ctrl[4,4:6]; placeholder="auto or 1:red, 2:#00ffaa", width=250, height=30)
-    contour_apply_btn = Button(ctrl[4,7]; label="Apply", width=80, height=30)
+    # contrast_card [analysis col 1] — Contrast controls
+    contrast_card = control_card!(ctrl_grid, 2, 1, "Contrast"; rows = 4, cols = 5)
+    clim_min_box = Textbox(contrast_card[2, 1:2]; placeholder = "min", height = 30)
+    manta_style_textbox!(clim_min_box, ui_theme; compact = compact_layout)
+    clim_max_box = Textbox(contrast_card[2, 3:4]; placeholder = "max", height = 30)
+    manta_style_textbox!(clim_max_box, ui_theme; compact = compact_layout)
+    apply_btn = Button(contrast_card[2, 5]; label = "Apply", height = 30)
+    manta_style_button!(apply_btn, ui_theme; compact = compact_layout)
+    auto_btn = Button(contrast_card[3, 1:2]; label = "Auto", height = 30)
+    manta_style_button!(auto_btn, ui_theme; compact = compact_layout)
+    p1_btn   = Button(contrast_card[3, 3]; label = "p1-p99", height = 30)
+    manta_style_button!(p1_btn, ui_theme; compact = compact_layout)
+    p5_btn   = Button(contrast_card[3, 4:5]; label = "p5-p95", height = 30)
+    manta_style_button!(p5_btn, ui_theme; compact = compact_layout)
+
+    # selection_card [analysis col 2] — Selection mode + Spectrum y-limits
+    selection_card = control_card!(ctrl_grid, 2, 2, "Selection"; rows = 4, cols = 5)
+    region_mode_menu = Menu(selection_card[2, 1:3]; options = ["point", "box", "circle"], prompt = "point")
+    manta_style_menu!(region_mode_menu, ui_theme; compact = compact_layout)
+    region_clear_btn = Button(selection_card[2, 4:5]; label = "Clear", height = 30)
+    manta_style_button!(region_clear_btn, ui_theme; compact = compact_layout)
+    region_count_label = Label(selection_card[3, 1:3]; text = "0 pix", halign = :left,
+        tellwidth = false, fontsize = font_sz, color = ui_theme.text_muted)
+    ctrl_lbl!(selection_card, (4, 1), "Spec y")
+    spec_ymin_box = Textbox(selection_card[4, 2]; placeholder = "y min", height = 30)
+    manta_style_textbox!(spec_ymin_box, ui_theme; compact = compact_layout)
+    spec_ymax_box = Textbox(selection_card[4, 3]; placeholder = "y max", height = 30)
+    manta_style_textbox!(spec_ymax_box, ui_theme; compact = compact_layout)
+    spec_y_apply_btn = Button(selection_card[4, 4]; label = "Apply y", height = 30)
+    manta_style_button!(spec_y_apply_btn, ui_theme; compact = compact_layout)
+    spec_y_auto_btn  = Button(selection_card[4, 5]; label = "Auto y", height = 30)
+    manta_style_button!(spec_y_auto_btn, ui_theme; compact = compact_layout)
+
+    # contour_card [analysis col 3] — Contours
+    contour_card = control_card!(ctrl_grid, 2, 3, "Contours"; rows = 3, cols = 5)
+    contour_chk = Checkbox(contour_card[2, 1])
     contour_chk.checked[] = show_contours[]
+    manta_style_checkbox!(contour_chk, ui_theme; compact = compact_layout)
+    Label(contour_card[2, 2]; text = "Show", halign = :left, tellwidth = false,
+        fontsize = font_sz, color = ui_theme.text_muted)
+    contour_levels_box = Textbox(contour_card[2, 3:4]; placeholder = "auto or 1:red, 2:#00ffaa", height = 30)
+    manta_style_textbox!(contour_levels_box, ui_theme; compact = compact_layout)
+    contour_apply_btn = Button(contour_card[2, 5]; label = "Apply", height = 30)
+    manta_style_button!(contour_apply_btn, ui_theme; compact = compact_layout)
 
-    Label(ctrl[5,1], text=L"\text{Moment}", halign=:left, tellwidth=false, fontsize=15)
-    moment_menu = Menu(ctrl[5,2]; options=["M0 integrated", "M1 mean", "M2 dispersion"], prompt="M0 integrated", width=138)
-    show_moment_btn = Button(ctrl[5,3]; label="Show", width=80, height=30)
-    show_channel_btn = Button(ctrl[5,4]; label="Channel", width=92, height=30)
-    save_moment_fits_btn = Button(ctrl[5,5]; label="Save moment FITS", width=150, height=30)
-    Label(ctrl[6,1], text=L"\text{Histogram}", halign=:left, tellwidth=false, fontsize=15)
-    hist_mode_menu = Menu(ctrl[6,2]; options=["bars", "kde"], prompt=String(hist_mode_obs[]), width=92)
-    hist_bins_box = Textbox(ctrl[6,3]; placeholder="bins", width=80, height=30)
-    hist_xmin_box = Textbox(ctrl[6,4]; placeholder="x min", width=100, height=30)
-    hist_xmax_box = Textbox(ctrl[6,5]; placeholder="x max", width=100, height=30)
-    hist_apply_btn = Button(ctrl[6,6]; label="Apply x", width=88, height=30)
-    hist_auto_btn = Button(ctrl[6,7]; label="Auto x", width=82, height=30)
-    hist_ymin_box = Textbox(ctrl[6,8]; placeholder="y min", width=100, height=30)
-    hist_ymax_box = Textbox(ctrl[6,9]; placeholder="y max", width=100, height=30)
-    hist_y_apply_btn = Button(ctrl[6,10]; label="Apply y", width=88, height=30)
-    hist_y_auto_btn = Button(ctrl[6,11]; label="Auto y", width=82, height=30)
-    Label(ctrl[7,1], text=L"\text{Spectrum y}", halign=:left, tellwidth=false, fontsize=15)
-    spec_ymin_box = Textbox(ctrl[7,2]; placeholder="y min", width=100, height=30)
-    spec_ymax_box = Textbox(ctrl[7,3]; placeholder="y max", width=100, height=30)
-    spec_y_apply_btn = Button(ctrl[7,4]; label="Apply y", width=88, height=30)
-    spec_y_auto_btn = Button(ctrl[7,5]; label="Auto y", width=82, height=30)
-    foreach(w -> manta_style_menu!(w, ui_theme), (scale_menu, cmap_menu, region_mode_menu, moment_menu, hist_mode_menu))
-    foreach(w -> manta_style_button!(w, ui_theme), (apply_btn, auto_btn, p1_btn, p5_btn, reset_btn, save_btn, region_clear_btn, contour_apply_btn, show_moment_btn, show_channel_btn, save_moment_fits_btn, hist_apply_btn, hist_auto_btn, hist_y_apply_btn, hist_y_auto_btn, spec_y_apply_btn, spec_y_auto_btn))
-    foreach(w -> manta_style_checkbox!(w, ui_theme), (invert_chk, graticule_chk, gauss_chk, contour_chk))
-    foreach(w -> manta_style_textbox!(w, ui_theme), (clim_min_box, clim_max_box, contour_levels_box, hist_bins_box, hist_xmin_box, hist_xmax_box, hist_ymin_box, hist_ymax_box, spec_ymin_box, spec_ymax_box))
-    foreach(w -> manta_style_slider!(w, ui_theme), (chan_slider, sigma_slider))
+    # ---- ANALYSIS bottom: Moment + Histogram ----
+    analysis_bottom = ctrl_grid[3, 1:3] = GridLayout(; alignmode = Outside(0))
+    colgap!(analysis_bottom, ctrl_gap)
+
+    moment_card = control_card!(analysis_bottom, 1, 1, "Moment"; rows = 3, cols = 6)
+    moment_menu = Menu(moment_card[2, 1:3];
+        options = ["M0 integrated", "M1 mean", "M2 dispersion"], prompt = "M0 integrated")
+    manta_style_menu!(moment_menu, ui_theme; compact = compact_layout)
+    show_moment_btn = Button(moment_card[2, 4]; label = "Show", height = 30)
+    manta_style_button!(show_moment_btn, ui_theme; compact = compact_layout)
+    show_channel_btn = Button(moment_card[2, 5:6]; label = "Channel", height = 30)
+    manta_style_button!(show_channel_btn, ui_theme; compact = compact_layout)
+    save_moment_fits_btn = Button(moment_card[3, 1:4]; label = "Save moment FITS", height = 30)
+    manta_style_button!(save_moment_fits_btn, ui_theme; compact = compact_layout)
+
+    hist_card = control_card!(analysis_bottom, 1, 2, "Histogram"; rows = 3, cols = 7)
+    hist_mode_menu = Menu(hist_card[2, 1]; options = ["bars", "kde"], prompt = String(hist_mode_obs[]))
+    manta_style_menu!(hist_mode_menu, ui_theme; compact = compact_layout)
+    hist_bins_box = Textbox(hist_card[2, 2]; placeholder = "bins", height = 30)
+    manta_style_textbox!(hist_bins_box, ui_theme; compact = compact_layout)
+    hist_xmin_box = Textbox(hist_card[2, 3]; placeholder = "x min", height = 30)
+    manta_style_textbox!(hist_xmin_box, ui_theme; compact = compact_layout)
+    hist_xmax_box = Textbox(hist_card[2, 4]; placeholder = "x max", height = 30)
+    manta_style_textbox!(hist_xmax_box, ui_theme; compact = compact_layout)
+    hist_apply_btn = Button(hist_card[2, 5]; label = "Apply x", height = 30)
+    manta_style_button!(hist_apply_btn, ui_theme; compact = compact_layout)
+    hist_auto_btn  = Button(hist_card[2, 6:7]; label = "Auto x", height = 30)
+    manta_style_button!(hist_auto_btn, ui_theme; compact = compact_layout)
+    hist_ymin_box = Textbox(hist_card[3, 1:2]; placeholder = "y min", height = 30)
+    manta_style_textbox!(hist_ymin_box, ui_theme; compact = compact_layout)
+    hist_ymax_box = Textbox(hist_card[3, 3:4]; placeholder = "y max", height = 30)
+    manta_style_textbox!(hist_ymax_box, ui_theme; compact = compact_layout)
+    hist_y_apply_btn = Button(hist_card[3, 5]; label = "Apply y", height = 30)
+    manta_style_button!(hist_y_apply_btn, ui_theme; compact = compact_layout)
+    hist_y_auto_btn  = Button(hist_card[3, 6:7]; label = "Auto y", height = 30)
+    manta_style_button!(hist_y_auto_btn, ui_theme; compact = compact_layout)
+
+    colsize!(analysis_bottom, 1, Relative(0.38))
+    colsize!(analysis_bottom, 2, Relative(0.62))
+
+    # ---- EXPORT cards ----
+    output_card = control_card!(ctrl_grid, 2, 1, "Output"; rows = 3, cols = 3)
+    save_btn = Button(output_card[2, 1:2]; label = "Save PNG", height = 32)
+    manta_style_button!(save_btn, ui_theme; compact = compact_layout)
+
+    # Grid sizing
+    foreach(c -> colsize!(ctrl_grid, c, Relative(1 / 3)), 1:3)
+    rowsize!(ctrl_grid, 1, Fixed(ctrl_row_h[1]))
+    rowsize!(ctrl_grid, 2, Fixed(ctrl_row_h[2]))
+    rowsize!(ctrl_grid, 3, Fixed(ctrl_row_h[3]))
+    colgap!(ctrl_grid, ctrl_gap)
+    rowgap!(ctrl_grid, ctrl_gap)
+
+    # main_grid row sizing
     rowsize!(main_grid, 1, Relative(1))
-    rowsize!(main_grid, 2, Fixed(165))
-    rowsize!(main_grid, 3, Fixed(100))
-    rowsize!(main_grid, 4, Fixed(270))
+    rowsize!(main_grid, 2, Fixed(spec_h_px))
+    rowsize!(main_grid, 3, Fixed(hist_h_px))
+    rowsize!(main_grid, 4, Fixed(ctrl_total_h))
+
+    # ---- Mode switching ----
+    nav_cards_hpc      = (channel_card, display_card, nav_view_card)
+    analysis_cards_hpc = (contrast_card, selection_card, contour_card, analysis_bottom)
+    export_cards_hpc   = (output_card,)
+
+    function set_mode_button_active!(btn, active::Bool)
+        btn.buttoncolor[]       = active ? ui_theme.accent        : ui_theme.surface
+        btn.buttoncolor_hover[] = active ? ui_theme.accent_strong : ui_theme.surface_hover
+        btn.labelcolor[]        = active ? :white                 : ui_theme.text
+        btn.labelcolor_hover[]  = active ? :white                 : ui_theme.accent_strong
+        nothing
+    end
+    function refresh_control_mode!()
+        mode = control_mode[]
+        is_nav = (mode === :navigation)
+        is_ana = (mode === :analysis)
+        is_exp = (mode === :export)
+        for c in nav_cards_hpc;      set_layout_contents_visible!(c, is_nav); end
+        for c in analysis_cards_hpc; set_layout_contents_visible!(c, is_ana); end
+        for c in export_cards_hpc;   set_layout_contents_visible!(c, is_exp); end
+        set_mode_button_active!(mode_nav_btn,      is_nav)
+        set_mode_button_active!(mode_analysis_btn, is_ana)
+        set_mode_button_active!(mode_export_btn,   is_exp)
+        nothing
+    end
+    refresh_control_mode!()
+    on_mode(btn, sym) = on(btn.clicks) do _
+        control_mode[] = sym
+        refresh_control_mode!()
+    end
+    on_mode(mode_nav_btn,      :navigation)
+    on_mode(mode_analysis_btn, :analysis)
+    on_mode(mode_export_btn,   :export)
 
     if use_manual[]
         a, b = clims_manual[]
@@ -1259,10 +1439,78 @@ function _view_healpix_cube(
     catch
         # rowgap! échoue si l'index est hors limites — silencieux.
     end
-    try
-        colgap!(ctrl, 10)
-    catch
+
+    # ---------- Keyboard shortcuts (HEALPix PPV cube) ----------
+    _set_status_hpc!(msg::AbstractString) =
+        (sel_label[] = latexstring("\\text{", latex_safe(msg), "}"); nothing)
+    _trigger_btn_hpc!(btn) = (btn.clicks[] = btn.clicks[] + 1)
+    function _set_channel_hpc!(n::Integer)
+        n_clamped = clamp(Int(n), 1, nv)
+        n_clamped == chan_idx[] && return
+        chan_slider.value[] = n_clamped
+        _set_status_hpc!("Channel $(n_clamped) / $(nv).")
     end
+    function _toggle_contours_hpc!()
+        new_val = !show_contours[]
+        contour_chk.checked[] = new_val
+        _set_status_hpc!(new_val ? "Contours enabled." : "Contours hidden.")
+    end
+    function _cycle_log_scale_hpc!()
+        next = scale_mode[] === :lin   ? :log10 :
+               scale_mode[] === :log10 ? :ln    : :lin
+        scale_menu.selection[] = String(next)
+        _set_status_hpc!("Image scale: $(String(next)).")
+    end
+    shortcuts_hpc = ShortcutBinding[
+        ShortcutBinding(Keyboard.i,         () -> (invert_cmap[] = !invert_cmap[]);
+                        description = "invert cmap"),
+        ShortcutBinding(Keyboard.page_up,   () -> _set_channel_hpc!(chan_idx[] - 1);
+                        description = "prev channel"),
+        ShortcutBinding(Keyboard.page_down, () -> _set_channel_hpc!(chan_idx[] + 1);
+                        description = "next channel"),
+        ShortcutBinding(Keyboard.home,      () -> _set_channel_hpc!(1);
+                        description = "first channel"),
+        ShortcutBinding(Keyboard.a,         () -> _trigger_btn_hpc!(auto_btn);
+                        description = "auto contrast"),
+        ShortcutBinding(Keyboard._1,        () -> apply_percentile_clims!(1, 99);
+                        description = "p1-p99"),
+        ShortcutBinding(Keyboard._5,        () -> apply_percentile_clims!(5, 95);
+                        description = "p5-p95"),
+        ShortcutBinding(Keyboard.r,         () -> _trigger_btn_hpc!(reset_btn);
+                        description = "reset zoom"),
+        ShortcutBinding(Keyboard.s,         () -> _trigger_btn_hpc!(save_btn);
+                        description = "save image"),
+        ShortcutBinding(Keyboard.c,         () -> _toggle_contours_hpc!();
+                        description = "contours"),
+        ShortcutBinding(Keyboard.l,         () -> _cycle_log_scale_hpc!();
+                        description = "cycle scale"),
+    ]
+    # Help: Shift+/ and the Help button open a dedicated Makie figure
+    # listing every documented binding; status bar keeps the one-liner.
+    function _open_help_hpc!()
+        try
+            open_shortcut_help_window(shortcuts_hpc;
+                title = "MANTA — HEALPix cube shortcuts", theme = ui_theme)
+        catch e
+            @warn "Could not open shortcut help window" exception = (e, catch_backtrace())
+        end
+        _set_status_hpc!(shortcut_help_message(shortcuts_hpc))
+    end
+    push!(shortcuts_hpc,
+          ShortcutBinding(Keyboard.slash,
+                          _open_help_hpc!;
+                          description = "this help",
+                          modifier = :shift))
+    on(help_btn.clicks) do _
+        _open_help_hpc!()
+    end
+    register_shortcuts!(fig, shortcuts_hpc;
+        textboxes = (clim_min_box, clim_max_box, contour_levels_box,
+                     hist_bins_box, hist_xmin_box, hist_xmax_box,
+                     hist_ymin_box, hist_ymax_box,
+                     spec_ymin_box, spec_ymax_box),
+        is_blocked = () -> zoom_drag_active[] || region_drag_active[],
+    )
 
     keepalive!(fig)
     on(fig.scene.events.window_open) do is_open

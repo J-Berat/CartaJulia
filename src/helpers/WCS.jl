@@ -432,9 +432,13 @@ function format_world_coord(wcs, dim::Integer, pix::Real)
         return "pix$(dim)=" * string(round(Float64(pix); digits = 2))
     end
     ax = wcs[dim]
-    ctype = isempty(ax.ctype) ? "axis$(dim)" : ax.ctype
+    # CTYPE/CUNIT peuvent être des chaînes ne contenant que des espaces
+    # (FITS mal renseigné) ; on les normalise pour éviter les "  =0.0" disgracieux.
+    ctype_clean = strip(String(ax.ctype))
+    ctype = isempty(ctype_clean) ? "axis$(dim)" : ctype_clean
     val = world_coord(wcs, dim, pix)
-    unit = isempty(ax.cunit) ? "" : " $(ax.cunit)"
+    unit_clean = strip(String(ax.cunit))
+    unit = isempty(unit_clean) ? "" : " $(unit_clean)"
     return "$(ctype)=" * string(round(val; digits = 5)) * unit
 end
 

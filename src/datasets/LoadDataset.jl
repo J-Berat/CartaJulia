@@ -22,11 +22,24 @@ Dispatch table:
 | `NamedTuple` / `AbstractDict`               | `MultiChannelDataset`                   |
 | `Healpix.HealpixMap`                        | `HealpixMapDataset`                     |
 
-Unsupported inputs raise an `ArgumentError` with a clear message.
+Unsupported inputs raise either `ArgumentError` or a structured `MANTAError`
+with a clear message and hint.
 """
 load_dataset(ds::AbstractMANTADataset; kwargs...) = ds
 
 function load_dataset(path::AbstractString; kwargs...)
+    # 1) Give registered loader plugins a chance first. Plugins are
+    #    matched in registration order; the first matcher to return true
+    #    owns the load. Unknown kwargs are forwarded as-is.
+    plug = try
+        plugin_load(String(path); kwargs...)
+    catch e
+        e isa MANTAError && rethrow()
+        @warn "MANTA loader plugin raised an error, falling back to built-ins" exception=(e, catch_backtrace())
+        nothing
+    end
+    plug === nothing || return plug
+
     spec = parse_path_spec(path)
     kind = first(spec)
     if kind === :fits
@@ -39,10 +52,14 @@ function load_dataset(path::AbstractString; kwargs...)
             return load_hdf5(spec[2]; kwargs...)
         end
     else
-        throw(ArgumentError(
-            "MANTA: cannot recognise file kind from path $(path). " *
-            "Supported extensions: .fits, .fit, .fits.gz, .h5, .hdf5, .he5, " *
-            "or the syntax \"file.h5:/group/dataset\"."))
+        ext = lowercase(last(splitext(path)))
+        throw(UnsupportedFormatError(
+            String(path),
+            isempty(ext) ? "(aucune extension)" : ext,
+            "Extensions supportées : .fits, .fit, .fits.gz, .h5, .hdf5, .he5, " *
+            "ou la syntaxe \"file.h5:/group/dataset\".\n" *
+            "     Tu peux aussi enregistrer un loader via " *
+            "`MANTA.register_plugin!(:loader, (matcher, loader))`."))
     end
 end
 

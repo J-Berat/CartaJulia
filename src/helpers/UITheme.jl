@@ -81,7 +81,7 @@ end
 
 function manta_style_menu!(menu, theme::MANTAUITheme = default_ui_theme(); compact::Bool = false)
     menu.height[] = compact ? 30 : 34
-    menu.width[] = max(menu.width[], 96)
+    menu.width[] = max(something(menu.width[], 0), 96)
     menu.textcolor[] = theme.text
     menu.fontsize[] = compact ? 13 : 14
     menu.dropdown_arrow_color[] = theme.accent
