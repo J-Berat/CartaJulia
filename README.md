@@ -1,22 +1,22 @@
 # MANTA
 
 MANTA is an interactive astronomical data viewer written in Julia.
-It is built with Makie/GLMakie and is meant for quick exploration of maps,
-cubes, and HEALPix data.
+It is built on top of Makie/GLMakie and is designed for quick visual exploration
+of maps, cubes, spectra, and HEALPix data — with no boilerplate required.
 
-The basic idea is simple: give a file or an array to `MANTA.manta(...)`, then
-inspect it visually with controls for slices, spectra, contrast, contours, and
-exports.
+The single entry point is `MANTA.manta(...)`. Pass it a file path or a Julia
+array; MANTA dispatches automatically to the right viewer.
 
 ## What MANTA Can Open
 
 - 2D FITS images;
-- 3D FITS cubes, with slice navigation and a spectrum at the selected voxel;
+- 3D FITS cubes, with slice navigation and a per-voxel or per-region spectrum;
 - HEALPix FITS maps, displayed in Mollweide projection;
-- HEALPix-PPV cubes, with one map per channel and an associated spectrum;
-- HDF5 datasets, using `file.h5:/group/dataset` when an internal path is needed;
-- in-memory Julia arrays: 2D images, 3D cubes, RGB/RGBA data;
-- `NamedTuple` or `Dict` collections of arrays for multi-panel displays.
+- HEALPix-PPV cubes (npix × nchannels), with one map per channel and a spectrum panel;
+- HDF5 datasets, using the `"file.h5:/group/dataset"` syntax when an internal path is needed;
+- in-memory Julia arrays: 1D vectors, 2D images, 3D cubes, RGB/RGBA data;
+- `NamedTuple` or `Dict` collections of arrays for side-by-side multi-panel displays;
+- `Healpix.HealpixMap` objects directly.
 
 ## Installation
 
@@ -32,269 +32,455 @@ cd MANTA.jl
 julia --project=. scripts/setup.jl
 ```
 
-The setup script installs the Julia dependencies and precompiles the project
-environment.
+The setup script installs the Julia dependencies listed in `Project.toml` and
+precompiles the project environment (including the precompile workload, which
+dramatically reduces time-to-first-plot on subsequent launches).
 
 ## Quick Start
 
-Run the demo:
+Run the built-in demo (generates a synthetic FITS cube and opens the viewer):
 
 ```bash
 ./manta
 ```
 
-The demo creates a synthetic FITS cube in `demo/output/`, then opens the
-interactive viewer.
-
-Open a FITS file:
+Open a specific FITS file:
 
 ```bash
 ./manta path/to/cube.fits
 ```
 
-Run the demo with custom dimensions:
+Control demo dimensions and contrast limits at startup:
 
 ```bash
-NX=96 NY=72 NZ=48 ./manta
-```
-
-Set the demo contrast limits at startup:
-
-```bash
-VMIN=0 VMAX=100 ./manta
+NX=96 NY=72 NZ=48 VMIN=0 VMAX=1500 ./manta
 ```
 
 ## Julia Usage
 
-From the repository root:
+Always launch Julia from the repository root with `--project=.` so the local
+environment is active:
 
 ```bash
 julia --project=.
 ```
 
-Then:
+Minimal example:
 
 ```julia
 using MANTA
 
-fig = MANTA.manta("path/to/cube.fits"; cmap=:magma)
+fig = MANTA.manta("path/to/cube.fits")
 display(fig)
 ```
 
-With a few options:
+With options:
 
 ```julia
 fig = MANTA.manta(
     "path/to/cube.fits";
-    cmap=:viridis,
-    vmin=0,
-    vmax=100,
-    invert=false,
-    figsize=(1400, 900),
-    save_dir="outputs",
-    settings_path="viewer_settings.toml",
+    cmap     = :magma,
+    vmin     = 0.0,
+    vmax     = 500.0,
+    scale    = :log10,
+    figsize  = (1600, 950),
+    save_dir = "outputs",
+    settings_path = "viewer_settings.toml",
 )
 display(fig)
 ```
 
-## Useful Options
+## Viewer Options Reference
 
-Common options:
+The table below covers all keyword arguments accepted by `manta`. Most apply to
+every viewer; a few are specific to cubes or HEALPix data.
 
-- `cmap`: Makie colormap, for example `:viridis`, `:magma`, `:inferno`,
-  `:plasma`, `:cividis`, or `:gray`;
-- `vmin`, `vmax`: manual contrast limits;
-- `invert`: reverse the colormap;
-- `figsize`: window size, for example `(1400, 900)`;
-- `save_dir`: export directory;
-- `settings_path`: TOML file used to save and reload viewer state;
-- `scale`: `:lin`, `:log10`, or `:ln` for views that support scaling;
-- `hist_mode`: histogram mode, either `:bars` or `:kde`;
-- `hist_bins`: number of histogram bins;
-- `hist_xlimits`: manual x-axis limits for the histogram;
-- `activate_gl=false`: useful for tests without an OpenGL context;
-- `display_fig=false`: create the figure without displaying it automatically.
+### Appearance
 
-More specialized options:
+| kwarg | type | default | meaning |
+|---|---|---|---|
+| `cmap` | `Symbol` | `:viridis` | Makie colormap (`:magma`, `:inferno`, `:plasma`, `:cividis`, `:gray`, …) |
+| `invert` | `Bool` | `false` | Reverse the colormap |
+| `figsize` | `Tuple{Int,Int}` | auto | Window size in pixels, e.g. `(1400, 900)` |
+| `scale` | `Symbol` | `:lin` | Image scale: `:lin`, `:log10`, or `:ln` |
 
-- `rgb=true`: interpret a 3- or 4-channel stack as RGB/RGBA;
-- `column`: column to read from a HEALPix FITS table;
-- `nx`, `ny`: Mollweide projection resolution;
-- `v0`, `dv`, `vunit`: spectral axis definition for HEALPix-PPV cubes.
+### Contrast
 
-## Viewer Possibilities
+| kwarg | type | default | meaning |
+|---|---|---|---|
+| `vmin`, `vmax` | `Real` | `nothing` | Manual contrast limits; auto if omitted |
+| `hist_mode` | `Symbol` | `:bars` | Histogram display mode: `:bars` or `:kde` |
+| `hist_bins` | `Int` | `64` | Number of histogram bins |
+| `hist_xlimits` | `Tuple{Real,Real}` | `nothing` | Manual x-axis limits for the histogram |
+| `hist_ylimits` | `Tuple{Real,Real}` | `nothing` | Manual y-axis limits for the histogram |
+| `spec_ylimits` | `Tuple{Real,Real}` | `nothing` | Manual y-axis limits for the spectrum panel (cubes and HEALPix-PPV) |
 
-For a 3D cube, MANTA can:
+### Moment maps (cubes and HEALPix-PPV)
 
-- choose the slice axis and current slice index;
-- click a voxel and display its spectrum;
-- average spectra inside a box or circular selection;
-- switch image and spectrum scales between linear, log10, and ln;
-- adjust contrast manually, automatically, or with percentile presets;
-- change or invert the colormap;
-- smooth the displayed image;
+| kwarg | type | default | meaning |
+|---|---|---|---|
+| `moment_threshold` | `Real` | `0.0` | Minimum value included in moment calculations |
+| `moment_nsigma` | `Real` | `nothing` | If set, threshold is computed as `nsigma × σ` of the data |
+| `moment_channels` | `AbstractVector{Int}` | `nothing` | Restrict moment calculations to these channel indices |
+
+### FITS-specific
+
+| kwarg | type | default | meaning |
+|---|---|---|---|
+| `hdu` | `Integer` | `1` | HDU index to read (1 = primary; 0 = auto-pick first non-empty HDU) |
+| `lazy` | `Bool` | `false` | Memory-map the cube: read slices on demand instead of loading the full file up-front. Ignored for non-FITS inputs. See [Lazy FITS Loading](#lazy-fits-loading). |
+
+### Cube-specific
+
+| kwarg | type | default | meaning |
+|---|---|---|---|
+| `settings_path` | `String` | `nothing` | Path to a TOML file used to save and reload viewer state |
+| `compare` | `String` | `nothing` | Path to a second FITS cube for side-by-side comparison |
+| `state` | any | `nothing` | Pre-load a viewer state snapshot (a `Dict` or `NamedTuple` as produced by "Copy code" or `save_viewer_settings`) |
+| `rgb` | `Bool` | `false` | Interpret a 3- or 4-channel stack as RGB/RGBA instead of a cube |
+
+### HEALPix-specific
+
+| kwarg | type | default | meaning |
+|---|---|---|---|
+| `column` | `Int` | `1` | Column index in the BinTable HDU |
+| `nx`, `ny` | `Int` | `1400`, `700` | Mollweide grid resolution |
+| `v0`, `dv`, `vunit` | `Real`, `Real`, `String` | `0.0`, `1.0`, `"km/s"` | Spectral axis definition for HEALPix-PPV cubes |
+
+### Headless / testing
+
+| kwarg | type | default | meaning |
+|---|---|---|---|
+| `activate_gl` | `Bool` | `true` | Set to `false` to skip GLMakie activation (useful in tests and Docker) |
+| `display_fig` | `Bool` | `true` | Set to `false` to build the figure without displaying it |
+
+### Output
+
+| kwarg | type | default | meaning |
+|---|---|---|---|
+| `save_dir` | `String` | `nothing` | Export directory; defaults to `~/Desktop` if it exists, otherwise the current directory |
+
+## Viewer Capabilities
+
+### 3D Cube Viewer
+
+Once a cube is open, the viewer lets you:
+
+- navigate slices along any of the three axes with a slider or keyboard arrows;
+- click a pixel to display its spectrum; draw a box or circular region to
+  average spectra inside it;
+- switch image and spectrum scales between `:lin`, `:log10`, and `:ln`;
+- adjust contrast manually, automatically, or with one-click p1-p99 / p5-p95 presets;
+- change or invert the colormap; smooth the displayed image;
 - add automatic or manual contours;
-- compare with a second cube of the same size;
-- compute moment 0, 1, and 2 maps;
-- apply a persistent voxel mask (threshold / rectangle / finite) that
-  propagates to moments, histograms, spectra, and FITS exports;
-- export images, spectra, FITS products, and GIFs;
-- save and reload viewer settings.
+- compare with a second cube of the same dimensions (`compare` kwarg or the UI button);
+- compute moment 0, 1, and 2 maps with configurable threshold and channel range;
+- apply a persistent voxel mask (see [Masks](#masks));
+- analyze the 2D power spectrum of any slice (see [Power Spectrum](#power-spectrum));
+- undo and redo viewer-state changes (Ctrl-Z / Ctrl-Shift-Z; see [Undo / Redo](#undo--redo));
+- export images (PNG/PDF), spectra (CSV), FITS products (slices, moments, region
+  means, full cubes, mask), and animated GIFs;
+- save and reload viewer settings to a TOML file; copy a Julia snippet that
+  reproduces the current view exactly.
+
+### HEALPix Viewer
 
 For HEALPix data, MANTA provides:
 
-- Mollweide projection;
-- right-click drag zoom;
-- optional coordinate graticule;
+- Mollweide projection with right-click drag zoom;
+- an optional coordinate graticule;
 - pixel or region selection;
-- spectral channels for PPV cubes;
-- contours, contrast control, colormap control, smoothing, and PNG/FITS exports
-  depending on the view.
+- spectral channel navigation for PPV cubes;
+- contours, contrast control, colormap control, smoothing;
+- PNG and FITS exports.
 
-## HDF5
+### 2D Image Viewer
 
-MANTA can read an HDF5 dataset directly:
+Single images get a lightweight viewer with a histogram, contrast controls,
+colormap menu, scale toggle (:lin / :log10 / :ln), and PNG export.
 
-```julia
-fig = MANTA.manta("data/map.h5:/group/dataset")
-display(fig)
-```
+### 1D Vector Viewer
 
-If the path points to a group, MANTA tries to find a single child dataset, or
-uses the `default_dataset` attribute when present.
-
-Some HDF5 attributes are recognized when available:
-
-- `units` or `bunit` for the unit label;
-- `AXIS1NAME`, `AXIS2NAME`, etc. for axis names;
-- `CTYPE`, `CRVAL`, `CRPIX`, `CDELT`, `CUNIT` for simple linear WCS metadata;
-- `PIXTYPE = HEALPIX`, `ORDERING`, `NSIDE`, `COORDSYS` for HEALPix data;
-- `v0`, `dv`, `vunit` for HEALPix-PPV cubes.
-
-## In-Memory Data
-
-MANTA can also display Julia data directly:
+Vectors have a dedicated viewer with a `lines` plot, live statistics over an
+optional selection range (n, finite, NaN, min, max, mean, std, median),
+`:lin / :log10 / :ln` scale toggles for both axes, and PNG / PDF / CSV exports:
 
 ```julia
 using MANTA
 
-image = rand(128, 128)
-MANTA.manta(image; title="image")
+# A plain numeric vector.
+MANTA.manta(sin.(range(0.0, 4π; length=512)); title="sin(t)")
 
-cube = rand(64, 64, 32)
-MANTA.manta(cube; cmap=:magma)
-```
-
-1D vectors have a dedicated viewer with a `lines` plot, live statistics over an
-optional selection range (n, finite, NaN, min, max, mean, std, median), `:lin /
-:log10 / :ln` scale toggles for both axes, and PNG / PDF / CSV exports:
-
-```julia
-using MANTA
-
-# A plain numeric vector goes through the AbstractVector bridge.
-MANTA.manta(sin.(range(0.0, 4π; length = 512));
-            title  = "sin(t)",
-            yscale = :lin)
-
-# A 1D FITS file (single image-HDU vector) opens the same viewer; if the
-# header carries CTYPE1/CRVAL1/CDELT1/CUNIT1, the X axis is automatically
-# WCS-mapped (e.g. frequency in Hz, velocity in km/s).
+# A 1D FITS file whose header carries CTYPE1/CRVAL1/CDELT1/CUNIT1 maps the
+# X axis automatically (e.g. frequency in Hz, velocity in km/s).
 MANTA.manta("path/to/spectrum.fits")
 
-# A VectorDataset can be built explicitly for custom labels / WCS.
+# Build a VectorDataset explicitly for custom labels or WCS.
 ds = MANTA.VectorDataset(rand(Float32, 256);
         axis_label = "channel",
         unit_label = "K",
         source_id  = "my_spectrum")
-MANTA.manta(ds; xlimits = (10, 200))
+MANTA.manta(ds; xlimits=(10, 200))
 ```
 
 Keyword arguments for the 1D viewer: `title`, `xscale`, `yscale`, `xlimits`,
 `ylimits`, `figsize`, `save_dir`, plus the usual `activate_gl` / `display_fig`
-toggles for headless usage. The exported CSV contains the values currently
-within the X-axis selection (or the full vector if no selection is set) and a
-self-describing comment header.
+toggles for headless usage.
 
-Multiple panels:
+## In-Memory Data
+
+MANTA can display Julia arrays directly without any file on disk:
 
 ```julia
+using MANTA
+
+# 2D image
+MANTA.manta(rand(128, 128); cmap=:magma)
+
+# 3D cube — gets the full interactive slice + spectrum + moments viewer
+MANTA.manta(rand(64, 64, 32); cmap=:viridis, vmin=0.0, vmax=1.0)
+
+# RGB image from three velocity components
+rgb = MANTA.rgb_image(U, V, W; normalize=:symmetric)
+MANTA.manta(rgb; title="RGB")
+
+# Multi-panel (NamedTuple or positional)
 MANTA.manta_panels(
     rand(128, 128),
     rand(128, 128);
-    titles=("map A", "map B"),
-    cmaps=(:viridis, :magma),
+    titles = ("map A", "map B"),
+    cmaps  = (:viridis, :magma),
 )
 ```
 
-RGB image:
+## Batch Export
+
+`manta_batch` renders a list of FITS files headlessly and writes one image per
+file. No GL context or window is required.
 
 ```julia
-rgb = MANTA.rgb_image(U, V, W; normalize=:symmetric)
-MANTA.manta(rgb; title="RGB")
+using MANTA
+
+out_paths = MANTA.manta_batch(
+    ["obs1.fits", "obs2.fits", "obs3.fits"];
+    format   = :png,          # :png (default) or :pdf
+    save_dir = "exports",     # defaults to each file's own directory
+    prefix   = "survey_",     # optional filename prefix
+    cmap     = :magma,
+    vmin     = 0,
+    vmax     = 500,
+    figsize  = (1200, 800),
+)
+# => ["exports/survey_obs1.png", "exports/survey_obs2.png", ...]
 ```
+
+All `kwargs` are forwarded verbatim to `manta` with `activate_gl=false,
+display_fig=false`, so no interactive state is created. Files that fail to
+render are skipped with a `@warn` and do not abort the batch; the return value
+contains only the paths that were actually written.
+
+## Lazy FITS Loading
+
+By default, MANTA reads the full FITS cube into memory at startup. For large
+files this can be slow or exceed available RAM. Passing `lazy=true` enables
+on-demand slice reading:
+
+```julia
+fig = MANTA.manta("path/to/large_cube.fits"; lazy=true)
+```
+
+With lazy loading, MANTA opens the file and reads only the currently displayed
+slice. An async prefetch mechanism starts loading the next slice in the
+background as soon as the current one is rendered, so interactive navigation
+stays smooth. Memory usage stays proportional to a single slice rather than
+the full cube.
+
+> **Note:** lazy loading is a read-only view; exports that require the full
+> cube (e.g. "Save cube FITS") will materialise all slices at export time.
 
 ## Masks
 
-The 3D cube viewer carries an optional persistent voxel mask. A mask is
-declarative: only the source (its kind and parameters) is stored, so it can be
-regenerated from the cube data whenever a viewer is reopened or a settings
-file is reloaded.
+The 3D cube viewer carries an optional persistent voxel mask. Only the source
+description is stored (not the full `BitArray`), so the mask can always be
+regenerated from the data when a settings file is reloaded.
 
-Supported sources:
+### Mask sources
 
-- `NoMaskSource()` — disabled (every voxel is kept).
-- `FiniteSource()` — keep only voxels where `isfinite(data)`.
-- `ThresholdSource(op, lo, hi)` — keep voxels whose value satisfies the
-  predicate selected by `op`:
-  - `:ge` keeps `data >= lo`,
-  - `:le` keeps `data <= hi`,
-  - `:range` keeps `lo <= data <= hi`,
-  - `:outside` keeps `data < lo || data > hi`.
-  Non-finite voxels are always rejected so NaNs never leak into accumulators.
-- `RectangleSource(; i1, i2, j1, j2, k1, k2)` — keep voxels whose 1-based
-  `(i, j, k)` index falls in the closed box. Any bound can be `nothing`
-  meaning "no constraint on that side"; bounds are reordered automatically.
+| Source | Keeps |
+|---|---|
+| `NoMaskSource()` | Everything (mask disabled) |
+| `FiniteSource()` | Voxels where `isfinite(data)` |
+| `ThresholdSource(:ge, lo, _)` | `data >= lo` |
+| `ThresholdSource(:le, _, hi)` | `data <= hi` |
+| `ThresholdSource(:range, lo, hi)` | `lo <= data <= hi` |
+| `ThresholdSource(:outside, lo, hi)` | `data < lo \|\| data > hi` |
+| `RectangleSource(; i1, i2, j1, j2, k1, k2)` | Voxels in the closed index box; any bound can be `nothing` |
 
-The Mask UI card in the cube viewer (next to the histogram and FITS export
-controls) exposes the same options as a source selector with the relevant
-parameter fields (`lo`/`hi` for thresholds, `i/j/k` range textboxes for
-rectangles), plus Apply / Reset buttons and a live count of kept voxels.
+Non-finite voxels are always excluded by threshold sources, so NaNs never
+leak into moment accumulators.
 
-A mask propagates uniformly to:
+### Mask combinators
 
-- moment 0 / 1 / 2 maps (`moment_map` accepts an optional `mask` kwarg and
-  combines it with the existing `moment_threshold` semantics);
+Sources can be composed arbitrarily:
+
+```julia
+src = AndSource(ThresholdSource(:ge, 0.5, 0.0), NotSource(RectangleSource(i2=32)))
+```
+
+`AndSource`, `OrSource`, and `NotSource` are all exported and round-trip
+through `viewer_settings.toml` via `mask_source_to_toml` / `mask_source_from_toml`.
+
+### Effect of the mask
+
+An active mask propagates to:
+
+- moment 0 / 1 / 2 maps (`moment_map` accepts an optional `mask` kwarg);
 - the histogram of the displayed slice;
-- per-voxel and per-region spectra (`mean_region_spectrum` likewise accepts a
-  `mask` kwarg);
-- FITS exports — selecting the `"mask"` product writes the materialised
-  `BitArray` as an `Int8` HDU, while moments / region exports respect the
-  active mask.
+- per-voxel and per-region spectra (`mean_region_spectrum` likewise accepts `mask`);
+- FITS exports — the `"mask"` export product writes the materialised `BitArray`
+  as an `Int8` HDU.
 
-Programmatically:
+### Programmatic usage
 
 ```julia
 using MANTA
 
 cube = rand(Float32, 64, 64, 32)
 
-# Build a mask from a declarative source.
-src  = ThresholdSource(:ge, 0.5, 0.0)        # keep voxels >= 0.5
+src  = ThresholdSource(:ge, 0.5, 0.0)      # keep voxels >= 0.5
 mask = make_mask(src, cube)
-@info "kept" mask_count(mask) "of" mask_total(mask) "voxels"
+@info "kept $(mask_count(mask)) of $(mask_total(mask)) voxels"
 
-# moment_map accepts the materialised BitArray directly:
-m0 = moment_map(cube, 3, 1:32, 0; mask = mask.bits)
+# Pass the materialised BitArray to moment_map:
+m0 = moment_map(cube, 3, 1:32, 0; mask=mask.bits)
 
-# Or restore a source from a TOML dict (typically `viewer_settings.toml`):
-d  = mask_source_to_toml(src)
-src2 = mask_source_from_toml(d)              # always returns a MaskSource
+# Serialize / deserialize a source (e.g. for settings files):
+d    = mask_source_to_toml(src)
+src2 = mask_source_from_toml(d)
 ```
 
-The mask source is persisted under the `"mask"` key of `viewer_settings.toml`;
-malformed or unknown entries gracefully degrade to `NoMaskSource()` so a
+The mask source is persisted under the `"mask"` key of `viewer_settings.toml`.
+Malformed or unknown entries silently degrade to `NoMaskSource()` so a
 corrupted settings file never blocks a viewer launch.
+
+## Power Spectrum
+
+The 3D cube viewer has a built-in 2D power-spectrum panel. It computes:
+
+- the 2D power spectrum of the currently displayed slice, shown as a log₁₀
+  heatmap on a (kx, ky) grid;
+- the 1D radially-averaged profile on a log-log plot.
+
+Controls let you choose the apodization window (`:none`, `:hann`, `:tukey`, …),
+toggle zero-padding to the next power of two, apply NaN apodization, and switch
+the k-axis between cycles/pixel and physical units (when WCS is available). The
+panel can be detached into a separate pop-out window.
+
+No additional setup is required; the power-spectrum tab is always present in the
+cube viewer UI.
+
+## Undo / Redo
+
+The 3D cube viewer records a snapshot history of the viewer state (contrast
+limits, scale mode, axis, slice index, colormap, contour visibility, …). You
+can step through this history with:
+
+- **Ctrl-Z** — undo the last state change;
+- **Ctrl-Shift-Z** — redo.
+
+The history is bounded to 64 snapshots, so memory usage is predictable even
+after thousands of UI interactions. Consecutive identical snapshots are
+deduplicated, so dragging a slider quickly still produces a sensible history.
+
+## Keyboard Shortcuts
+
+All viewers expose a **Help** button (or **Shift+/**) that opens a floating
+window listing every available shortcut for the current view.
+
+Common shortcuts in the **3D cube viewer**:
+
+| Key | Action |
+|---|---|
+| ←  / → | Previous / next slice |
+| ↑  / ↓ | Previous / next slice (alternate) |
+| `a` | Auto contrast |
+| `1` | p1–p99 contrast preset |
+| `5` | p5–p95 contrast preset |
+| `i` | Invert colormap |
+| `l` | Cycle scale (lin → log10 → ln) |
+| `c` | Toggle contours |
+| `r` | Reset zoom |
+| `s` | Save image |
+| `Ctrl-Z` | Undo |
+| `Ctrl-Shift-Z` | Redo |
+| `Shift-/` | Open shortcut help window |
+
+Common shortcuts in the **2D image viewer**:
+
+| Key | Action |
+|---|---|
+| `a` | Auto contrast |
+| `1` | p1–p99 contrast preset |
+| `5` | p5–p95 contrast preset |
+| `i` | Invert colormap |
+| `l` | Cycle scale |
+| `r` | Reset zoom |
+| `s` | Save image (PNG) |
+| `Shift-/` | Open shortcut help window |
+
+## Plugin System
+
+MANTA exposes a lightweight extension API for adding new file-format loaders,
+custom view modes, or post-processing overlays — without modifying MANTA itself.
+
+Three extension points are available:
+
+- **`:loader`** — register a `(matcher, loader)` pair. `matcher(path)::Bool`
+  returns `true` when your loader can handle the file; `loader(path; kwargs...)`
+  must return an `AbstractMANTADataset`.
+- **`:dataset_view`** — register a `(DatasetType, name, fn)` triple to add a
+  named view mode for an existing dataset type.
+- **`:postprocess`** — register a `(fig, ds, opts) -> nothing` callback invoked
+  after a view is fully built (useful for overlays or custom shortcuts).
+
+```julia
+using MANTA
+
+# Add a loader for .myformat files.
+my_loader = MANTA.register_plugin!(:loader, (
+    path -> endswith(path, ".myformat"),
+    (path; kwargs...) -> MyPackage.load_as_manta(path),
+))
+
+# Remove it later (by identity).
+MANTA.unregister_plugin!(:loader, my_loader)
+
+# List currently registered loaders.
+MANTA.list_plugins(:loader)
+```
+
+Plugins are dispatched in registration order; the first matching loader wins.
+`MANTA.clear_plugins!()` removes everything (used in tests).
+
+## HDF5
+
+MANTA reads an HDF5 dataset with the `"path.h5:/group/dataset"` syntax:
+
+```julia
+fig = MANTA.manta("data/map.h5:/group/dataset")
+display(fig)
+```
+
+If the path points to an HDF5 group, MANTA tries to find a single child
+dataset or uses the `default_dataset` attribute when present.
+
+HDF5 attributes recognized when available:
+
+- `units` or `bunit` for the unit label;
+- `AXIS1NAME`, `AXIS2NAME`, … for axis names;
+- `CTYPE`, `CRVAL`, `CRPIX`, `CDELT`, `CUNIT` for linear WCS metadata;
+- `PIXTYPE = HEALPIX`, `ORDERING`, `NSIDE`, `COORDSYS` for HEALPix data;
+- `v0`, `dv`, `vunit` for HEALPix-PPV spectral axes.
 
 ## Development Commands
 
@@ -304,23 +490,27 @@ Install or update dependencies:
 julia --project=. scripts/setup.jl
 ```
 
-Run tests:
+Run the test suite:
 
 ```bash
 julia --project=. -e 'using Pkg; Pkg.test()'
 ```
 
-Check that the package loads:
+Verify the package loads:
 
 ```bash
 julia --project=. -e 'using MANTA; println("MANTA OK")'
 ```
 
-Show the Julia environment status:
+Show the environment status:
 
 ```bash
 julia --project=. -e 'using Pkg; Pkg.status()'
 ```
+
+> Tests are designed to run without an OpenGL context (`activate_gl=false,
+> display_fig=false`). Every new visual feature must expose a headless-compatible
+> code path for CI and Docker.
 
 ## Docker
 
@@ -333,48 +523,85 @@ docker build -t manta .
 docker run --rm manta julia --project=. -e 'using Pkg; Pkg.test()'
 ```
 
-Opening an interactive window from Docker requires graphical access, such as X11
-on Linux or XQuartz on macOS.
+Opening an interactive window from Docker requires graphical access — X11
+forwarding on Linux, or XQuartz on macOS.
 
 ## Troubleshooting
 
-If no window opens, test GLMakie:
+**No window opens:**
 
 ```bash
 julia --project=. -e 'using GLMakie; display(GLMakie.Figure()); sleep(2)'
 ```
 
-If this command fails, the issue is probably the graphical environment or
-OpenGL.
+If this fails, the issue is the graphical environment or OpenGL, not MANTA.
 
-If a dependency is missing:
+**A dependency is missing:**
 
 ```bash
 julia --project=. scripts/setup.jl
 ```
 
-If `log10` or `ln` scales produce empty regions, check that the displayed
-values are strictly positive. Values less than or equal to zero are invalid for
-those scales.
+**`log10` / `ln` scales show empty or blank regions:**
+Values ≤ 0 are invalid for these scales; MANTA converts them to `NaN` before
+display. Check that the data has strictly positive values in the region you are
+viewing.
+
+**Lazy loading is slow on first slice:**
+The async prefetch covers the *next* slice; the very first read always hits
+disk. On networked filesystems, consider a local copy.
 
 ## Repository Layout
 
 ```text
 .
-|-- Project.toml
-|-- README.md
-|-- manta
-|-- demo/
-|   `-- run_demo.jl
-|-- scripts/
-|   `-- setup.jl
-|-- src/
-|   |-- MANTA.jl
-|   |-- MANTAHealpix.jl
-|   |-- datasets/
-|   |-- loaders/
-|   |-- views/
-|   `-- helpers/
-`-- test/
-    `-- runtests.jl
+├── Project.toml          Julia environment manifest
+├── README.md
+├── DOCKER.md
+├── Dockerfile
+├── docker-entrypoint.sh
+├── manta                 Shell launcher
+├── demo/
+│   └── run_demo.jl       Synthetic demo cube + viewer
+├── scripts/
+│   └── setup.jl          Dependency installer & precompiler
+├── src/
+│   ├── MANTA.jl          Module entry point; public API dispatch
+│   ├── MANTAHealpix.jl   HEALPix viewers (map, PPV cube, panels, RGB)
+│   ├── datasets/
+│   │   ├── Datasets.jl   Dataset types (CubeDataset, ImageDataset, …)
+│   │   └── LoadDataset.jl  Dataset loader dispatch
+│   ├── loaders/
+│   │   ├── FITSLoader.jl
+│   │   ├── HDF5Loader.jl
+│   │   ├── InMemoryLoader.jl
+│   │   └── LazyFITS.jl   On-demand slice reader with async prefetch
+│   ├── masking/
+│   │   └── Mask.jl       Declarative voxel mask system
+│   ├── helpers/
+│   │   ├── Helpers.jl    UI utilities (colormaps, WCS, LaTeX, contours, …)
+│   │   ├── UITheme.jl    Colour constants and widget style helpers
+│   │   ├── Shortcuts.jl  Keyboard shortcut registration
+│   │   ├── UndoRedo.jl   Bounded snapshot history (Ctrl-Z / Ctrl-Shift-Z)
+│   │   ├── Plugins.jl    Extension point registry
+│   │   ├── PowerSpectrum.jl  2D FFT + radial profile helpers
+│   │   └── …             (Moments, WCS, Stats, Scaling, …)
+│   └── views/
+│       ├── CubeView.jl   3D cube viewer (main orchestrator)
+│       ├── HealpixMapView.jl  HEALPix map viewer
+│       ├── VectorView.jl     1D spectrum / vector viewer
+│       └── cube/         Cube-viewer sub-bundles
+│           ├── MaskBundle.jl
+│           ├── CompareBundle.jl
+│           ├── KeyboardBundle.jl
+│           ├── ExportBundle.jl
+│           ├── PowerSpectrumBundle.jl
+│           ├── PSWindowBundle.jl
+│           ├── SlicePipelineBundle.jl
+│           ├── SpectrumBundle.jl
+│           ├── UICallbacksBundle.jl
+│           ├── SettingsBundle.jl
+│           └── AnimationRequest.jl
+└── test/
+    └── runtests.jl       Headless test suite
 ```

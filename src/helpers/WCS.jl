@@ -343,7 +343,7 @@ or if the deprojection falls outside its valid domain (e.g. ρ > 1 for
 SIN).
 
 Supported projections: `TAN` (gnomonic), `SIN` (orthographic),
-`CAR` (plate carrée), and a linear pass-through for anything else.
+`CAR` (plate carrée / equirectangular), and a linear pass-through for anything else.
 """
 function sky_world_coords(wcs::WCSTransform, pix1::Real, pix2::Real)
     lon_d, lat_d = wcs.sky_dims
@@ -432,8 +432,8 @@ function format_world_coord(wcs, dim::Integer, pix::Real)
         return "pix$(dim)=" * string(round(Float64(pix); digits = 2))
     end
     ax = wcs[dim]
-    # CTYPE/CUNIT peuvent être des chaînes ne contenant que des espaces
-    # (FITS mal renseigné) ; on les normalise pour éviter les "  =0.0" disgracieux.
+    # CTYPE/CUNIT can be whitespace-only strings (malformed FITS header);
+    # normalise them to avoid ugly "  =0.0" labels.
     ctype_clean = strip(String(ax.ctype))
     ctype = isempty(ctype_clean) ? "axis$(dim)" : ctype_clean
     val = world_coord(wcs, dim, pix)

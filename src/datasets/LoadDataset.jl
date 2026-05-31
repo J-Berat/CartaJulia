@@ -45,20 +45,28 @@ function load_dataset(path::AbstractString; kwargs...)
     if kind === :fits
         return load_fits(spec[2]; kwargs...)
     elseif kind === :hdf5
+        # `lazy` is FITS-only. Strip it before forwarding so load_hdf5 does
+        # not receive an unknown keyword, and warn the caller explicitly.
+        kw = pairs(kwargs)
+        if get(kwargs, :lazy, false)
+            @warn "MANTA: `lazy=true` is not supported for HDF5 files and will be ignored." *
+                  " Use a FITS file, or omit `lazy`." path=abspath(String(path))
+        end
+        hdf5_kw = filter(p -> p[1] !== :lazy, kw)
         # spec is either (:hdf5, file) or (:hdf5, file, address).
         if length(spec) >= 3
-            return load_hdf5(spec[2], spec[3]; kwargs...)
+            return load_hdf5(spec[2], spec[3]; hdf5_kw...)
         else
-            return load_hdf5(spec[2]; kwargs...)
+            return load_hdf5(spec[2]; hdf5_kw...)
         end
     else
         ext = lowercase(last(splitext(path)))
         throw(UnsupportedFormatError(
             String(path),
-            isempty(ext) ? "(aucune extension)" : ext,
-            "Extensions supportées : .fits, .fit, .fits.gz, .h5, .hdf5, .he5, " *
-            "ou la syntaxe \"file.h5:/group/dataset\".\n" *
-            "     Tu peux aussi enregistrer un loader via " *
+            isempty(ext) ? "(no extension)" : ext,
+            "Supported extensions: .fits, .fit, .fits.gz, .h5, .hdf5, .he5, " *
+            "or the \"file.h5:/group/dataset\" syntax.\n" *
+            "     You can also register a custom loader via " *
             "`MANTA.register_plugin!(:loader, (matcher, loader))`."))
     end
 end

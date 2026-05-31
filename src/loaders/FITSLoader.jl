@@ -27,17 +27,17 @@ function load_fits(
     lazy::Bool = false,
 )
     require_file(filepath;
-        hint = "Vérifie le chemin (cwd = $(pwd())) ou utilise un chemin absolu.")
+        hint = "Check the path (cwd = $(pwd())) or use an absolute path.")
 
     Int(hdu) >= 0 || invalid_kwarg(:hdu, hdu;
-        hint = "Doit être un entier ≥ 0 (1 = HDU primaire, 0 = auto-détection).")
+        hint = "Must be an integer ≥ 0 (1 = primary HDU, 0 = auto-detect first non-empty HDU).")
 
     # Lazy path: shortcut HEALPix detection, hand off to the lazy loader,
     # and wrap the result in the appropriate dataset (without ever
     # reading the full data array).
     if lazy
         Int(hdu) >= 1 || invalid_kwarg(:hdu, hdu;
-            hint = "Le chargement lazy nécessite un HDU explicite ≥ 1.")
+            hint = "Lazy loading requires an explicit HDU ≥ 1.")
         header, arr, _ = open_lazy_fits(filepath; hdu = Int(hdu))
         if arr isa LazyFITSImage
             return _load_image_fits_lazy(filepath, arr, header)
@@ -101,15 +101,15 @@ function load_fits(
     #    error pointing at the most likely fix (try another HDU, fix the file).
     if raw === nothing
         msg = primary_error === nothing ?
-            "HDU vide ou illisible." :
+            "Empty or unreadable HDU." :
             sprint(showerror, primary_error)
         throw(UnsupportedFormatError(
             String(filepath),
             "FITS",
-            "Échec lecture HDU #$(hdu_index)" *
-            (n_hdus > 0 ? " (le fichier en contient $(n_hdus))." : ".") *
-            "\n     Essaie un autre `hdu=...` ou vérifie l'intégrité du fichier." *
-            "\n     Détail: $(msg)"))
+            "Failed to read HDU #$(hdu_index)" *
+            (n_hdus > 0 ? " (the file contains $(n_hdus))." : ".") *
+            "\n     Try a different `hdu=...` or check the file integrity." *
+            "\n     Detail: $(msg)"))
     end
     if ndims(raw) == 1
         return _load_vector_fits(filepath, raw, header)
@@ -119,10 +119,10 @@ function load_fits(
     end
     if ndims(raw) != 3
         throw(DatasetShapeError(
-            "tableau FITS de dimension $(ndims(raw)) (taille $(size(raw))) " *
-            "dans $(abspath(filepath)).",
-            "MANTA gère 1D (vecteur), 2D (image) et 3D (cube). " *
-            "Réduis la dimensionnalité ou choisis un autre `hdu=...`."))
+            "FITS array has $(ndims(raw)) dimensions (size $(size(raw))) " *
+            "in $(abspath(filepath)).",
+            "MANTA handles 1D (vector), 2D (image), and 3D (cube). " *
+            "Reduce the dimensionality or choose a different `hdu=...`."))
     end
     return _load_cube_fits(filepath, raw, header)
 end
@@ -278,8 +278,8 @@ function _load_healpix_cube_fits(
         hpix_dim = vax == 1 ? 2 : 1
         nside_h = valid_healpix_npix(s[hpix_dim])
         nside_h == 0 && throw(ArgumentError(
-            "MANTA: header indique CTYPE$(vax) spectral mais NAXIS$(hpix_dim)=$(s[hpix_dim]) " *
-            "n'est pas un npix HEALPix valide (12·nside²)."))
+            "MANTA: header lists CTYPE$(vax) as the spectral axis but NAXIS$(hpix_dim)=$(s[hpix_dim]) " *
+            "is not a valid HEALPix npix (12·nside²)."))
         vax_sym = vax == 2 ? :last : :first
         @info "Velocity axis from FITS header" fits_axis=vax CRVAL=v0_h CDELT=dv_h CUNIT=unit_h
         (nside_h, s[hpix_dim], s[vax], vax_sym, Float64(v0_h), Float64(dv_h), String(unit_h))

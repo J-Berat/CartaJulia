@@ -19,8 +19,9 @@
 #   * `RectangleSource(i1, i2, j1, j2, k1, k2)` — keep voxels whose 1-based
 #     index falls in the closed box. `nothing` for any axis means "all".
 #
-# Combinators (`:and` / `:or` / `:not`) are not part of this iteration; the
-# `MaskSource` hierarchy is extensible for that purpose.
+# Combinators (`:and` / `:or` / `:not`) compose any two `MaskSource` values
+# into a new one. They are fully recursive — e.g. `AndSource(ThresholdSource(…),
+# NotSource(RectangleSource(…)))` is valid and round-trips through TOML.
 #
 # Consumers integrate via an optional `mask::Union{Nothing,AbstractArray{Bool,3}}`
 # kwarg (see `moment_map`, `mean_region_spectrum`) so passing `nothing` keeps
@@ -86,6 +87,39 @@ struct RectangleSource <: MaskSource
     k2::Union{Nothing,Int}
 end
 
+"""
+    AndSource(a::MaskSource, b::MaskSource)
+
+Keep voxels that are kept by **both** `a` and `b`. Equivalent to the
+bitwise AND of the two materialised masks. Recursively composable:
+any `MaskSource` (including another `AndSource`) may be used as operand.
+"""
+struct AndSource <: MaskSource
+    a::MaskSource
+    b::MaskSource
+end
+
+"""
+    OrSource(a::MaskSource, b::MaskSource)
+
+Keep voxels that are kept by `a` **or** `b` (inclusive). Equivalent to
+the bitwise OR of the two materialised masks.
+"""
+struct OrSource <: MaskSource
+    a::MaskSource
+    b::MaskSource
+end
+
+"""
+    NotSource(inner::MaskSource)
+
+Invert a mask: keep voxels **rejected** by `inner`, reject those it keeps.
+`NotSource(NoMaskSource())` therefore produces an all-false mask.
+"""
+struct NotSource <: MaskSource
+    inner::MaskSource
+end
+
 function RectangleSource(;
     i1::Union{Nothing,Integer} = nothing,
     i2::Union{Nothing,Integer} = nothing,
@@ -125,6 +159,49 @@ struct MANTAMask
     bits::BitArray{3}
     source::MaskSource
 end
+
+# --- Bounds validation --------------------------------------------------
+
+"""
+    validate_bounds(src::RectangleSource, cube_size)
+
+Throw `ArgumentError` if any specified (non-`nothing`) bound of `src` lies
+outside the valid 1-based index range for `cube_size`.
+
+Called automatically by `build_mask` so errors are reported at the call site
+rather than inside low-level indexing. Can also be called by UI code as soon
+as the cube dimensions are known — e.g. when the user finishes editing a mask
+field — to surface the problem before materialisation.
+
+```julia
+validate_bounds(RectangleSource(i1=1, i2=50), (64, 64, 64))  # ok
+validate_bounds(RectangleSource(i1=1, i2=1000), (64, 64, 64))  # ArgumentError
+```
+"""
+function validate_bounds(src::RectangleSource, cube_size)
+    nx, ny, nz = Int(cube_size[1]), Int(cube_size[2]), Int(cube_size[3])
+    function _check(val, lo, hi, name)
+        val === nothing && return
+        (val < lo || val > hi) || return
+        throw(ArgumentError(
+            "RectangleSource: $name = $val is out of range [$lo, $hi] " *
+            "for a cube of size ($nx, $ny, $nz)"))
+    end
+    _check(src.i1, 1, nx, "i1")
+    _check(src.i2, 1, nx, "i2")
+    _check(src.j1, 1, ny, "j1")
+    _check(src.j2, 1, ny, "j2")
+    _check(src.k1, 1, nz, "k1")
+    _check(src.k2, 1, nz, "k2")
+    return nothing
+end
+
+"""
+    validate_bounds(src::MaskSource, cube_size)
+
+No-op fallback for non-rectangle sources.
+"""
+validate_bounds(::MaskSource, _) = nothing
 
 # --- Builders -----------------------------------------------------------
 
@@ -172,18 +249,36 @@ function build_mask(src::ThresholdSource, data::AbstractArray{<:Real,3})
 end
 
 function build_mask(src::RectangleSource, data::AbstractArray{<:Real,3})
+    validate_bounds(src, size(data))
     nx, ny, nz = size(data)
-    i1 = src.i1 === nothing ? 1  : clamp(src.i1, 1, nx)
-    i2 = src.i2 === nothing ? nx : clamp(src.i2, 1, nx)
-    j1 = src.j1 === nothing ? 1  : clamp(src.j1, 1, ny)
-    j2 = src.j2 === nothing ? ny : clamp(src.j2, 1, ny)
-    k1 = src.k1 === nothing ? 1  : clamp(src.k1, 1, nz)
-    k2 = src.k2 === nothing ? nz : clamp(src.k2, 1, nz)
+    i1 = src.i1 === nothing ? 1  : src.i1
+    i2 = src.i2 === nothing ? nx : src.i2
+    j1 = src.j1 === nothing ? 1  : src.j1
+    j2 = src.j2 === nothing ? ny : src.j2
+    k1 = src.k1 === nothing ? 1  : src.k1
+    k2 = src.k2 === nothing ? nz : src.k2
     out = falses(nx, ny, nz)
     if i1 <= i2 && j1 <= j2 && k1 <= k2
         @inbounds out[i1:i2, j1:j2, k1:k2] .= true
     end
     return out
+end
+
+function build_mask(src::AndSource, data::AbstractArray{<:Real,3})
+    a = build_mask(src.a, data)
+    b = build_mask(src.b, data)
+    return a .& b
+end
+
+function build_mask(src::OrSource, data::AbstractArray{<:Real,3})
+    a = build_mask(src.a, data)
+    b = build_mask(src.b, data)
+    return a .| b
+end
+
+function build_mask(src::NotSource, data::AbstractArray{<:Real,3})
+    inner = build_mask(src.inner, data)
+    return .!inner
 end
 
 """
@@ -257,6 +352,19 @@ end
 # `mask_source_from_toml(d)` is permissive: unknown / malformed entries
 # return `NoMaskSource()` so a corrupted settings file never crashes a
 # viewer launch.
+#
+# **Settings-corruption strategy (uniform across all viewer settings)**
+# Every field in the settings TOML is treated with the same fallback
+# policy: on a type mismatch or missing key, emit `@warn` and continue
+# with the current / default value rather than throwing.  The helpers
+# `_safe_int`, `_safe_float32`, and `_safe_bool` in
+# `src/views/cube/SettingsBundle.jl` implement this for scalar fields;
+# `mask_source_from_toml` implements it for the structured mask subtree.
+# `load_viewer_settings` is intentionally *strict* on TOML syntax errors
+# (they are caught by the outer `try/catch` in the `on_mode` callback and
+# reported to the status bar), because a syntactically broken file is a
+# different problem from a file whose individual values have the wrong
+# type.
 
 """
     mask_source_to_toml(src::MaskSource) -> Dict{String,Any}
@@ -285,6 +393,23 @@ function mask_source_to_toml(src::MaskSource)
         src.k1 === nothing || (d["k1"] = src.k1)
         src.k2 === nothing || (d["k2"] = src.k2)
         return d
+    elseif src isa AndSource
+        return Dict{String,Any}(
+            "kind" => "and",
+            "a"   => mask_source_to_toml(src.a),
+            "b"   => mask_source_to_toml(src.b),
+        )
+    elseif src isa OrSource
+        return Dict{String,Any}(
+            "kind" => "or",
+            "a"   => mask_source_to_toml(src.a),
+            "b"   => mask_source_to_toml(src.b),
+        )
+    elseif src isa NotSource
+        return Dict{String,Any}(
+            "kind"  => "not",
+            "inner" => mask_source_to_toml(src.inner),
+        )
     end
     return Dict{String,Any}("kind" => "none")
 end
@@ -315,6 +440,17 @@ function mask_source_from_toml(d::AbstractDict)
             k1 = _toml_int_or_nothing(d, "k1"),
             k2 = _toml_int_or_nothing(d, "k2"),
         )
+    elseif kind == "and"
+        a = mask_source_from_toml(get(d, "a", nothing))
+        b = mask_source_from_toml(get(d, "b", nothing))
+        return AndSource(a, b)
+    elseif kind == "or"
+        a = mask_source_from_toml(get(d, "a", nothing))
+        b = mask_source_from_toml(get(d, "b", nothing))
+        return OrSource(a, b)
+    elseif kind == "not"
+        inner = mask_source_from_toml(get(d, "inner", nothing))
+        return NotSource(inner)
     end
     return NoMaskSource()
 end

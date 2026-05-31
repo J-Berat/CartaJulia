@@ -216,7 +216,7 @@ end
 """
     open_shortcut_help_window(bindings;
                               title="Keyboard shortcuts",
-                              theme=default_ui_theme(),
+                              theme=current_ui_theme(),
                               activate_gl=true,
                               display_fig=true,
                               figsize=nothing) -> Figure
@@ -231,7 +231,7 @@ custom binding set.
 
 Keyword arguments:
 - `title`     : window header text.
-- `theme`     : `MANTAUITheme` instance (defaults to `default_ui_theme()`).
+- `theme`     : `MANTAUITheme` instance (defaults to `current_ui_theme()`).
 - `activate_gl`: when `false`, fall back to a headless backend via
   `pick_backend!(false)` — required for the headless test suite.
 - `display_fig`: when `false`, build the figure but do not call `display`.
@@ -240,7 +240,7 @@ Keyword arguments:
 """
 function open_shortcut_help_window(bindings::AbstractVector{ShortcutBinding};
                                    title::AbstractString = "Keyboard shortcuts",
-                                   theme = default_ui_theme(),
+                                   theme = current_ui_theme(),
                                    activate_gl::Bool = true,
                                    display_fig::Bool = true,
                                    figsize::Union{Nothing,Tuple{Int,Int}} = nothing)

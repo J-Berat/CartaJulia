@@ -332,12 +332,15 @@ Apply the viewer's 2D Gaussian filter independently to every slice along
 function filtered_cube_by_slice(data::AbstractArray{T,3}, axis::Integer, sigma::Real) where {T}
     1 <= axis <= 3 || throw(ArgumentError("axis must be 1, 2, or 3"))
     σ = Float32(sigma)
-    σ <= 0 && return Float32.(data)
-    out = similar(Float32.(data))
+    # why: avoid `Float32.(data)` / `similar(Float32.(data))` which would
+    # materialise a lazy FITS cube in full.  Allocate the output directly and
+    # fill it slice-by-slice via `get_slice_view`, which dispatches to the
+    # cached `read_slice!` path for lazy arrays and to a no-alloc SubArray
+    # view for dense arrays.
+    out = Array{Float32,3}(undef, size(data))
     for idx in 1:size(data, axis)
-        # why: nan_gaussian_filter only reads its input, so a view avoids
-        # an extra slice copy per channel.
-        s = nan_gaussian_filter(get_slice_view(data, axis, idx), σ)
+        s_raw = get_slice_view(data, axis, idx)
+        s = σ > 0 ? nan_gaussian_filter(s_raw, σ) : Float32.(s_raw)
         if axis == 1
             @views out[idx, :, :] .= s
         elseif axis == 2

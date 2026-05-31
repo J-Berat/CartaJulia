@@ -19,6 +19,7 @@ using Healpix
 # ---- helpers ----
 include("helpers/Helpers.jl")
 include("helpers/UITheme.jl")
+include("helpers/UIConstants.jl")
 
 # ---- datasets ----
 include("datasets/Datasets.jl")
@@ -55,6 +56,10 @@ include("views/cube/ExportBundle.jl")
 include("views/cube/PSWindowBundle.jl")
 include("views/cube/PowerSpectrumBundle.jl")
 include("views/cube/AnimationRequest.jl")
+include("views/cube/SlicePipelineBundle.jl")
+include("views/cube/SpectrumBundle.jl")
+include("views/cube/UICallbacksBundle.jl")
+include("views/cube/SettingsBundle.jl")
 include("views/CubeView.jl")
 include("views/VectorView.jl")
 
@@ -67,14 +72,16 @@ export stable_source_id
 export view_cube
 # Mask system (persistent voxel masks for cube viewers)
 export MaskSource, NoMaskSource, FiniteSource, ThresholdSource, RectangleSource
-export MANTAMask, make_mask, build_mask, mask_count, mask_total, mask_fraction
+export AndSource, OrSource, NotSource
+export MANTAMask, make_mask, build_mask, validate_bounds, mask_count, mask_total, mask_fraction
 export mask_source_to_toml, mask_source_from_toml
 
 spawn_safely(f::Function) = @async try f() catch e
     @error "Background task failed" exception=(e, catch_backtrace())
 end
 
-export manta, manta_panels
+export set_dark_mode!, is_dark_mode, dark_ui_theme, current_ui_theme
+export manta, manta_panels, manta_batch
 
 """
     manta(filepath::String; kwargs...)
@@ -119,7 +126,7 @@ function manta(
     display_fig::Bool = true,
     settings_path::Union{Nothing,AbstractString} = nothing,
     rgb::Bool = false,
-    # HEALPix-specific options (ignorés pour les cubes 3D)
+    # HEALPix-specific options (ignored for 3D cubes)
     column::Int = 1,
     nx::Int = 1400,
     ny::Int = 700,
@@ -128,7 +135,7 @@ function manta(
     hist_bins::Int = 64,
     hist_xlimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
     hist_ylimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
-    # HEALPix PPV cube (npix×nv) — axe vitesse pour le spectre
+    # HEALPix PPV cube (npix×nv) — spectral axis for the spectrum panel
     spec_ylimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
     v0::Real = 0.0,
     dv::Real = 1.0,
@@ -253,7 +260,7 @@ function manta(
         (isfinite(lo) && isfinite(hi) && lo != hi) ? (lo, hi) : (0f0, 1f0)
     end
     hist_mode_obs = Observable(normalize_histogram_mode(hist_mode))
-    hist_bins_obs = Observable(clamp(hist_bins, 4, 512))
+    hist_bins_obs = Observable(clamp(hist_bins, HIST_BINS_MIN, HIST_BINS_MAX))
     hist_xlimits_manual = Observable(hist_xlimits !== nothing)
     hist_xlimits_manual_value = Observable(hist_xlimits === nothing ?
         (0f0, 1f0) :
@@ -275,17 +282,17 @@ function manta(
     hist_kde_visible = lift(m -> m === :kde, hist_mode_obs)
     hist_ylabel_obs = lift(histogram_ylabel, hist_mode_obs)
 
-    ui_theme = default_ui_theme()
+    ui_theme = current_ui_theme()
     fig_bg_panels = ui_theme.background
     pick_backend!(activate_gl)
     fig = Figure(size = _pick_fig_size(figsize), backgroundcolor = fig_bg_panels)
     grid = fig[1, 1] = GridLayout()
     colgap!(grid, 16); rowgap!(grid, 14)
-    # halign/tellwidth : empêche img_grid de s'élargir au-delà de son contenu
-    # naturel (image + colorbar) quand les contrôles en dessous sont plus larges.
+    # halign/tellwidth: prevents img_grid from expanding beyond its natural
+    # content width (image + colorbar) when the controls below are wider.
     img_grid = grid[1, 1] = GridLayout(; halign = :center, tellwidth = false)
     colgap!(img_grid, -8)
-    rowgap!(img_grid, 14)   # espace entre image et histogramme (même valeur que rowgap de grid)
+    rowgap!(img_grid, 14)   # gap between image and histogram (same as rowgap of grid)
     ax = Axis(
         img_grid[1, 1];
         title = make_main_title(title),
@@ -307,8 +314,8 @@ function manta(
     ui_accent = ui_theme.accent
     ui_text_muted = ui_theme.text_muted
 
-    # Histogramme placé dans img_grid[2, 1:2] : il hérite automatiquement
-    # de la même largeur que le couple image+colorbar (colonnes 1 et 2).
+    # Histogram placed in img_grid[2, 1:2]: it automatically inherits the
+    # same width as the image+colorbar pair (columns 1 and 2).
     ax_hist = Axis(
         img_grid[2, 1:2];
         title = L"\text{Image histogram}",
@@ -316,9 +323,9 @@ function manta(
         ylabel = hist_ylabel_obs,
         height = 130,
     )
-    barplot!(ax_hist, hist_x_obs, hist_y_obs; width = hist_width_obs, color = (ui_accent, 0.44), strokecolor = ui_accent, strokewidth = 0.3, visible = hist_bars_visible)
-    lines!(ax_hist, hist_x_obs, hist_y_obs; color = ui_accent, linewidth = 1.8, visible = hist_kde_visible)
-    vlines!(ax_hist, lift(lim -> [first(lim), last(lim)], clims_safe); color = (ui_text_muted, 0.65), linewidth = 1.1, linestyle = :dash)
+    barplot!(ax_hist, hist_x_obs, hist_y_obs; width = hist_width_obs, color = (ui_accent, HIST_BAR_ALPHA), strokecolor = ui_accent, strokewidth = HIST_BAR_STROKE_LW, visible = hist_bars_visible)
+    lines!(ax_hist, hist_x_obs, hist_y_obs; color = ui_accent, linewidth = HIST_KDE_LW, visible = hist_kde_visible)
+    vlines!(ax_hist, lift(lim -> [first(lim), last(lim)], clims_safe); color = (ui_text_muted, HIST_LIMITS_ALPHA), linewidth = HIST_LIMITS_LW, linestyle = :dash)
 
     ctrl = grid[2, 1] = GridLayout(; alignmode = Outside())
     Label(ctrl[1, 1], text = "Image", halign = :left, tellwidth = false, fontsize = 14, color = ui_text_muted)
@@ -350,7 +357,9 @@ function manta(
     ui_status = Observable(" ")
     grid[3, 1] = Label(grid[3, 1]; text = ui_status, halign = :left, tellwidth = false)
 
-    foreach(w -> manta_style_button!(w, ui_theme), (apply_btn, auto_btn, p1_btn, p5_btn, save_btn, help_btn, hist_apply_btn, hist_auto_btn, hist_y_apply_btn, hist_y_auto_btn))
+    foreach(w -> manta_style_button_primary!(w, ui_theme), (apply_btn, save_btn, hist_apply_btn, hist_y_apply_btn))
+    foreach(w -> manta_style_button!(w, ui_theme),         (p1_btn, p5_btn))
+    foreach(w -> manta_style_button_ghost!(w, ui_theme),   (auto_btn, hist_auto_btn, hist_y_auto_btn, help_btn))
     foreach(w -> manta_style_menu!(w, ui_theme), (scale_menu, cmap_menu, hist_mode_menu))
     foreach(w -> manta_style_textbox!(w, ui_theme), (clim_min_box, clim_max_box, hist_bins_box, hist_xmin_box, hist_xmax_box, hist_ymin_box, hist_ymax_box))
     manta_style_checkbox!(invert_chk, ui_theme)
@@ -835,6 +844,68 @@ manta(x::AbstractVector{<:Real}; kwargs...) = manta(load_dataset(x); kwargs...)
 #
 # Exercises the main public entry points in headless mode so that Julia bakes
 # the specialized methods into the package's pkgimage cache. This wipes out
+"""
+    manta_batch(paths; format=:png, save_dir=nothing, prefix="", kwargs...) -> Vector{String}
+
+Headless batch export: render each FITS file in `paths` and save one image
+per file.  Returns the list of output file paths written.
+
+### Arguments
+- `paths` — `AbstractVector{<:AbstractString}` of FITS file paths.
+- `format` — output format, either `:png` (default) or `:pdf`.
+- `save_dir` — directory for the exported images.  Defaults to the same
+  folder as each source file when `nothing`.
+- `prefix` — optional string prepended to every output filename.
+- `kwargs...` — forwarded verbatim to `manta(path; activate_gl=false,
+  display_fig=false, kwargs...)`.  Common ones: `cmap`, `vmin`, `vmax`,
+  `invert`, `figsize`, `scale`.
+
+### Notes
+- Each figure is built headlessly (no GL context required) and written via
+  CairoMakie through `with_export_backend`.  Existing output files are
+  silently overwritten.
+- The keep-alive reference is released via `forget!` after each save so
+  that Julia's GC can reclaim figure memory between iterations.
+- Errors for individual files are caught and logged as `@warn`; processing
+  continues with the remaining paths so that one bad file does not abort a
+  large batch.
+"""
+function manta_batch(
+    paths::AbstractVector{<:AbstractString};
+    format::Symbol = :png,
+    save_dir::Union{Nothing,AbstractString} = nothing,
+    prefix::AbstractString = "",
+    kwargs...,
+) :: Vector{String}
+    format in (:png, :pdf) ||
+        throw(ArgumentError("manta_batch: format must be :png or :pdf, got :$(format)"))
+
+    out_paths = String[]
+
+    for path in paths
+        try
+            fig = manta(path; activate_gl = false, display_fig = false, kwargs...)
+
+            stem = splitext(basename(path))[1]
+            fname = string(prefix, stem, ".", format)
+            dir   = save_dir === nothing ? dirname(abspath(path)) : String(save_dir)
+            isdir(dir) || mkpath(dir)
+            out = joinpath(dir, fname)
+
+            with_export_backend() do
+                Makie.save(out, fig)
+            end
+            forget!(fig)
+            push!(out_paths, out)
+            @info "manta_batch: saved $(out)"
+        catch e
+            @warn "manta_batch: failed for $(path)" exception=(e, catch_backtrace())
+        end
+    end
+
+    return out_paths
+end
+
 # most of the TTFP (Time-To-First-Plot) on every subsequent launch.
 #
 # Every call uses `activate_gl=false, display_fig=false` — the same headless
@@ -867,7 +938,7 @@ using PrecompileTools: @setup_workload, @compile_workload
             forget!(fig)
         end
 
-        # 2D image (Float32 matrix) → vue 2D simple.
+        # 2D image (Float32 matrix) → simple 2D view.
         let fig = manta(_pc_img2d;
                         activate_gl = false, display_fig = false,
                         figsize = (500, 360))

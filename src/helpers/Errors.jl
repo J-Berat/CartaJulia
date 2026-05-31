@@ -64,25 +64,25 @@ end
 # ---- pretty showerror ----------------------------------------------------
 
 function Base.showerror(io::IO, e::FileNotFoundError)
-    print(io, "MANTA: fichier introuvable: ", e.path)
+    print(io, "MANTA: file not found: ", e.path)
     isempty(e.hint) || print(io, "\n  → ", e.hint)
 end
 
 function Base.showerror(io::IO, e::UnsupportedFormatError)
-    print(io, "MANTA: format non supporté pour ", e.path,
-              " (détecté: ", e.detected, ")")
+    print(io, "MANTA: unsupported format for ", e.path,
+              " (detected: ", e.detected, ")")
     isempty(e.hint) || print(io, "\n  → ", e.hint)
 end
 
 function Base.showerror(io::IO, e::HDUSelectionError)
     print(io, "MANTA: HDU #", e.requested,
-              " indisponible dans ", e.path,
-              " (le fichier en contient ", e.available, ")")
+              " not available in ", e.path,
+              " (the file contains ", e.available, ")")
     isempty(e.hint) || print(io, "\n  → ", e.hint)
 end
 
 function Base.showerror(io::IO, e::InvalidArgumentError)
-    print(io, "MANTA: argument invalide ", e.name, " = ", repr(e.value))
+    print(io, "MANTA: invalid argument ", e.name, " = ", repr(e.value))
     isempty(e.hint) || print(io, "\n  → ", e.hint)
 end
 
@@ -101,7 +101,7 @@ Throw [`FileNotFoundError`](@ref) when `path` is not a regular file on disk.
 function require_file(path::AbstractString; hint::AbstractString = "")
     if !isfile(path)
         h = isempty(hint) ?
-            "Vérifie le chemin (cwd = $(pwd())) ou utilise un chemin absolu." :
+            "Check the path (cwd = $(pwd())) or use an absolute path." :
             String(hint)
         throw(FileNotFoundError(String(path), h))
     end
@@ -118,8 +118,8 @@ function rethrow_actionable(e::Exception, path::AbstractString;
                             format_hint::AbstractString = "")
     detected = string(typeof(e).name.name)
     user_hint = isempty(format_hint) ?
-        "Erreur originale: $(sprint(showerror, e))" :
-        "$(format_hint)\n     (erreur originale: $(sprint(showerror, e)))"
+        "Original error: $(sprint(showerror, e))" :
+        "$(format_hint)\n     (original error: $(sprint(showerror, e)))"
     throw(UnsupportedFormatError(String(path), detected, user_hint))
 end
 
@@ -141,8 +141,8 @@ Throw [`HDUSelectionError`](@ref).
 function invalid_hdu(path::AbstractString, requested::Integer, available::Integer;
                      hint::AbstractString = "")
     h = isempty(hint) ?
-        (available <= 0 ? "Le fichier ne contient aucune HDU lisible." :
-         "Choisis une HDU entre 1 et $(available) via le kwarg `hdu`.") :
+        (available <= 0 ? "The file contains no readable HDU." :
+         "Choose an HDU between 1 and $(available) using the `hdu` keyword.") :
         String(hint)
     throw(HDUSelectionError(String(path), Int(requested), Int(available), h))
 end

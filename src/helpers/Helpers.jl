@@ -32,7 +32,7 @@
 #             _axis_render_height,
 #             latex_safe, make_main_title, make_slice_title, make_spec_title,
 #             latex_tick, latex_tick_formatter,
-#             parse_manual_clims, parse_gif_request,
+#             parse_textbox, parse_manual_clims, parse_gif_request,
 #             SimpleWCSAxis, read_simple_wcs, has_wcs, world_coord,
 #             wcs_axis_label, format_world_coord, data_unit_label,
 #             WCSTransform, read_wcs_transform, pixel_scale,
@@ -55,10 +55,12 @@ export region_uv_indices, mean_region_spectrum
 export dual_view_product, resample_matrix_linear, resample_cube_linear, reproject_cube_linear
 export moments, moments_map, moment_map, moment_vectors, filtered_cube_by_slice
 export make_info_tex
+export MANTA_ICONS
 export MANTA_COLORMAP_OPTIONS, ui_colormap_options
 export to_cmap, get_box_str, _pick_fig_size, _axis_render_height
 export latex_safe, make_main_title, make_slice_title, make_spec_title
 export latex_tick, latex_tick_formatter
+export parse_textbox
 export parse_manual_clims, parse_histogram_bins, parse_histogram_xlimits
 export parse_histogram_ylimits, parse_spectrum_ylimits, parse_gif_request
 export manta_recipe, copy_text_to_clipboard

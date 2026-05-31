@@ -171,14 +171,15 @@ function load_hdf5(
     v0::Real = 0.0,
     dv::Real = 1.0,
     vunit::AbstractString = "km/s",
-    # Accepted-but-ignored kwargs so the public `manta(path; hdu, lazy)`
-    # entry point can blindly forward to whichever loader matches.
+    # `hdu` is FITS-only; accepted here so `load_dataset` can forward kwargs
+    # uniformly without filtering.  It is silently ignored for HDF5 files.
     hdu::Integer = 1,
-    lazy::Bool = false,
+    # `lazy` is intentionally NOT accepted here.  LoadDataset strips it and
+    # emits a clear warning before calling this function, so that callers
+    # receive an explicit message rather than a silent no-op.
 )
     isfile(path) || throw(FileNotFoundError(String(path),
-        "Vérifie le chemin (cwd = $(pwd())) ou utilise un chemin absolu."))
-    lazy && @warn "MANTA: `lazy=true` n'est pas implémenté pour HDF5, on passe en mode classique." path=abspath(path)
+        "Check the path (cwd = $(pwd())) or use an absolute path."))
 
     data, attrs_dict = try
         h5open(path, "r") do f

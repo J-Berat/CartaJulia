@@ -1,6 +1,7 @@
 # OS
 .DS_Store
 Thumbs.db
+.Rhistory
 # Julia
 Manifest.toml
 .julia/
@@ -17,3 +18,4 @@ demo/output/
 .vscode/
 .idea/
 *.swp
+*.bak

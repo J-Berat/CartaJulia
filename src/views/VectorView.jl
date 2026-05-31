@@ -268,7 +268,7 @@ function _view_vector(
     end
 
     # ---- theme + figure ----
-    ui_theme       = default_ui_theme()
+    ui_theme       = current_ui_theme()
     fig_bg         = ui_theme.background
     ui_text        = ui_theme.text
     ui_text_muted  = ui_theme.text_muted
@@ -355,9 +355,10 @@ function _view_vector(
     save_pdf_btn = Button(ctrl[3, 3]; label = "Save PDF", width = 110, height = 32)
     save_csv_btn = Button(ctrl[3, 4]; label = "Save CSV", width = 110, height = 32)
 
-    # Style consistently with other MANTA views.
-    foreach(w -> manta_style_button!(w, ui_theme),
-            (sel_apply_btn, sel_reset_btn, save_png_btn, save_pdf_btn, save_csv_btn))
+    # Style consistent avec les autres vues MANTA.
+    foreach(w -> manta_style_button_primary!(w, ui_theme), (sel_apply_btn, save_png_btn))
+    foreach(w -> manta_style_button!(w, ui_theme),         (save_pdf_btn, save_csv_btn))
+    manta_style_button_ghost!(sel_reset_btn, ui_theme)
     foreach(w -> manta_style_menu!(w, ui_theme),
             (xscale_menu, yscale_menu))
     foreach(w -> manta_style_textbox!(w, ui_theme),

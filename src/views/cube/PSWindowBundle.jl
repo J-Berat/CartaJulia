@@ -265,7 +265,7 @@ function _cube_ps_window_bundle(;
                     xtickformat = latex_tick_formatter,
                 )
                 if !isempty(k)
-                    lines!(ax, k, p_floored; color = ui_accent, linewidth = 1.8)
+                    lines!(ax, k, p_floored; color = ui_accent, linewidth = PS_LINE_LW)
                 end
                 push!(ps_blocks, ax)
 

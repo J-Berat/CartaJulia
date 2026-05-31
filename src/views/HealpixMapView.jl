@@ -29,14 +29,14 @@ function _view_healpix_map(
     @info "HEALPix map" source=fname nside=m.resolution.nside npix=length(m)
     unit_label_tex = latexstring("\\text{", latex_safe(unit_label), "}")
 
-    # ---------- Reprojection (une seule fois, conservée en mémoire) ----------
+    # ---------- Reprojection (once, kept in memory) ----------
     # why: project once, then gather into both the displayed image and the
     # pixel-index grid used for region selection. Avoids running the
     # Mollweide trig + ang2pixRing twice.
     ipix_grid = mollweide_pixel_index(m.resolution, nx, ny)
     img_raw   = mollweide_apply_index(ipix_grid, m)
 
-    # ---------- État ----------
+    # ---------- State ----------
     cmap_name   = Observable(cmap)
     invert_cmap = Observable(invert)
     cm_obs = lift(cmap_name, invert_cmap) do name, inv
@@ -93,14 +93,26 @@ function _view_healpix_map(
     contour_levels_obs = lift(contour_use_manual, contour_manual_levels, contour_auto_levels) do use_man, manual, auto
         use_man && !isempty(manual) ? manual : auto
     end
-    contour_default_color = RGBAf(0, 0, 0, 0.62)
-    contour_colors_obs = lift(contour_levels_obs, contour_use_manual, contour_manual_colors) do levels, use_man, colors
-        contour_color_values(use_man ? colors : String[], length(levels), contour_default_color)
+    # Auto-contrasted contour colour: white on dark images, black on bright ones.
+    contour_default_color_obs = lift(img_disp) do img
+        fv = filter(isfinite, vec(Float32.(img)))
+        isempty(fv) && return RGBAf(0f0, 0f0, 0f0, CONTOUR_AUTO_DARK_ALPHA)
+        lo, hi = percentile_clims(fv, 5, 95)
+        rng = hi - lo
+        rng < 1f-9 && return RGBAf(0f0, 0f0, 0f0, CONTOUR_AUTO_DARK_ALPHA)
+        t = clamp((median(fv) - lo) / rng, 0f0, 1f0)
+        t > CONTOUR_AUTO_BRIGHTNESS_THRESHOLD ?
+            RGBAf(0f0, 0f0, 0f0, CONTOUR_AUTO_DARK_ALPHA) :
+            RGBAf(1f0, 1f0, 1f0, CONTOUR_AUTO_LIGHT_ALPHA)
+    end
+    contour_colors_obs = lift(contour_levels_obs, contour_use_manual, contour_manual_colors,
+                              contour_default_color_obs) do levels, use_man, colors, def_color
+        contour_color_values(use_man ? colors : String[], length(levels), def_color)
     end
     show_contours = Observable(false)
 
     hist_mode_obs = Observable(normalize_histogram_mode(hist_mode))
-    hist_bins_obs = Observable(clamp(hist_bins, 4, 512))
+    hist_bins_obs = Observable(clamp(hist_bins, HIST_BINS_MIN, HIST_BINS_MAX))
     hist_xlimits_manual = Observable(hist_xlimits !== nothing)
     hist_xlimits_manual_value = Observable(hist_xlimits === nothing ?
         (0f0, 1f0) :
@@ -133,7 +145,7 @@ function _view_healpix_map(
     region_end = Observable(Point2f(NaN32, NaN32))
     region_ipix = Observable(Int[])
 
-    ui_theme = default_ui_theme()
+    ui_theme = current_ui_theme()
     ui_accent = ui_theme.accent
     ui_selection = ui_theme.selection
     ui_text_muted = ui_theme.text_muted
@@ -141,18 +153,25 @@ function _view_healpix_map(
     # ---------- Figure ----------
     pick_backend!(activate_gl)
     fig_size = _pick_fig_size(figsize)
-    # Layout responsive : mêmes seuils que CubeView pour rester cohérent
-    # quand on bascule d'une vue à l'autre. Sans ça, les hauteurs fixes
-    # poussent la barre d'info / histogramme / contrôles hors fenêtre sur
-    # les petites tailles (≤ 1500×950).
-    compact_layout  = fig_size[1] <= 1500 || fig_size[2] <= 950
-    cbar_h_px       = compact_layout ? 38  : 52
-    info_h_px       = compact_layout ? 22  : 30
-    hist_h_px       = compact_layout ? 70  : 105
-    font_sz         = compact_layout ? 13  : 15
+    if figsize === nothing
+        fig_size = (min(fig_size[1], 1500), 900)
+    end
+    # Responsive layout: same thresholds as CubeView for consistency when
+    # switching between views. Without this, Fixed heights push the info bar
+    # / histogram / controls off screen on small window sizes (≤ 1500×950).
+    compact_layout  = fig_size[1] <= COMPACT_LAYOUT_W || fig_size[2] <= COMPACT_LAYOUT_H
+    tight_layout    = fig_size[1] <= 1280 || fig_size[2] <= 760
+    cbar_h_px       = tight_layout ? 30 : compact_layout ? 38  : 52
+    info_h_px       = tight_layout ? 18 : compact_layout ? 22  : 30
+    hist_h_px       = tight_layout ? 45  : compact_layout ? 70  : 95
+    map_h_px        = tight_layout ? 160 : compact_layout ? 220 : 330
+    map_w_px        = tight_layout ? 320 : compact_layout ? 440 : 660
+    font_sz         = tight_layout ? 12 : compact_layout ? 13  : 15
     fig = Figure(size = fig_size, backgroundcolor = ui_theme.background)
 
     main_grid = fig[1, 1] = GridLayout()
+    colsize!(fig.layout, 1, Relative(1))
+    colsize!(main_grid, 1, Relative(1))
     colgap!(main_grid, -8)
     rowgap!(main_grid, -8)
 
@@ -164,6 +183,10 @@ function _view_healpix_map(
         xticklabelsvisible = false, yticklabelsvisible = false,
         bottomspinevisible = false, topspinevisible = false,
         leftspinevisible   = false, rightspinevisible = false,
+        width = map_w_px,
+        tellwidth = false,
+        tellheight = false,
+        halign = :center,
     )
     xs = LinRange(-2f0, 2f0, nx)
     ys = LinRange(-1f0, 1f0, ny)
@@ -173,19 +196,19 @@ function _view_healpix_map(
     hm = heatmap!(ax_img, xs, ys, img_for_plot;
                   colormap=cm_obs, colorrange=clims_safe, nan_color=:white)
     contour!(ax_img, xs, ys, img_for_plot;
-             levels=contour_levels_obs, color=contour_colors_obs, linewidth=1.1,
+             levels=contour_levels_obs, color=contour_colors_obs, linewidth=CONTOUR_LW_HP,
              visible=show_contours)
-    full_map_bounds = (-2.0, 2.0, -1.0, 1.0)
+    full_map_bounds = MOLLWEIDE_BOUNDS
     set_mollweide_view!(ax_img, full_map_bounds...)
     graticule = draw_mollweide_graticule!(ax_img)
     refresh_graticule_labels!(graticule, ax_img; bounds=full_map_bounds)
 
-    # cadre ellipse Mollweide (purement esthétique)
+    # Mollweide ellipse border (purely cosmetic)
     ell_x = [2cos(t) for t in LinRange(0, 2π, 200)]
     ell_y = [sin(t)  for t in LinRange(0, 2π, 200)]
     lines!(ax_img, ell_x, ell_y; color=:black, linewidth=0.8)
 
-    # rectangle de zoom
+    # zoom rectangle
     zoom_box_segments = lift(zoom_drag_active, zoom_drag_start, zoom_drag_end) do active, p0, p1
         active || return Point2f[]
         if !(isfinite(p0[1]) && isfinite(p0[2]) && isfinite(p1[1]) && isfinite(p1[2]))
@@ -199,12 +222,33 @@ function _view_healpix_map(
             Point2f(x0,y1), Point2f(x0,y0),
         ]
     end
-    linesegments!(ax_img, zoom_box_segments; color=(ui_selection, 0.95),
-                  linewidth=2.0, linestyle=:dash)
+    # Corner accents for the zoom rectangle.
+    zoom_corner_segments = lift(zoom_drag_active, zoom_drag_start, zoom_drag_end) do active, p0, p1
+        active || return Point2f[]
+        if !(isfinite(p0[1]) && isfinite(p0[2]) && isfinite(p1[1]) && isfinite(p1[2]))
+            return Point2f[]
+        end
+        x0, y0 = Float32(p0[1]), Float32(p0[2])
+        x1, y1 = Float32(p1[1]), Float32(p1[2])
+        cx = sign(x1 - x0) * abs(x1 - x0) * ZOOM_BEZIER_FACTOR
+        cy = sign(y1 - y0) * abs(y1 - y0) * ZOOM_BEZIER_FACTOR
+        Point2f[
+            Point2f(x0, y0), Point2f(x0 + cx, y0),
+            Point2f(x0, y0), Point2f(x0, y0 + cy),
+            Point2f(x1, y0), Point2f(x1 - cx, y0),
+            Point2f(x1, y0), Point2f(x1, y0 + cy),
+            Point2f(x1, y1), Point2f(x1 - cx, y1),
+            Point2f(x1, y1), Point2f(x1, y1 - cy),
+            Point2f(x0, y1), Point2f(x0 + cx, y1),
+            Point2f(x0, y1), Point2f(x0, y1 - cy),
+        ]
+    end
+    linesegments!(ax_img, zoom_box_segments;    color=(ui_selection, ZOOM_BOX_ALPHA),    linewidth=ZOOM_BOX_LW,    linestyle=:dash)
+    linesegments!(ax_img, zoom_corner_segments; color=(ui_selection, ZOOM_CORNER_ALPHA), linewidth=ZOOM_CORNER_LW, linestyle=:solid)
     region_segments = lift(region_start, region_end, region_shape, region_ipix, region_drag_active) do p0, p1, shape, ipixs, dragging
         (dragging || !isempty(ipixs)) ? projected_region_segments(p0, p1, shape) : Point2f[]
     end
-    lines!(ax_img, region_segments; color=(ui_selection, 0.98), linewidth=2.3)
+    lines!(ax_img, region_segments; color=(ui_selection, REGION_ALPHA), linewidth=REGION_LW_HP)
 
     Colorbar(
         main_grid[2, 1],
@@ -212,18 +256,20 @@ function _view_healpix_map(
         label = unit_label_tex,
         vertical = false,
         height = 18,
+        width = map_w_px,
         tellwidth = false,
+        tellheight = false,
         halign = :center,
     )
-    rowsize!(main_grid, 1, Relative(1))
+    rowsize!(main_grid, 1, Fixed(map_h_px))
     rowsize!(main_grid, 2, Fixed(cbar_h_px))
 
     # Bandeau info
     info_obs = Observable(latexstring("\\text{move cursor over the map}"))
-    Label(main_grid[3, 1], info_obs; halign=:left, fontsize=font_sz)
+    Label(main_grid[3, 1], info_obs; halign=:left, fontsize=font_sz, tellheight=false)
     rowsize!(main_grid, 3, Fixed(info_h_px))
 
-    # Contrôles
+    # Controls
     ax_hist = Axis(
         main_grid[4, 1];
         title = L"\text{Visible map histogram}",
@@ -233,19 +279,23 @@ function _view_healpix_map(
         # hard-coded value here (cf. CLAUDE.md / anti-patterns).
         xtickformat = _latex_tick_formatter,
         ytickformat = _latex_tick_formatter,
+        width = map_w_px,
+        tellwidth = false,
+        tellheight = false,
+        halign = :center,
     )
-    barplot!(ax_hist, hist_x_obs, hist_y_obs; width=hist_width_obs, color=(ui_accent, 0.44), strokecolor=ui_accent, strokewidth=0.3, visible=hist_bars_visible)
-    lines!(ax_hist, hist_x_obs, hist_y_obs; color=ui_accent, linewidth=1.8, visible=hist_kde_visible)
+    barplot!(ax_hist, hist_x_obs, hist_y_obs; width=hist_width_obs, color=(ui_accent, HIST_BAR_ALPHA), strokecolor=ui_accent, strokewidth=HIST_BAR_STROKE_LW, visible=hist_bars_visible)
+    lines!(ax_hist, hist_x_obs, hist_y_obs; color=ui_accent, linewidth=HIST_KDE_LW, visible=hist_kde_visible)
     vlines!(ax_hist, lift(lim -> [first(lim), last(lim)], clims_safe);
-            color=(ui_text_muted, 0.65), linewidth=1.0, linestyle=:dash)
+            color=(ui_text_muted, HIST_LIMITS_ALPHA), linewidth=HIST_LIMITS_LW_HP, linestyle=:dash)
     rowsize!(main_grid, 4, Fixed(hist_h_px))
 
     # ---------- Controls (card-based modal layout, mirrors CubeView) ----------
-    ctrl_row_h   = compact_layout ? (36, 168, 130) : (42, 188, 150)
-    ctrl_gap     = compact_layout ? 6 : 10
+    ctrl_row_h   = tight_layout ? (138, 98, 30) : compact_layout ? (168, 130, 36) : (188, 150, 42)
+    ctrl_gap     = tight_layout ? 5 : compact_layout ? 6 : 10
+    card_pad     = tight_layout ? 7 : compact_layout ? 9 : 12
+    card_gap     = tight_layout ? 5 : compact_layout ? 7 : 10
     ctrl_total_h = sum(ctrl_row_h) + 2 * ctrl_gap
-    card_pad     = compact_layout ? 9 : 12
-    card_gap     = compact_layout ? 7 : 10
 
     ctrl_grid = main_grid[5, 1] = GridLayout(; alignmode = Outside())
     rowsize!(main_grid, 5, Fixed(ctrl_total_h))
@@ -288,18 +338,21 @@ function _view_healpix_map(
     ctrl_lbl!(layout, pos, txt) = Label(layout[pos...]; text = txt, halign = :left,
         tellwidth = false, fontsize = 13, color = ui_theme.text_muted)
 
-    # ── Mode bar (row 1, full width) ──────────────────────────────────────
-    mode_bar = ctrl_grid[1, 1:3] = GridLayout(; alignmode = Outside(0))
+    # ── Mode bar (full width) ─────────────────────────────────────────────
+    mode_bar = ctrl_grid[3, 1:3] = GridLayout(; alignmode = Outside(0), halign = :center)
     colgap!(mode_bar, compact_layout ? 6 : 10)
-    mode_nav_btn      = Button(mode_bar[1, 1]; label = "Navigation", width = 130, height = 32)
-    mode_analysis_btn = Button(mode_bar[1, 2]; label = "Analysis",   width = 112, height = 32)
-    mode_export_btn   = Button(mode_bar[1, 3]; label = "Export",     width = 96,  height = 32)
-    help_btn          = Button(mode_bar[1, 4]; label = "Help",       width = 74,  height = 32)
-    foreach(c -> colsize!(mode_bar, c, Auto()), 1:4)
+    tab_h = tight_layout ? 28 : 32
+    mode_nav_btn      = Button(mode_bar[1, 1]; label = "Navigation", width = tight_layout ? 118 : 130, height = tab_h)
+    mode_analysis_btn = Button(mode_bar[1, 2]; label = "Analysis",   width = tight_layout ? 104 : 112, height = tab_h)
+    mode_export_btn   = Button(mode_bar[1, 3]; label = "Export",     width = tight_layout ? 90  : 96,  height = tab_h)
+    help_btn          = Button(mode_bar[1, 4]; label = "Help",       width = tight_layout ? 70  : 74,  height = tab_h)
+    btn_undo          = Button(mode_bar[1, 5]; label = "⟲ Undo",     width = tight_layout ? 86  : 92,  height = tab_h)
+    btn_redo          = Button(mode_bar[1, 6]; label = "⟳ Redo",     width = tight_layout ? 86  : 92,  height = tab_h)
+    foreach(c -> colsize!(mode_bar, c, Auto()), 1:6)
     control_mode = Observable(:navigation)
 
-    # ── NAVIGATION: Display card (row 2 col 1) ────────────────────────────
-    display_card = control_card!(ctrl_grid, 2, 1, "Display"; rows = 4, cols = 5)
+    # ── NAVIGATION: Display card (row 1 col 1) ────────────────────────────
+    display_card = control_card!(ctrl_grid, 1, 1, "Display"; rows = 4, cols = 5)
     ctrl_lbl!(display_card, (2, 1), "Scale")
     scale_menu = Menu(display_card[2, 2:3]; options = ["lin", "log10", "ln"],
                       prompt = String(scale), width = compact_layout ? 88 : 102)
@@ -321,8 +374,8 @@ function _view_healpix_map(
         width = compact_layout ? 128 : 158, height = 24)
     foreach(c -> colsize!(display_card, c, Auto()), 1:5)
 
-    # ── NAVIGATION: View card (row 2 col 2) ───────────────────────────────
-    nav_view_card = control_card!(ctrl_grid, 2, 2, "View"; rows = 3, cols = 4)
+    # ── NAVIGATION: View card (row 1 col 2) ───────────────────────────────
+    nav_view_card = control_card!(ctrl_grid, 1, 2, "View"; rows = 3, cols = 4)
     graticule_chk = Checkbox(nav_view_card[2, 1])
     Label(nav_view_card[2, 2]; text = "Graticule", halign = :left, tellwidth = false,
           fontsize = 13, color = ui_theme.text)
@@ -330,8 +383,8 @@ function _view_healpix_map(
     reset_zoom_btn = Button(nav_view_card[3, 1:2]; label = "Reset zoom", width = 122, height = 32)
     foreach(c -> colsize!(nav_view_card, c, Auto()), 1:4)
 
-    # ── ANALYSIS: Contrast card (row 2 col 1) ────────────────────────────
-    contrast_card = control_card!(ctrl_grid, 2, 1, "Contrast"; rows = 4, cols = 5)
+    # ── ANALYSIS: Contrast card (row 1 col 1) ────────────────────────────
+    contrast_card = control_card!(ctrl_grid, 1, 1, "$(MANTA_ICONS.contrast) Contrast"; rows = 4, cols = 5)
     clim_min_box  = Textbox(contrast_card[2, 1]; placeholder = "min", width = 110, height = 32)
     clim_max_box  = Textbox(contrast_card[2, 2]; placeholder = "max", width = 110, height = 32)
     apply_btn     = Button(contrast_card[2, 3]; label = "Apply",  width = 78, height = 32)
@@ -340,8 +393,8 @@ function _view_healpix_map(
     p5_btn        = Button(contrast_card[3, 2]; label = "p5-p95", width = 86, height = 32)
     foreach(c -> colsize!(contrast_card, c, Auto()), 1:5)
 
-    # ── ANALYSIS: Selection card (row 2 col 2) ───────────────────────────
-    selection_card = control_card!(ctrl_grid, 2, 2, "Selection"; rows = 3, cols = 4)
+    # ── ANALYSIS: Selection card (row 1 col 2) ───────────────────────────
+    selection_card = control_card!(ctrl_grid, 1, 2, "$(MANTA_ICONS.selection) Selection"; rows = 3, cols = 4)
     region_mode_menu = Menu(selection_card[2, 1]; options = ["point", "box", "circle"],
                             prompt = "point", width = compact_layout ? 100 : 116)
     region_clear_btn = Button(selection_card[2, 2]; label = "Clear",
@@ -350,8 +403,8 @@ function _view_healpix_map(
                                tellwidth = false, fontsize = 13, color = ui_theme.text_muted)
     foreach(c -> colsize!(selection_card, c, Auto()), 1:4)
 
-    # ── ANALYSIS: Contours card (row 2 col 3) ────────────────────────────
-    contour_card = control_card!(ctrl_grid, 2, 3, "Contours"; rows = 3, cols = 5)
+    # ── ANALYSIS: Contours card (row 1 col 3) ────────────────────────────
+    contour_card = control_card!(ctrl_grid, 1, 3, "Contours"; rows = 3, cols = 5)
     contour_chk = Checkbox(contour_card[2, 1])
     Label(contour_card[2, 2]; text = "Show", halign = :left, tellwidth = false,
           fontsize = 13, color = ui_theme.text)
@@ -362,8 +415,8 @@ function _view_healpix_map(
     contour_chk.checked[] = show_contours[]
     foreach(c -> colsize!(contour_card, c, Auto()), 1:5)
 
-    # ── ANALYSIS bottom: Histogram card (row 3, centred) ─────────────────
-    analysis_bottom = ctrl_grid[3, 1:3] = GridLayout(; alignmode = Outside(0))
+    # ── ANALYSIS bottom: Histogram card (row 2, centred) ─────────────────
+    analysis_bottom = ctrl_grid[2, 1:3] = GridLayout(; alignmode = Outside(0))
     colgap!(analysis_bottom, ctrl_gap)
     hist_card = control_card!(analysis_bottom, 1, 2, "Histogram"; rows = 3, cols = 6)
     hist_mode_menu   = Menu(hist_card[2, 1]; options = ["bars", "kde"],
@@ -384,25 +437,31 @@ function _view_healpix_map(
     colsize!(analysis_bottom, 2, Fixed(compact_layout ? 480 : 560))
     colsize!(analysis_bottom, 3, Relative(1))
 
-    # ── EXPORT: Output card (row 2 col 1) ────────────────────────────────
-    output_card = control_card!(ctrl_grid, 2, 1, "Output"; rows = 3, cols = 3)
+    # ── EXPORT: Output card (row 1 col 1) ────────────────────────────────
+    output_card = control_card!(ctrl_grid, 1, 1, "Output"; rows = 3, cols = 3)
     save_btn = Button(output_card[2, 1]; label = "Save PNG", width = 110, height = 32)
     foreach(c -> colsize!(output_card, c, Auto()), 1:3)
 
     # ── Grid sizing ───────────────────────────────────────────────────────
     foreach(c -> colsize!(ctrl_grid, c, Relative(1 / 3)), 1:3)
     rowsize!(ctrl_grid, 1, Fixed(ctrl_row_h[1]))
-    rowsize!(ctrl_grid, 2, Fixed(ctrl_row_h[2]))
+    rowsize!(ctrl_grid, 2, Fixed(0))
     rowsize!(ctrl_grid, 3, Fixed(ctrl_row_h[3]))
 
     # ── Style ─────────────────────────────────────────────────────────────
     foreach(w -> manta_style_menu!(w, ui_theme),
             (scale_menu, cmap_menu, region_mode_menu, hist_mode_menu))
+    # Mode navigation buttons (tab-like; state managed by set_mode_button_active!)
     foreach(w -> manta_style_button!(w, ui_theme),
-            (mode_nav_btn, mode_analysis_btn, mode_export_btn, help_btn,
-             apply_btn, auto_btn, p1_btn, p5_btn, reset_zoom_btn, save_btn,
-             region_clear_btn, contour_apply_btn,
-             hist_apply_btn, hist_auto_btn, hist_y_apply_btn, hist_y_auto_btn))
+            (mode_nav_btn, mode_analysis_btn, mode_export_btn, p1_btn, p5_btn))
+    # Primary actions (accent)
+    foreach(w -> manta_style_button_primary!(w, ui_theme),
+            (apply_btn, save_btn, contour_apply_btn,
+             hist_apply_btn, hist_y_apply_btn))
+    # Resets, Clear, and utilities (unobtrusive)
+    foreach(w -> manta_style_button_ghost!(w, ui_theme),
+            (help_btn, btn_undo, btn_redo, auto_btn, reset_zoom_btn, region_clear_btn,
+             hist_auto_btn, hist_y_auto_btn))
     foreach(w -> manta_style_checkbox!(w, ui_theme),
             (invert_chk, graticule_chk, gauss_chk, contour_chk))
     foreach(w -> manta_style_textbox!(w, ui_theme),
@@ -429,6 +488,17 @@ function _view_healpix_map(
         for card in nav_cards_hp;      set_layout_contents_visible!(card, mode === :navigation); end
         for card in analysis_cards_hp; set_layout_contents_visible!(card, mode === :analysis);   end
         for card in export_cards_hp;   set_layout_contents_visible!(card, mode === :export);     end
+        if mode === :navigation
+            rowsize!(ctrl_grid, 1, Fixed(ctrl_row_h[1]))
+            rowsize!(ctrl_grid, 2, Fixed(0))
+        elseif mode === :analysis
+            rowsize!(ctrl_grid, 1, Fixed(ctrl_row_h[1]))
+            rowsize!(ctrl_grid, 2, Fixed(ctrl_row_h[2]))
+        else
+            rowsize!(ctrl_grid, 1, Fixed(tight_layout ? 90 : 105))
+            rowsize!(ctrl_grid, 2, Fixed(0))
+        end
+        rowsize!(ctrl_grid, 3, Fixed(ctrl_row_h[3]))
         set_mode_button_active!(mode_nav_btn,      mode === :navigation)
         set_mode_button_active!(mode_analysis_btn, mode === :analysis)
         set_mode_button_active!(mode_export_btn,   mode === :export)
@@ -463,6 +533,96 @@ function _view_healpix_map(
         lo, hi = hist_ylimits_manual_value[]
         set_box_text!(hist_ymin_box, string(lo))
         set_box_text!(hist_ymax_box, string(hi))
+    end
+    _hp_status!(msg::AbstractString) =
+        (info_obs[] = latexstring("\\text{", latex_safe(msg), "}"); nothing)
+    _hp_snapshot() = (;
+        scale_mode = scale_mode[],
+        cmap_name = cmap_name[],
+        invert_cmap = invert_cmap[],
+        gauss_on = gauss_on[],
+        sigma = sigma[],
+        show_graticule = show_graticule[],
+        show_contours = show_contours[],
+        use_manual = use_manual[],
+        clims_manual = clims_manual[],
+        hist_mode = hist_mode_obs[],
+        hist_bins = hist_bins_obs[],
+        hist_xmanual = hist_xlimits_manual[],
+        hist_xlimits = hist_xlimits_manual_value[],
+        hist_ymanual = hist_ylimits_manual[],
+        hist_ylimits = hist_ylimits_manual_value[],
+    )
+    _hp_undo_stack = UndoRedoStack(_hp_snapshot(); capacity = UNDO_STACK_CAPACITY)
+    for _obs in (
+        scale_mode, cmap_name, invert_cmap, gauss_on, sigma, show_graticule,
+        show_contours, use_manual, clims_manual, hist_mode_obs, hist_bins_obs,
+        hist_xlimits_manual, hist_xlimits_manual_value,
+        hist_ylimits_manual, hist_ylimits_manual_value,
+    )
+        on(_obs) do _
+            _hp_undo_stack.suppress && return
+            register_state!(_hp_undo_stack, _hp_snapshot())
+        end
+    end
+    on(_hp_undo_stack.can_undo; update = true) do can
+        btn_undo.labelcolor[] = can ? ui_theme.text : ui_theme.text_muted
+        btn_undo.labelcolor_hover[] = can ? ui_theme.accent_strong : ui_theme.text_muted
+    end
+    on(_hp_undo_stack.can_redo; update = true) do can
+        btn_redo.labelcolor[] = can ? ui_theme.text : ui_theme.text_muted
+        btn_redo.labelcolor_hover[] = can ? ui_theme.accent_strong : ui_theme.text_muted
+    end
+    function _apply_hp_snap!(snap)
+        snap === nothing && return
+        with_suppression(_hp_undo_stack) do
+            scale_menu.selection[] = String(snap.scale_mode)
+            if String(snap.cmap_name) in MANTA_COLORMAP_OPTIONS
+                cmap_menu.selection[] = String(snap.cmap_name)
+            else
+                cmap_name[] = snap.cmap_name
+            end
+            invert_chk.checked[] = snap.invert_cmap
+            gauss_chk.checked[] = snap.gauss_on
+            sigma_slider.value[] = Float32(snap.sigma)
+            graticule_chk.checked[] = snap.show_graticule
+            contour_chk.checked[] = snap.show_contours
+            hist_mode_menu.selection[] = String(snap.hist_mode)
+            hist_bins_obs[] = snap.hist_bins
+            hist_xlimits_manual_value[] = snap.hist_xlimits
+            hist_xlimits_manual[] = snap.hist_xmanual
+            hist_ylimits_manual_value[] = snap.hist_ylimits
+            hist_ylimits_manual[] = snap.hist_ymanual
+            set_box_text!(hist_bins_box, string(snap.hist_bins))
+            set_box_text!(hist_xmin_box, snap.hist_xmanual ? string(first(snap.hist_xlimits)) : "")
+            set_box_text!(hist_xmax_box, snap.hist_xmanual ? string(last(snap.hist_xlimits)) : "")
+            set_box_text!(hist_ymin_box, snap.hist_ymanual ? string(first(snap.hist_ylimits)) : "")
+            set_box_text!(hist_ymax_box, snap.hist_ymanual ? string(last(snap.hist_ylimits)) : "")
+            if snap.use_manual
+                clims_manual[] = snap.clims_manual
+                use_manual[] = true
+                set_box_text!(clim_min_box, string(first(snap.clims_manual)))
+                set_box_text!(clim_max_box, string(last(snap.clims_manual)))
+            else
+                use_manual[] = false
+                set_box_text!(clim_min_box, "")
+                set_box_text!(clim_max_box, "")
+            end
+            refresh_hist_axes!()
+        end
+        nothing
+    end
+    on(btn_undo.clicks) do _
+        snap = undo!(_hp_undo_stack)
+        snap === nothing && (_hp_status!("Nothing to undo."); return)
+        _apply_hp_snap!(snap)
+        _hp_status!("Undo.")
+    end
+    on(btn_redo.clicks) do _
+        snap = redo!(_hp_undo_stack)
+        snap === nothing && (_hp_status!("Nothing to redo."); return)
+        _apply_hp_snap!(snap)
+        _hp_status!("Redo.")
     end
     function clear_region!()
         region_ipix[] = Int[]
@@ -630,7 +790,7 @@ function _view_healpix_map(
         contour_chk.checked[] = true
     end
 
-    # zoom right-drag, identique à `manta`
+    # zoom right-drag, identical to `manta`
     on(events(ax_img).mousebutton) do ev
         if ev.button == Mouse.right && ev.action == Mouse.press
             p = mouseposition(ax_img); any(isnan, p) && return

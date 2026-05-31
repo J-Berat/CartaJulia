@@ -10,11 +10,11 @@
 """
     mollweide_grid(map; nx=1200, ny=600) -> Matrix{Float32}
 
-Reprojette `map::HealpixMap` sur une grille `(ny, nx)` Mollweide centrée
-sur `(l, b) = (0, 0)`. Pixels hors ellipse → `NaN32`. Convention :
+Reproject `map::HealpixMap` onto a `(ny, nx)` Mollweide grid centred on
+`(l, b) = (0, 0)`. Pixels outside the ellipse → `NaN32`. Convention:
 - `x ∈ [-2, 2]`, `y ∈ [-1, 1]`
-- longitude croît vers la gauche dans la convention astro ; on garde la
-  même convention que `Healpix.jl` (lon = φ HEALPix).
+- longitude increases to the left following the astronomical convention;
+  same orientation as `Healpix.jl` (lon = φ HEALPix).
 """
 function mollweide_grid(m::Healpix.HealpixMap; nx::Int=1200, ny::Int=600)
     return mollweide_apply_index(mollweide_pixel_index(m.resolution, nx, ny), m)
@@ -108,9 +108,9 @@ end
 """
     mollweide_pixel_index(res, nx, ny) -> Matrix{Int32}
 
-Précalcule l'index HEALPix (RING) à chaque point de la grille Mollweide.
-0 = pixel hors ellipse. Permet de regénérer une nouvelle frame en O(npx)
-sans recalculer la projection.
+Pre-compute the HEALPix (RING) pixel index at every point of the Mollweide
+grid. 0 = pixel outside the ellipse. Allows regenerating a new frame in
+O(npx) without recomputing the projection.
 """
 function mollweide_pixel_index(res::Healpix.Resolution, nx::Int, ny::Int)
     idx = zeros(Int32, ny, nx)

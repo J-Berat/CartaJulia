@@ -239,7 +239,6 @@ function _cube_compare_bundle(;
         compare_path_current[] = cmp_path
         compare_visible[]      = true
         colsize!(img_grid, 2, Auto())
-        colsize!(img_grid, 4, Auto())
         set_block_visible!(ax_cmp, true)
         set_block_visible!(img_colorbar_cmp, true)
         ax_cmp.xgridvisible[] = show_grid[]

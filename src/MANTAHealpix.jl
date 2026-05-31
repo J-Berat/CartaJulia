@@ -1,23 +1,22 @@
 # HEALPix Mollweide viewer with interactive zoom.
-# API publique : `is_healpix_fits`, `read_healpix_map`, `mollweide_grid`,
-# `manta_healpix(filepath; ...)`.
+# Public API: `is_healpix_fits`, `read_healpix_map`, `mollweide_grid`,
+# `manta_healpix(filepath; ...)`, `manta_healpix(::Healpix.HealpixMap; ...)`.
 #
-# Compatible avec les conventions de `manta(...)` (zoom right-drag, reset,
-# colormap, vlims, save image, échelles lin/log10/ln).
+# Follows the same conventions as `manta(...)` (zoom right-drag, reset,
+# colormap, vlims, save image, lin/log10/ln scales).
 
 using GLMakie, CairoMakie, Makie, Observables, FITSIO, LaTeXStrings
 using Healpix
 
 ############################
-# Détection / Lecture
+# Detection / Reading
 ############################
 
 """
     is_healpix_fits(path) -> Bool
 
-Heuristique : un fichier HEALPix expose `PIXTYPE = 'HEALPIX'` dans le
-header d'une extension BinTable. On lit les headers sans charger les
-données.
+Heuristic: a HEALPix file exposes `PIXTYPE = 'HEALPIX'` in the header of
+a BinTable extension. Headers are read without loading the data arrays.
 """
 function is_healpix_fits(path::AbstractString)
     isfile(path) || return false
@@ -40,15 +39,15 @@ end
 """
     read_healpix_map(path; column=1) -> (HealpixMap, header_dict)
 
-Lit la carte HEALPix (RING ou NESTED auto-détecté). `column` est le
-numéro de colonne dans la BinTable (1 pour I_STOKES, etc.).
-Retourne aussi le header de l'extension lue, utile pour récupérer
-unités et noms.
+Read the HEALPix map (RING or NESTED auto-detected). `column` is the
+column index in the BinTable (1 for I_STOKES, etc.).
+Also returns the header of the read extension, useful for retrieving
+units and axis names.
 """
 function read_healpix_map(path::AbstractString; column::Int=1)
     m = Healpix.readMapFromFITS(String(path), column, Float64)
     hdr = FITS(path) do f
-        # Le header de la HDU 2 (BinTable HEALPix) contient les infos utiles.
+        # HDU 2 (HEALPix BinTable) holds the useful metadata.
         h = length(f) >= 2 ? read_header(f[2]) : read_header(f[1])
         Dict{String,Any}(string(k) => h[k] for k in keys(h))
     end
@@ -57,6 +56,45 @@ end
 
 # ---- HEALPix projection / graticule helpers ----
 include("views/HealpixProjection.jl")
+
+"""
+    manta_healpix(m::Healpix.HealpixMap;
+                  cmap=:inferno, vmin=nothing, vmax=nothing,
+                  invert=false, scale=:lin,
+                  nx=1400, ny=700,
+                  figsize=nothing, save_dir=nothing,
+                  activate_gl=true, display_fig=true)
+
+In-memory HEALPix map viewer (Mollweide projection).
+Accepts the same keyword arguments as `manta_healpix(filepath::String; …)`.
+"""
+function manta_healpix(
+    m::Healpix.HealpixMap;
+    cmap::Symbol = :inferno,
+    vmin = nothing,
+    vmax = nothing,
+    invert::Bool = false,
+    scale::Symbol = :lin,
+    nx::Int = 1400,
+    ny::Int = 700,
+    figsize::Union{Nothing,Tuple{Int,Int}} = nothing,
+    save_dir::Union{Nothing,AbstractString} = nothing,
+    activate_gl::Bool = true,
+    display_fig::Bool = true,
+    hist_mode::Symbol = :bars,
+    hist_bins::Int = 64,
+    hist_xlimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
+    hist_ylimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
+)
+    ds = load_dataset(m)
+    return _view_healpix_map(ds;
+        cmap = cmap, vmin = vmin, vmax = vmax, invert = invert,
+        scale = scale, nx = nx, ny = ny, figsize = figsize,
+        save_dir = save_dir, activate_gl = activate_gl,
+        display_fig = display_fig,
+        hist_mode = hist_mode, hist_bins = hist_bins,
+        hist_xlimits = hist_xlimits, hist_ylimits = hist_ylimits)
+end
 
 function manta_healpix(
     pixels::AbstractArray;
@@ -86,7 +124,7 @@ function manta_healpix(
         rightspinevisible = false,
     )
     image!(ax, (-2f0, 2f0), (-1f0, 1f0), permutedims(img))
-    set_mollweide_view!(ax, -2.0, 2.0, -1.0, 1.0)
+    set_mollweide_view!(ax, MOLLWEIDE_BOUNDS...)
     graticule = draw_mollweide_graticule!(ax)
     set_graticule_visible!(graticule, show_graticule)
     ell_x = [2cos(t) for t in LinRange(0, 2π, 200)]
@@ -115,10 +153,10 @@ function manta_healpix_panels(
     N >= 1 || throw(ArgumentError("Provide at least one HEALPix panel."))
     pick_backend!(activate_gl)
     fig_size = _pick_fig_size(figsize)
-    # Layout responsive : on rétrécit la colorbar (et son row Fixed) sur les
-    # petites fenêtres pour que la carte reste lisible — même logique que
-    # les vues map / cube HEALPix.
-    compact_layout = fig_size[1] <= 1500 || fig_size[2] <= 950
+    # Responsive layout: shrink the colorbar (and its Fixed row) on small
+    # windows so the map remains legible — same logic as the HEALPix map/cube
+    # views.
+    compact_layout = fig_size[1] <= COMPACT_LAYOUT_W || fig_size[2] <= COMPACT_LAYOUT_H
     cbar_row_h     = compact_layout ? 32 : 44
     cbar_height    = compact_layout ? 12 : 16
     fig = Figure(size = fig_size)
@@ -166,7 +204,7 @@ function manta_healpix_panels(
             rowsize!(fig.layout, 1, Relative(1))
             rowsize!(fig.layout, 2, Fixed(cbar_row_h))
         end
-        set_mollweide_view!(ax, -2.0, 2.0, -1.0, 1.0)
+        set_mollweide_view!(ax, MOLLWEIDE_BOUNDS...)
         graticule = draw_mollweide_graticule!(ax)
         set_graticule_visible!(graticule, show_graticule)
         ell_x = [2cos(t) for t in LinRange(0, 2π, 200)]
@@ -184,13 +222,14 @@ end
 """
     detect_velocity_axis(filepath, ndim) -> (axis, v0, dv, vunit) | nothing
 
-Scan les `CTYPE{i}` (i=1..ndim) de la HDU primaire pour identifier l'axe
-vitesse/fréquence. Reconnaît `VRAD`, `VOPT`, `VELO`, `VELOCITY`, `FREQ`,
-`FELO`. Si trouvé, lit `CRVAL/CDELT/CRPIX/CUNIT` du même axe et calcule
-`v0 = CRVAL - (CRPIX - 1) * CDELT`, `dv = CDELT`. Conversion `m/s → km/s`.
+Scan `CTYPE{i}` (i=1..ndim) in the primary HDU to identify the
+velocity/frequency axis. Recognises `VRAD`, `VOPT`, `VELO`, `VELOCITY`,
+`FREQ`, `FELO`. When found, reads `CRVAL/CDELT/CRPIX/CUNIT` for that axis
+and computes `v0 = CRVAL - (CRPIX - 1) * CDELT`, `dv = CDELT`.
+Converts `m/s → km/s` when needed.
 
-Retourne `nothing` si aucun CTYPE vitesse n'est trouvé. La dim non
-détectée est alors l'axe HEALPix.
+Returns `nothing` when no spectral CTYPE is found; the undetected
+dimension is then assumed to be the HEALPix pixel axis.
 """
 function detect_velocity_axis(filepath::AbstractString, ndim::Int)
     try
@@ -202,9 +241,9 @@ function detect_velocity_axis(filepath::AbstractString, ndim::Int)
                 k = "CTYPE$(i)"
                 haskey(h, k) || continue
                 ct = uppercase(strip(String(h[k])))
-                # On accepte les CTYPE typiques d'un axe spectral : vitesse
-                # radio/optique, fréquence, longueur d'onde. On veut juste
-                # identifier l'axe non-spatial du cube.
+                # Accept typical spectral-axis CTYPEs: radio/optical velocity,
+                # frequency, wavelength.  Goal is simply to identify the
+                # non-spatial axis of the cube.
                 if startswith(ct, "VRAD") || startswith(ct, "VOPT") ||
                    startswith(ct, "VELO") || startswith(ct, "FREQ") ||
                    startswith(ct, "FELO") || startswith(ct, "WAVE") ||
@@ -231,8 +270,8 @@ function detect_velocity_axis(filepath::AbstractString, ndim::Int)
             elseif unit_raw in ("khz", "mhz", "ghz")
                 unit_norm = unit_raw
             elseif isempty(unit_raw)
-                # Heuristique : si CTYPE est une vitesse, on suppose km/s ;
-                # si c'est une fréquence, on suppose Hz.
+                # Heuristic: assume km/s for velocity CTYPEs, Hz for
+                # frequency CTYPEs.
                 unit_norm = startswith(ctype_found, "F") ? "Hz" : "km/s"
             end
             return (v_axis, v0, dv, unit_norm)
@@ -245,15 +284,15 @@ end
 """
     valid_healpix_npix(n) -> Int
 
-Retourne `nside` si `n = 12·nside²`, sinon 0. Sert à détecter si une
-dimension d'un tableau 2D est un nombre HEALPix valide.
+Return `nside` if `n = 12·nside²`, otherwise 0. Used to detect whether a
+dimension of a 2D array is a valid HEALPix pixel count.
 """
 function valid_healpix_npix(n::Integer)
     n <= 0 && return 0
     if n % 12 == 0
         s2 = n ÷ 12
         s = isqrt(s2)
-        s*s == s2 && (s & (s-1)) == 0 && return s   # nside puissance de 2
+        s*s == s2 && (s & (s-1)) == 0 && return s   # nside must be a power of 2
     end
     return 0
 end
@@ -261,8 +300,8 @@ end
 """
     mollweide_xy_to_lonlat(x, y) -> (lon_deg, lat_deg) | nothing
 
-Inverse de la projection Mollweide. Retourne `nothing` si (x,y) est hors
-ellipse. Longitude ∈ (-180°, 180°], latitude ∈ [-90°, 90°].
+Inverse Mollweide projection. Returns `nothing` when (x, y) lies outside
+the ellipse. Longitude ∈ (-180°, 180°], latitude ∈ [-90°, 90°].
 """
 @inline function mollweide_xy_to_lonlat(x::Real, y::Real)
     (x^2 / 4 + y^2 > 1) && return nothing
@@ -276,7 +315,7 @@ ellipse. Longitude ∈ (-180°, 180°], latitude ∈ [-90°, 90°].
 end
 
 ############################
-# Viewer interactif
+# Interactive viewer
 ############################
 
 """
@@ -287,17 +326,17 @@ end
                   figsize=nothing, save_dir=nothing,
                   activate_gl=true, display_fig=true)
 
-Visualiseur interactif HEALPix en projection Mollweide.
+Interactive HEALPix viewer in Mollweide projection.
 
-- **Zoom** : maintenir clic-droit et glisser pour dessiner un rectangle ;
-  le bouton "Reset zoom" rétablit la vue complète.
-- **Hover/clic gauche** : affiche `(l, b)` galactiques et la valeur du
-  pixel.
-- **Échelle** : `:lin`, `:log10`, `:ln` (sélectionnable au runtime).
-- **Contrast** : auto (quantiles 2/98 % en lin, 5/98 % en log) ou
-  `vmin`/`vmax` manuels.
+- **Zoom**: hold right-click and drag to draw a rectangle; the "Reset
+  zoom" button restores the full-sky view.
+- **Hover / left-click**: displays galactic `(l, b)` coordinates and the
+  pixel value.
+- **Scale**: `:lin`, `:log10`, `:ln` (selectable at runtime).
+- **Contrast**: automatic (2/98 % quantiles in lin, 5/98 % in log) or
+  manual `vmin`/`vmax`.
 
-Retourne la `Figure` GLMakie.
+Returns the GLMakie `Figure`.
 """
 function manta_healpix(
     filepath::String;
@@ -339,20 +378,20 @@ end
                        figsize=nothing, save_dir=nothing,
                        activate_gl=true, display_fig=true)
 
-Visualiseur interactif d'un **cube HEALPix-PPV** stocké comme un tableau
-2D `(npix, nv)` ou `(nv, npix)` dans un FITS classique. Affiche :
+Interactive viewer for a **HEALPix-PPV cube** stored as a 2D array
+`(npix, nv)` or `(nv, npix)` in a standard FITS file. Displays:
 
-- en haut, la **carte Mollweide** du canal courant ;
-- en bas, le **spectre** au pixel cliqué.
+- top panel: **Mollweide map** of the current channel;
+- bottom panel: **spectrum** at the clicked pixel.
 
-Contrôles :
-- slider "Channel" → change de canal (réutilise l'index Mollweide
-  précalculé, pas de recalcul de projection).
-- right-drag → zoom rectangulaire sur la Mollweide.
-- left-click → sélectionne un pixel HEALPix, met à jour le spectre.
-- échelle, contraste manuel, colormap, invert colormap, save PNG.
+Controls:
+- "Channel" slider → change channel (reuses the pre-computed Mollweide
+  index; no reprojection needed).
+- right-drag → rectangular zoom on the Mollweide map.
+- left-click → select a HEALPix pixel and update the spectrum.
+- scale, manual contrast, colormap, invert colormap, save PNG.
 
-`v0`, `dv`, `vunit` : axe vitesse `v(j) = v0 + (j-1)*dv` pour le spectre.
+`v0`, `dv`, `vunit` define the spectral axis `v(j) = v0 + (j-1)*dv`.
 """
 function manta_healpix_cube(
     filepath::String;
@@ -466,7 +505,7 @@ function _view_healpix_cube(
                                      order == 1 ? "mean " * spec_word * " [" * vunit_eff * "]" :
                                                   spec_word * " dispersion [" * vunit_eff * "]"
 
-    # ---------- Précalcul de l'index Mollweide (une fois) ----------
+    # ---------- Pre-compute Mollweide pixel index (once) ----------
     res = Healpix.Resolution(nside)
     ipix_grid = mollweide_pixel_index(res, nx, ny)   # 0 = hors ellipse
 
@@ -487,7 +526,7 @@ function _view_healpix_cube(
     # Public caption shown in titles: encodes the spectral quantity and unit.
     moment_long_label(order::Integer) = moment_caption(order)
 
-    # ---------- État ----------
+    # ---------- State ----------
     cmap_name   = Observable(cmap)
     invert_cmap = Observable(invert)
     cm_obs = lift(cmap_name, invert_cmap) do name, inv
@@ -515,10 +554,11 @@ function _view_healpix_cube(
         out2
     end
 
-    # Échelle de couleur globale, calculée dans l'espace transformé (cohérent
-    # entre frames). On évalue les quantiles sur tout le cube pour le mode
-    # actif. Hypothèse : les `clims_manual` sont dans le même espace que
-    # l'image affichée (i.e. l'utilisateur tape les valeurs après log).
+    # Global colour scale, computed in the transformed space (consistent
+    # across frames). Quantiles are evaluated over the whole cube for the
+    # active mode. Assumption: `clims_manual` values are in the same
+    # transformed space as the displayed image (i.e. the user enters them
+    # after the log transform has been applied).
     use_manual = Observable(false)
     clims_manual = Observable((0f0, 1f0))
     function _vector_clims(vals, mode::Symbol)
@@ -583,14 +623,26 @@ function _view_healpix_cube(
     contour_levels_obs = lift(contour_use_manual, contour_manual_levels, contour_auto_levels) do use_man, manual, auto
         use_man && !isempty(manual) ? manual : auto
     end
-    contour_default_color = RGBAf(0, 0, 0, 0.62)
-    contour_colors_obs = lift(contour_levels_obs, contour_use_manual, contour_manual_colors) do levels, use_man, colors
-        contour_color_values(use_man ? colors : String[], length(levels), contour_default_color)
+    # Auto-contrasted contour colour: white on dark images, black on bright ones.
+    contour_default_color_obs = lift(img_disp) do img
+        fv = filter(isfinite, vec(Float32.(img)))
+        isempty(fv) && return RGBAf(0f0, 0f0, 0f0, CONTOUR_AUTO_DARK_ALPHA)
+        lo, hi = percentile_clims(fv, 5, 95)
+        rng = hi - lo
+        rng < 1f-9 && return RGBAf(0f0, 0f0, 0f0, CONTOUR_AUTO_DARK_ALPHA)
+        t = clamp((median(fv) - lo) / rng, 0f0, 1f0)
+        t > CONTOUR_AUTO_BRIGHTNESS_THRESHOLD ?
+            RGBAf(0f0, 0f0, 0f0, CONTOUR_AUTO_DARK_ALPHA) :
+            RGBAf(1f0, 1f0, 1f0, CONTOUR_AUTO_LIGHT_ALPHA)
+    end
+    contour_colors_obs = lift(contour_levels_obs, contour_use_manual, contour_manual_colors,
+                              contour_default_color_obs) do levels, use_man, colors, def_color
+        contour_color_values(use_man ? colors : String[], length(levels), def_color)
     end
     show_contours = Observable(false)
 
     hist_mode_obs = Observable(normalize_histogram_mode(hist_mode))
-    hist_bins_obs = Observable(clamp(hist_bins, 4, 512))
+    hist_bins_obs = Observable(clamp(hist_bins, HIST_BINS_MIN, HIST_BINS_MAX))
     hist_xlimits_manual = Observable(hist_xlimits !== nothing)
     hist_xlimits_manual_value = Observable(hist_xlimits === nothing ?
         (0f0, 1f0) :
@@ -623,7 +675,7 @@ function _view_healpix_cube(
     region_end = Observable(Point2f(NaN32, NaN32))
     region_ipix = Observable(Int[])
 
-    # Pixel sélectionné (initial : centre)
+    # Selected pixel (initial: centre)
     sel_ipix  = Observable(0)
     sel_xy    = Observable(Point2f(NaN32, NaN32))
     sel_label = Observable(latexstring("\\text{click on map to select a pixel}"))
@@ -662,7 +714,7 @@ function _view_healpix_cube(
         )
     end
 
-    ui_theme = default_ui_theme()
+    ui_theme = current_ui_theme()
     ui_accent = ui_theme.accent
     ui_selection = ui_theme.selection
     ui_text_muted = ui_theme.text_muted
@@ -670,19 +722,28 @@ function _view_healpix_cube(
     # ---------- Figure ----------
     pick_backend!(activate_gl)
     fig_size = _pick_fig_size(figsize)
-    # Layout responsive (cf. _view_healpix_map / CubeView). Sans ces seuils,
-    # les Fixed() écrasent la carte ou poussent les contrôles hors fenêtre
-    # quand l'utilisateur ouvre la vue PPV avec figsize ≤ 1500×950.
-    compact_layout = fig_size[1] <= 1500 || fig_size[2] <= 950
-    cbar_h_px      = compact_layout ? 38  : 52
-    spec_h_px      = compact_layout ? 130 : 165
-    hist_h_px      = compact_layout ? 70  : 100
-    font_sz        = compact_layout ? 13  : 15
+    if figsize === nothing
+        fig_size = (min(fig_size[1], 1500), 900)
+    end
+    # Responsive layout (see _view_healpix_map / CubeView). Without these
+    # thresholds, Fixed() heights crush the map or push the controls off
+    # screen when the user opens the PPV view with figsize ≤ 1500×950.
+    compact_layout = fig_size[1] <= COMPACT_LAYOUT_W || fig_size[2] <= COMPACT_LAYOUT_H
+    tight_layout   = fig_size[1] <= 1280 || fig_size[2] <= 760
+    cbar_h_px      = tight_layout ? 30 : compact_layout ? 38  : 52
+    map_h_px       = tight_layout ? 170 : compact_layout ? 220 : 340
+    map_w_px       = tight_layout ? 340 : compact_layout ? 440 : 680
+    spec_h_px      = tight_layout ? 85  : compact_layout ? 110 : 150
+    hist_h_px      = tight_layout ? 45  : compact_layout ? 60  : 90
+    font_sz        = tight_layout ? 12 : compact_layout ? 13  : 15
     fig = Figure(size = fig_size, backgroundcolor = ui_theme.background)
     main_grid = fig[1, 1] = GridLayout()
+    colsize!(fig.layout, 1, Relative(1))
+    colsize!(main_grid, 1, Relative(1))
 
     # Carte
     map_grid = main_grid[1, 1] = GridLayout()
+    colsize!(map_grid, 1, Relative(1))
     colgap!(map_grid, -8)
     rowgap!(map_grid, -8)
     is_channel_axis = (vunit_eff == "channel")
@@ -705,7 +766,10 @@ function _view_healpix_cube(
         xticksvisible = false, yticksvisible = false,
         xticklabelsvisible = false, yticklabelsvisible = false,
         bottomspinevisible = false, topspinevisible = false,
-        leftspinevisible   = false, rightspinevisible = false)
+        leftspinevisible   = false, rightspinevisible = false,
+        width = map_w_px,
+        tellwidth = false,
+        tellheight = false)
 
     xs = LinRange(-2f0, 2f0, nx)
     ys = LinRange(-1f0, 1f0, ny)
@@ -713,9 +777,9 @@ function _view_healpix_cube(
     hm = heatmap!(ax_img, xs, ys, img_for_plot;
                   colormap=cm_obs, colorrange=clims_safe, nan_color=:white)
     contour!(ax_img, xs, ys, img_for_plot;
-             levels=contour_levels_obs, color=contour_colors_obs, linewidth=1.1,
+             levels=contour_levels_obs, color=contour_colors_obs, linewidth=CONTOUR_LW_HP,
              visible=show_contours)
-    full_map_bounds = (-2.0, 2.0, -1.0, 1.0)
+    full_map_bounds = MOLLWEIDE_BOUNDS
     set_mollweide_view!(ax_img, full_map_bounds...)
     graticule = draw_mollweide_graticule!(ax_img)
     refresh_graticule_labels!(graticule, ax_img; bounds=full_map_bounds)
@@ -732,16 +796,35 @@ function _view_healpix_cube(
         Point2f[Point2f(x0,y0),Point2f(x1,y0),Point2f(x1,y0),Point2f(x1,y1),
                 Point2f(x1,y1),Point2f(x0,y1),Point2f(x0,y1),Point2f(x0,y0)]
     end
-    linesegments!(ax_img, zoom_box_segments; color=(ui_selection,0.95),
-                  linewidth=2.0, linestyle=:dash)
+    # Corner accents for the zoom rectangle.
+    zoom_corner_segments = lift(zoom_drag_active, zoom_drag_start, zoom_drag_end) do active, p0, p1
+        active || return Point2f[]
+        (isfinite(p0[1]) && isfinite(p1[1])) || return Point2f[]
+        x0, y0 = Float32(p0[1]), Float32(p0[2])
+        x1, y1 = Float32(p1[1]), Float32(p1[2])
+        cx = sign(x1 - x0) * abs(x1 - x0) * ZOOM_BEZIER_FACTOR
+        cy = sign(y1 - y0) * abs(y1 - y0) * ZOOM_BEZIER_FACTOR
+        Point2f[
+            Point2f(x0, y0), Point2f(x0 + cx, y0),
+            Point2f(x0, y0), Point2f(x0, y0 + cy),
+            Point2f(x1, y0), Point2f(x1 - cx, y0),
+            Point2f(x1, y0), Point2f(x1, y0 + cy),
+            Point2f(x1, y1), Point2f(x1 - cx, y1),
+            Point2f(x1, y1), Point2f(x1, y1 - cy),
+            Point2f(x0, y1), Point2f(x0 + cx, y1),
+            Point2f(x0, y1), Point2f(x0, y1 - cy),
+        ]
+    end
+    linesegments!(ax_img, zoom_box_segments;    color=(ui_selection, ZOOM_BOX_ALPHA),    linewidth=ZOOM_BOX_LW,    linestyle=:dash)
+    linesegments!(ax_img, zoom_corner_segments; color=(ui_selection, ZOOM_CORNER_ALPHA), linewidth=ZOOM_CORNER_LW, linestyle=:solid)
     region_segments = lift(region_start, region_end, region_shape, region_ipix, region_drag_active) do p0, p1, shape, ipixs, dragging
         (dragging || !isempty(ipixs)) ? projected_region_segments(p0, p1, shape) : Point2f[]
     end
-    lines!(ax_img, region_segments; color=(ui_selection, 0.98), linewidth=2.3)
+    lines!(ax_img, region_segments; color=(ui_selection, REGION_ALPHA), linewidth=REGION_LW_HP)
     marker_pts = lift(sel_xy) do p
         (isfinite(p[1]) && isfinite(p[2])) ? Point2f[p] : Point2f[]
     end
-    scatter!(ax_img, marker_pts; color=ui_accent, markersize=12, marker=:cross)
+    scatter!(ax_img, marker_pts; color=ui_accent, markersize=MARKER_SIZE_HP, marker=:cross)
 
     map_unit_label = lift(show_moment, moment_order) do show_mom, ord
         show_mom ? latexstring("\\text{", latex_safe(moment_label(ord)), "}") : data_unit_tex
@@ -752,17 +835,19 @@ function _view_healpix_cube(
         label=map_unit_label,
         vertical=false,
         height=compact_layout ? 14 : 18,
+        width=map_w_px,
         tellwidth=false,
+        tellheight=false,
         halign=:center,
     )
     rowsize!(map_grid, 1, Relative(1))
     rowsize!(map_grid, 2, Fixed(cbar_h_px))
 
     # Spectre
-    # Affiché dans le même espace que la carte (lin/log10/ln) → cohérence
-    # avec la colorbar : le spectre est mis à l'échelle, et les bornes
-    # `clims_manual` (entrées par l'utilisateur dans le même espace
-    # transformé) lui sont appliquées en y-limits.
+    # Displayed in the same space as the map (lin/log10/ln) → consistency
+    # with the colorbar: the spectrum is scaled, and the `clims_manual`
+    # bounds (entered by the user in the same transformed space) are applied
+    # as y-limits.
     spec_y_disp = lift(spec_y_obs, scale_mode) do y, m_
         out = apply_scale(y, m_)
         out2 = similar(out, Float32)
@@ -778,13 +863,14 @@ function _view_healpix_cube(
             latexstring("v\\;[\\mathrm{", latex_safe(vunit_eff), "}]"),
         ylabel = lift(m_ -> m_ === :lin   ? data_unit_tex :
                             m_ === :log10 ? latexstring("\\log_{10}\\,\\text{", latex_safe(data_unit), "}") :
-                                            latexstring("\\ln\\,\\text{", latex_safe(data_unit), "}"), scale_mode))
+                                            latexstring("\\ln\\,\\text{", latex_safe(data_unit), "}"), scale_mode),
+        tellheight = false)
     lines!(ax_spec, spec_x, spec_y_disp; color=:black, linewidth=1.5)
-    # ligne verticale à v(chan_idx)
+    # vertical line at v(chan_idx)
     chan_v = lift(chan_idx) do j; Float32(v0_eff + (j-1)*dv_eff); end
     vlines!(ax_spec, lift(v -> [v], chan_v); color=ui_accent, linewidth=1.2, linestyle=:dash)
 
-    # ylimits du spectre : manuel, hérité du contraste initial, ou auto.
+    # Spectrum y-limits: manual, inherited from initial contrast, or auto.
     function _refresh_spec_ylim!()
         if spec_ylimits_source[] === :manual || spec_ylimits_source[] === :contrast
             lo, hi = spec_ylimits_value[]
@@ -823,20 +909,22 @@ function _view_healpix_cube(
         # hard-coded value here (cf. CLAUDE.md / anti-patterns).
         xtickformat = _latex_tick_formatter,
         ytickformat = _latex_tick_formatter,
+        tellheight = false,
     )
-    barplot!(ax_hist, hist_x_obs, hist_y_obs; width=hist_width_obs, color=(ui_accent, 0.44), strokecolor=ui_accent, strokewidth=0.3, visible=hist_bars_visible)
-    lines!(ax_hist, hist_x_obs, hist_y_obs; color=ui_accent, linewidth=1.8, visible=hist_kde_visible)
+    barplot!(ax_hist, hist_x_obs, hist_y_obs; width=hist_width_obs, color=(ui_accent, HIST_BAR_ALPHA), strokecolor=ui_accent, strokewidth=HIST_BAR_STROKE_LW, visible=hist_bars_visible)
+    lines!(ax_hist, hist_x_obs, hist_y_obs; color=ui_accent, linewidth=HIST_KDE_LW, visible=hist_kde_visible)
     vlines!(ax_hist, lift(lim -> [first(lim), last(lim)], clims_safe);
-            color=(ui_text_muted, 0.65), linewidth=1.0, linestyle=:dash)
+            color=(ui_text_muted, HIST_LIMITS_ALPHA), linewidth=HIST_LIMITS_LW_HP, linestyle=:dash)
 
-    # Contrôles (card-based modal layout, mirrors CubeView / HealpixMapView)
-    ctrl_row_h   = compact_layout ? (36, 168, 130) : (42, 190, 150)
-    ctrl_gap     = compact_layout ? 6 : 10
+    # Controls (card-based modal layout, mirrors CubeView / HealpixMapView)
+    ctrl_row_h   = tight_layout ? (142, 104, 30) : compact_layout ? (168, 130, 36) : (190, 150, 42)
+    ctrl_gap     = tight_layout ? 5 : compact_layout ? 6 : 10
+    card_pad     = tight_layout ? 7 : compact_layout ? 9 : 12
+    card_gap     = tight_layout ? 5 : compact_layout ? 7 : 10
     ctrl_total_h = sum(ctrl_row_h) + 2 * ctrl_gap
-    card_pad     = compact_layout ? 9 : 12
-    card_gap     = compact_layout ? 7 : 10
 
     ctrl_grid = main_grid[4, 1] = GridLayout(; alignmode = Outside())
+    rowsize!(main_grid, 4, Fixed(ctrl_total_h))
 
     # -- Visibility helpers (verbatim from CubeView) --
     set_block_visible!(block, visible::Bool) = begin
@@ -873,22 +961,27 @@ function _view_healpix_cube(
     ctrl_lbl!(layout, pos, txt) = Label(layout[pos...]; text = txt, halign = :left,
         tellwidth = false, fontsize = font_sz, color = ui_theme.text_muted)
 
-    # -- Mode bar (row 1, full width) --
-    mode_bar = ctrl_grid[1, 1:3] = GridLayout(; alignmode = Outside(0))
+    # -- Mode bar (full width) --
+    mode_bar = ctrl_grid[3, 1:3] = GridLayout(; alignmode = Outside(0), halign = :center)
     colgap!(mode_bar, compact_layout ? 6 : 10)
-    mode_nav_btn      = Button(mode_bar[1, 1]; label = "Navigation", width = 130, height = 32)
-    mode_analysis_btn = Button(mode_bar[1, 2]; label = "Analysis",   width = 112, height = 32)
-    mode_export_btn   = Button(mode_bar[1, 3]; label = "Export",     width = 96,  height = 32)
-    help_btn          = Button(mode_bar[1, 4]; label = "Help",       width = 74,  height = 32)
-    foreach(c -> colsize!(mode_bar, c, Auto()), 1:4)
+    tab_h = tight_layout ? 28 : 32
+    mode_nav_btn      = Button(mode_bar[1, 1]; label = "Navigation", width = tight_layout ? 118 : 130, height = tab_h)
+    mode_analysis_btn = Button(mode_bar[1, 2]; label = "Analysis",   width = tight_layout ? 104 : 112, height = tab_h)
+    mode_export_btn   = Button(mode_bar[1, 3]; label = "Export",     width = tight_layout ? 90  : 96,  height = tab_h)
+    help_btn          = Button(mode_bar[1, 4]; label = "Help",       width = tight_layout ? 70  : 74,  height = tab_h)
+    btn_undo          = Button(mode_bar[1, 5]; label = "⟲ Undo",     width = tight_layout ? 86  : 92,  height = tab_h)
+    btn_redo          = Button(mode_bar[1, 6]; label = "⟳ Redo",     width = tight_layout ? 86  : 92,  height = tab_h)
+    foreach(c -> colsize!(mode_bar, c, Auto()), 1:6)
     foreach(w -> manta_style_button!(w, ui_theme; compact = compact_layout),
-            (mode_nav_btn, mode_analysis_btn, mode_export_btn, help_btn))
+            (mode_nav_btn, mode_analysis_btn, mode_export_btn))
+    foreach(w -> manta_style_button_ghost!(w, ui_theme; compact = compact_layout),
+            (help_btn, btn_undo, btn_redo))
     control_mode = Observable(:navigation)
 
     # ---- NAVIGATION cards ----
 
     # channel_card [nav col 1] — Channel slider + Scale
-    channel_card = control_card!(ctrl_grid, 2, 1, "Channel"; rows = 4, cols = 6)
+    channel_card = control_card!(ctrl_grid, 1, 1, "Channel"; rows = 4, cols = 6)
     ctrl_lbl!(channel_card, (2, 1), "Channel")
     chan_slider = Slider(channel_card[2, 2:5]; range = 1:nv, startvalue = chan_idx[])
     manta_style_slider!(chan_slider, ui_theme; compact = compact_layout)
@@ -904,7 +997,7 @@ function _view_healpix_cube(
     manta_style_menu!(scale_menu, ui_theme; compact = compact_layout)
 
     # display_card [nav col 2] — Colormap, Invert, Smoothing
-    display_card = control_card!(ctrl_grid, 2, 2, "Display"; rows = 4, cols = 5)
+    display_card = control_card!(ctrl_grid, 1, 2, "Display"; rows = 4, cols = 5)
     cmap_menu = Menu(display_card[2, 1:3]; options = ui_colormap_options(), prompt = String(cmap))
     manta_style_menu!(cmap_menu, ui_theme; compact = compact_layout)
     invert_chk = Checkbox(display_card[2, 4])
@@ -923,38 +1016,38 @@ function _view_healpix_cube(
     manta_style_slider!(sigma_slider, ui_theme; compact = compact_layout)
 
     # nav_view_card [nav col 3] — Graticule, Reset zoom
-    nav_view_card = control_card!(ctrl_grid, 2, 3, "View"; rows = 3, cols = 4)
+    nav_view_card = control_card!(ctrl_grid, 1, 3, "View"; rows = 3, cols = 4)
     graticule_chk = Checkbox(nav_view_card[2, 1])
     graticule_chk.checked[] = show_graticule[]
     manta_style_checkbox!(graticule_chk, ui_theme; compact = compact_layout)
     Label(nav_view_card[2, 2]; text = "Graticule", halign = :left, tellwidth = false,
         fontsize = font_sz, color = ui_theme.text_muted)
     reset_btn = Button(nav_view_card[2, 3:4]; label = "Reset zoom", height = 32)
-    manta_style_button!(reset_btn, ui_theme; compact = compact_layout)
+    manta_style_button_ghost!(reset_btn, ui_theme; compact = compact_layout)
 
     # ---- ANALYSIS cards ----
 
     # contrast_card [analysis col 1] — Contrast controls
-    contrast_card = control_card!(ctrl_grid, 2, 1, "Contrast"; rows = 4, cols = 5)
+    contrast_card = control_card!(ctrl_grid, 1, 1, "$(MANTA_ICONS.contrast) Contrast"; rows = 4, cols = 5)
     clim_min_box = Textbox(contrast_card[2, 1:2]; placeholder = "min", height = 30)
     manta_style_textbox!(clim_min_box, ui_theme; compact = compact_layout)
     clim_max_box = Textbox(contrast_card[2, 3:4]; placeholder = "max", height = 30)
     manta_style_textbox!(clim_max_box, ui_theme; compact = compact_layout)
     apply_btn = Button(contrast_card[2, 5]; label = "Apply", height = 30)
-    manta_style_button!(apply_btn, ui_theme; compact = compact_layout)
+    manta_style_button_primary!(apply_btn, ui_theme; compact = compact_layout)
     auto_btn = Button(contrast_card[3, 1:2]; label = "Auto", height = 30)
-    manta_style_button!(auto_btn, ui_theme; compact = compact_layout)
+    manta_style_button_ghost!(auto_btn, ui_theme; compact = compact_layout)
     p1_btn   = Button(contrast_card[3, 3]; label = "p1-p99", height = 30)
     manta_style_button!(p1_btn, ui_theme; compact = compact_layout)
     p5_btn   = Button(contrast_card[3, 4:5]; label = "p5-p95", height = 30)
     manta_style_button!(p5_btn, ui_theme; compact = compact_layout)
 
     # selection_card [analysis col 2] — Selection mode + Spectrum y-limits
-    selection_card = control_card!(ctrl_grid, 2, 2, "Selection"; rows = 4, cols = 5)
+    selection_card = control_card!(ctrl_grid, 1, 2, "$(MANTA_ICONS.selection) Selection"; rows = 4, cols = 5)
     region_mode_menu = Menu(selection_card[2, 1:3]; options = ["point", "box", "circle"], prompt = "point")
     manta_style_menu!(region_mode_menu, ui_theme; compact = compact_layout)
     region_clear_btn = Button(selection_card[2, 4:5]; label = "Clear", height = 30)
-    manta_style_button!(region_clear_btn, ui_theme; compact = compact_layout)
+    manta_style_button_ghost!(region_clear_btn, ui_theme; compact = compact_layout)
     region_count_label = Label(selection_card[3, 1:3]; text = "0 pix", halign = :left,
         tellwidth = false, fontsize = font_sz, color = ui_theme.text_muted)
     ctrl_lbl!(selection_card, (4, 1), "Spec y")
@@ -963,12 +1056,12 @@ function _view_healpix_cube(
     spec_ymax_box = Textbox(selection_card[4, 3]; placeholder = "y max", height = 30)
     manta_style_textbox!(spec_ymax_box, ui_theme; compact = compact_layout)
     spec_y_apply_btn = Button(selection_card[4, 4]; label = "Apply y", height = 30)
-    manta_style_button!(spec_y_apply_btn, ui_theme; compact = compact_layout)
+    manta_style_button_primary!(spec_y_apply_btn, ui_theme; compact = compact_layout)
     spec_y_auto_btn  = Button(selection_card[4, 5]; label = "Auto y", height = 30)
-    manta_style_button!(spec_y_auto_btn, ui_theme; compact = compact_layout)
+    manta_style_button_ghost!(spec_y_auto_btn, ui_theme; compact = compact_layout)
 
     # contour_card [analysis col 3] — Contours
-    contour_card = control_card!(ctrl_grid, 2, 3, "Contours"; rows = 3, cols = 5)
+    contour_card = control_card!(ctrl_grid, 1, 3, "Contours"; rows = 3, cols = 5)
     contour_chk = Checkbox(contour_card[2, 1])
     contour_chk.checked[] = show_contours[]
     manta_style_checkbox!(contour_chk, ui_theme; compact = compact_layout)
@@ -977,10 +1070,10 @@ function _view_healpix_cube(
     contour_levels_box = Textbox(contour_card[2, 3:4]; placeholder = "auto or 1:red, 2:#00ffaa", height = 30)
     manta_style_textbox!(contour_levels_box, ui_theme; compact = compact_layout)
     contour_apply_btn = Button(contour_card[2, 5]; label = "Apply", height = 30)
-    manta_style_button!(contour_apply_btn, ui_theme; compact = compact_layout)
+    manta_style_button_primary!(contour_apply_btn, ui_theme; compact = compact_layout)
 
     # ---- ANALYSIS bottom: Moment + Histogram ----
-    analysis_bottom = ctrl_grid[3, 1:3] = GridLayout(; alignmode = Outside(0))
+    analysis_bottom = ctrl_grid[2, 1:3] = GridLayout(; alignmode = Outside(0))
     colgap!(analysis_bottom, ctrl_gap)
 
     moment_card = control_card!(analysis_bottom, 1, 1, "Moment"; rows = 3, cols = 6)
@@ -991,10 +1084,10 @@ function _view_healpix_cube(
     manta_style_button!(show_moment_btn, ui_theme; compact = compact_layout)
     show_channel_btn = Button(moment_card[2, 5:6]; label = "Channel", height = 30)
     manta_style_button!(show_channel_btn, ui_theme; compact = compact_layout)
-    save_moment_fits_btn = Button(moment_card[3, 1:4]; label = "Save moment FITS", height = 30)
-    manta_style_button!(save_moment_fits_btn, ui_theme; compact = compact_layout)
+    save_moment_fits_btn = Button(moment_card[3, 1:4]; label = "$(MANTA_ICONS.save) Save moment FITS", height = 30)
+    manta_style_button_primary!(save_moment_fits_btn, ui_theme; compact = compact_layout)
 
-    hist_card = control_card!(analysis_bottom, 1, 2, "Histogram"; rows = 3, cols = 7)
+    hist_card = control_card!(analysis_bottom, 1, 4, "$(MANTA_ICONS.histogram) Histogram"; rows = 3, cols = 7)
     hist_mode_menu = Menu(hist_card[2, 1]; options = ["bars", "kde"], prompt = String(hist_mode_obs[]))
     manta_style_menu!(hist_mode_menu, ui_theme; compact = compact_layout)
     hist_bins_box = Textbox(hist_card[2, 2]; placeholder = "bins", height = 30)
@@ -1004,39 +1097,43 @@ function _view_healpix_cube(
     hist_xmax_box = Textbox(hist_card[2, 4]; placeholder = "x max", height = 30)
     manta_style_textbox!(hist_xmax_box, ui_theme; compact = compact_layout)
     hist_apply_btn = Button(hist_card[2, 5]; label = "Apply x", height = 30)
-    manta_style_button!(hist_apply_btn, ui_theme; compact = compact_layout)
+    manta_style_button_primary!(hist_apply_btn, ui_theme; compact = compact_layout)
     hist_auto_btn  = Button(hist_card[2, 6:7]; label = "Auto x", height = 30)
-    manta_style_button!(hist_auto_btn, ui_theme; compact = compact_layout)
+    manta_style_button_ghost!(hist_auto_btn, ui_theme; compact = compact_layout)
     hist_ymin_box = Textbox(hist_card[3, 1:2]; placeholder = "y min", height = 30)
     manta_style_textbox!(hist_ymin_box, ui_theme; compact = compact_layout)
     hist_ymax_box = Textbox(hist_card[3, 3:4]; placeholder = "y max", height = 30)
     manta_style_textbox!(hist_ymax_box, ui_theme; compact = compact_layout)
     hist_y_apply_btn = Button(hist_card[3, 5]; label = "Apply y", height = 30)
-    manta_style_button!(hist_y_apply_btn, ui_theme; compact = compact_layout)
+    manta_style_button_primary!(hist_y_apply_btn, ui_theme; compact = compact_layout)
     hist_y_auto_btn  = Button(hist_card[3, 6:7]; label = "Auto y", height = 30)
-    manta_style_button!(hist_y_auto_btn, ui_theme; compact = compact_layout)
+    manta_style_button_ghost!(hist_y_auto_btn, ui_theme; compact = compact_layout)
 
-    colsize!(analysis_bottom, 1, Relative(0.38))
-    colsize!(analysis_bottom, 2, Relative(0.62))
+    Box(analysis_bottom[1, 2]; color = :transparent, strokewidth = 0)
+    Box(analysis_bottom[1, 5]; color = :transparent, strokewidth = 0)
+    colsize!(analysis_bottom, 1, Fixed(compact_layout ? 420 : 500))
+    colsize!(analysis_bottom, 2, Fixed(compact_layout ? 18 : 24))
+    colsize!(analysis_bottom, 3, Relative(1))
+    colsize!(analysis_bottom, 4, Fixed(compact_layout ? 520 : 620))
+    colsize!(analysis_bottom, 5, Relative(1))
 
     # ---- EXPORT cards ----
-    output_card = control_card!(ctrl_grid, 2, 1, "Output"; rows = 3, cols = 3)
-    save_btn = Button(output_card[2, 1:2]; label = "Save PNG", height = 32)
-    manta_style_button!(save_btn, ui_theme; compact = compact_layout)
+    output_card = control_card!(ctrl_grid, 1, 1, "Output"; rows = 3, cols = 3)
+    save_btn = Button(output_card[2, 1:2]; label = "$(MANTA_ICONS.save) Save PNG", height = 32)
+    manta_style_button_primary!(save_btn, ui_theme; compact = compact_layout)
 
     # Grid sizing
     foreach(c -> colsize!(ctrl_grid, c, Relative(1 / 3)), 1:3)
     rowsize!(ctrl_grid, 1, Fixed(ctrl_row_h[1]))
-    rowsize!(ctrl_grid, 2, Fixed(ctrl_row_h[2]))
+    rowsize!(ctrl_grid, 2, Fixed(0))
     rowsize!(ctrl_grid, 3, Fixed(ctrl_row_h[3]))
     colgap!(ctrl_grid, ctrl_gap)
     rowgap!(ctrl_grid, ctrl_gap)
 
     # main_grid row sizing
-    rowsize!(main_grid, 1, Relative(1))
+    rowsize!(main_grid, 1, Fixed(map_h_px))
     rowsize!(main_grid, 2, Fixed(spec_h_px))
     rowsize!(main_grid, 3, Fixed(hist_h_px))
-    rowsize!(main_grid, 4, Fixed(ctrl_total_h))
 
     # ---- Mode switching ----
     nav_cards_hpc      = (channel_card, display_card, nav_view_card)
@@ -1058,6 +1155,17 @@ function _view_healpix_cube(
         for c in nav_cards_hpc;      set_layout_contents_visible!(c, is_nav); end
         for c in analysis_cards_hpc; set_layout_contents_visible!(c, is_ana); end
         for c in export_cards_hpc;   set_layout_contents_visible!(c, is_exp); end
+        if is_nav
+            rowsize!(ctrl_grid, 1, Fixed(ctrl_row_h[1]))
+            rowsize!(ctrl_grid, 2, Fixed(0))
+        elseif is_ana
+            rowsize!(ctrl_grid, 1, Fixed(ctrl_row_h[1]))
+            rowsize!(ctrl_grid, 2, Fixed(ctrl_row_h[2]))
+        else
+            rowsize!(ctrl_grid, 1, Fixed(tight_layout ? 90 : 105))
+            rowsize!(ctrl_grid, 2, Fixed(0))
+        end
+        rowsize!(ctrl_grid, 3, Fixed(ctrl_row_h[3]))
         set_mode_button_active!(mode_nav_btn,      is_nav)
         set_mode_button_active!(mode_analysis_btn, is_ana)
         set_mode_button_active!(mode_export_btn,   is_exp)
@@ -1101,6 +1209,113 @@ function _view_healpix_cube(
         set_box_text!(spec_ymin_box, string(lo))
         set_box_text!(spec_ymax_box, string(hi))
     end
+    _hpc_status!(msg::AbstractString) =
+        (sel_label[] = latexstring("\\text{", latex_safe(msg), "}"); nothing)
+    _hpc_snapshot() = (;
+        channel = chan_idx[],
+        scale_mode = scale_mode[],
+        cmap_name = cmap_name[],
+        invert_cmap = invert_cmap[],
+        gauss_on = gauss_on[],
+        sigma = sigma[],
+        show_graticule = show_graticule[],
+        show_contours = show_contours[],
+        use_manual = use_manual[],
+        clims_manual = clims_manual[],
+        show_moment = show_moment[],
+        moment_order = moment_order[],
+        hist_mode = hist_mode_obs[],
+        hist_bins = hist_bins_obs[],
+        hist_xmanual = hist_xlimits_manual[],
+        hist_xlimits = hist_xlimits_manual_value[],
+        hist_ymanual = hist_ylimits_manual[],
+        hist_ylimits = hist_ylimits_manual_value[],
+        spec_ysource = spec_ylimits_source[],
+        spec_ylimits = spec_ylimits_value[],
+    )
+    _hpc_undo_stack = UndoRedoStack(_hpc_snapshot(); capacity = UNDO_STACK_CAPACITY)
+    for _obs in (
+        chan_idx, scale_mode, cmap_name, invert_cmap, gauss_on, sigma,
+        show_graticule, show_contours, use_manual, clims_manual,
+        show_moment, moment_order, hist_mode_obs, hist_bins_obs,
+        hist_xlimits_manual, hist_xlimits_manual_value,
+        hist_ylimits_manual, hist_ylimits_manual_value,
+        spec_ylimits_source, spec_ylimits_value,
+    )
+        on(_obs) do _
+            _hpc_undo_stack.suppress && return
+            register_state!(_hpc_undo_stack, _hpc_snapshot())
+        end
+    end
+    on(_hpc_undo_stack.can_undo; update = true) do can
+        btn_undo.labelcolor[] = can ? ui_theme.text : ui_theme.text_muted
+        btn_undo.labelcolor_hover[] = can ? ui_theme.accent_strong : ui_theme.text_muted
+    end
+    on(_hpc_undo_stack.can_redo; update = true) do can
+        btn_redo.labelcolor[] = can ? ui_theme.text : ui_theme.text_muted
+        btn_redo.labelcolor_hover[] = can ? ui_theme.accent_strong : ui_theme.text_muted
+    end
+    function _apply_hpc_snap!(snap)
+        snap === nothing && return
+        with_suppression(_hpc_undo_stack) do
+            chan_slider.value[] = clamp(Int(snap.channel), 1, nv)
+            scale_menu.selection[] = String(snap.scale_mode)
+            if String(snap.cmap_name) in MANTA_COLORMAP_OPTIONS
+                cmap_menu.selection[] = String(snap.cmap_name)
+            else
+                cmap_name[] = snap.cmap_name
+            end
+            invert_chk.checked[] = snap.invert_cmap
+            gauss_chk.checked[] = snap.gauss_on
+            sigma_slider.value[] = Float32(snap.sigma)
+            graticule_chk.checked[] = snap.show_graticule
+            contour_chk.checked[] = snap.show_contours
+            show_moment[] = snap.show_moment
+            moment_order[] = snap.moment_order
+            moment_menu.selection[] = snap.moment_order == 0 ? "M0 integrated" :
+                                      snap.moment_order == 1 ? "M1 mean" : "M2 dispersion"
+            hist_mode_menu.selection[] = String(snap.hist_mode)
+            hist_bins_obs[] = snap.hist_bins
+            hist_xlimits_manual_value[] = snap.hist_xlimits
+            hist_xlimits_manual[] = snap.hist_xmanual
+            hist_ylimits_manual_value[] = snap.hist_ylimits
+            hist_ylimits_manual[] = snap.hist_ymanual
+            set_box_text!(hist_bins_box, string(snap.hist_bins))
+            set_box_text!(hist_xmin_box, snap.hist_xmanual ? string(first(snap.hist_xlimits)) : "")
+            set_box_text!(hist_xmax_box, snap.hist_xmanual ? string(last(snap.hist_xlimits)) : "")
+            set_box_text!(hist_ymin_box, snap.hist_ymanual ? string(first(snap.hist_ylimits)) : "")
+            set_box_text!(hist_ymax_box, snap.hist_ymanual ? string(last(snap.hist_ylimits)) : "")
+            spec_ylimits_value[] = snap.spec_ylimits
+            spec_ylimits_source[] = snap.spec_ysource
+            set_box_text!(spec_ymin_box, snap.spec_ysource === :auto ? "" : string(first(snap.spec_ylimits)))
+            set_box_text!(spec_ymax_box, snap.spec_ysource === :auto ? "" : string(last(snap.spec_ylimits)))
+            if snap.use_manual
+                clims_manual[] = snap.clims_manual
+                use_manual[] = true
+                set_box_text!(clim_min_box, string(first(snap.clims_manual)))
+                set_box_text!(clim_max_box, string(last(snap.clims_manual)))
+            else
+                use_manual[] = false
+                set_box_text!(clim_min_box, "")
+                set_box_text!(clim_max_box, "")
+            end
+            _refresh_hist_axes!()
+            _refresh_spec_ylim!()
+        end
+        nothing
+    end
+    on(btn_undo.clicks) do _
+        snap = undo!(_hpc_undo_stack)
+        snap === nothing && (_hpc_status!("Nothing to undo."); return)
+        _apply_hpc_snap!(snap)
+        _hpc_status!("Undo.")
+    end
+    on(btn_redo.clicks) do _
+        snap = redo!(_hpc_undo_stack)
+        snap === nothing && (_hpc_status!("Nothing to redo."); return)
+        _apply_hpc_snap!(snap)
+        _hpc_status!("Redo.")
+    end
     function clear_region!()
         region_ipix[] = Int[]
         region_start[] = Point2f(NaN32, NaN32)
@@ -1143,10 +1358,10 @@ function _view_healpix_cube(
         sel === nothing && return
         new_mode = Symbol(sel)
         new_mode === scale_mode[] && return
-        # Les clims_manual étaient exprimées dans l'ancien espace (lin/log10/ln).
-        # Les invalider et vider les textboxes pour repartir en auto dans le
-        # nouvel espace — sinon le spectre et la colorbar restent bloqués sur
-        # des bornes incohérentes.
+        # clims_manual were expressed in the old scale space (lin/log10/ln).
+        # Invalidate them and clear the text boxes to restart in auto mode
+        # under the new scale — otherwise the spectrum and colorbar stay
+        # locked to stale, inconsistent bounds.
         if use_manual[]
             use_manual[] = false
         end
@@ -1426,18 +1641,17 @@ function _view_healpix_cube(
     end
 
     # init
-    update_spectrum!(max(1, npix ÷ 2))     # spectre par défaut au pixel central
+    update_spectrum!(max(1, npix ÷ 2))     # default spectrum at the central pixel
     _refresh_spec_ylim!()
     _refresh_hist_axes!()
 
-    # Espacement vertical : éloigne la ligne de contrôles des xticks du
-    # spectre pour éviter le chevauchement (ex: "j=41, v=80km/s" qui se
-    # superposait au tick "80").
+    # Extra vertical spacing: push the control row away from the spectrum
+    # xtick labels to avoid overlap (e.g. "j=41, v=80km/s" over tick "80").
     try
         rowgap!(main_grid, 2, 22)
         rowgap!(main_grid, 1, 6)
     catch
-        # rowgap! échoue si l'index est hors limites — silencieux.
+        # rowgap! fails silently when the index is out of range.
     end
 
     # ---------- Keyboard shortcuts (HEALPix PPV cube) ----------

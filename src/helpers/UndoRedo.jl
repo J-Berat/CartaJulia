@@ -8,12 +8,12 @@
 # A timed snapshot is cheaper to reason about than command inversion,
 # and trivially correct because we replay the whole tuple.
 #
-# The stack is bounded (`capacity = 64` by default) so memory stays predictable
-# even after thousands of UI interactions.
+# The stack is bounded (`capacity = UNDO_STACK_CAPACITY` by default) so memory
+# stays predictable even after thousands of UI interactions.
 #
 # Integration pattern:
 #
-#   state = UndoRedoStack{NamedTuple}(...; capacity = 64)
+#   state = UndoRedoStack{NamedTuple}(...)  # capacity defaults to UNDO_STACK_CAPACITY
 #   register_state!(state, (clims = ..., scale = :lin, axis = 3, slice = 1))
 #   # … user changes things …
 #   register_state!(state, (clims = ..., scale = :log10, axis = 3, slice = 1))
@@ -25,7 +25,7 @@
 # slider that fires 100 events per drag still produces a sensible history.
 
 """
-    UndoRedoStack{T}(; capacity = 64)
+    UndoRedoStack{T}(; capacity = UNDO_STACK_CAPACITY)
 
 Bounded snapshot history with an Observable cursor. Useful when wiring
 Ctrl-Z / Ctrl-Shift-Z into a Makie figure.
@@ -39,13 +39,13 @@ mutable struct UndoRedoStack{T}
     suppress::Bool                 # internal: ignore register_state! when replaying
 end
 
-function UndoRedoStack{T}(; capacity::Integer = 64) where {T}
+function UndoRedoStack{T}(; capacity::Integer = UNDO_STACK_CAPACITY) where {T}
     capacity > 0 || throw(ArgumentError("capacity must be positive"))
     UndoRedoStack{T}(T[], 0, Int(capacity),
                      Observable(false), Observable(false), false)
 end
 
-UndoRedoStack(initial::T; capacity::Integer = 64) where {T} =
+UndoRedoStack(initial::T; capacity::Integer = UNDO_STACK_CAPACITY) where {T} =
     (s = UndoRedoStack{T}(; capacity); register_state!(s, initial); s)
 
 "Number of recorded snapshots."

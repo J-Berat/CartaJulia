@@ -270,33 +270,32 @@ function _cube_export_bundle!(;
                     CairoMakie.contour!(axS, slice_disp[];
                                         levels    = contour_levels_obs[],
                                         color     = contour_colors_obs[],
-                                        linewidth = 1.2)
+                                        linewidth = CONTOUR_LW)
                 end
                 axS.xgridvisible[] = show_grid[]
                 axS.ygridvisible[] = show_grid[]
                 if show_crosshair[]
                     u_max, v_max = slice_dims(axis[])
                     u, v = u_idx[], v_idx[]
-                    CairoMakie.linesegments!(
-                        axS,
-                        Point2f[
-                            Point2f(1, u), Point2f(v_max, u),
-                            Point2f(v, 1), Point2f(v, u_max),
-                        ];
-                        color     = (:white, 0.9),
-                        linewidth = 1.6,
-                        linestyle = :dot,
-                    )
+                    _ch_segs = Point2f[
+                        Point2f(1, u), Point2f(v_max, u),
+                        Point2f(v, 1), Point2f(v, u_max),
+                    ]
+                    # Halo noir + trait blanc fin (cohérent avec la vue interactive).
+                    CairoMakie.linesegments!(axS, _ch_segs;
+                        color = (:black, CROSSHAIR_ALPHA_DARK),  linewidth = CROSSHAIR_LW_DARK,  linestyle = :solid)
+                    CairoMakie.linesegments!(axS, _ch_segs;
+                        color = (:white, CROSSHAIR_ALPHA_LIGHT), linewidth = CROSSHAIR_LW_LIGHT, linestyle = :solid)
                 end
                 if show_marker[]
-                    CairoMakie.scatter!(axS, [Point2f(uv_point[]...)], markersize = 10)
+                    CairoMakie.scatter!(axS, [Point2f(uv_point[]...)], markersize = MARKER_SIZE)
                 end
                 if !isempty(region_uvs[])
                     CairoMakie.lines!(
                         axS,
                         region_segments_from_points(region_start[], region_end[], region_shape[]);
                         color     = (RGBf(1.0, 0.78, 0.18), 0.98),
-                        linewidth = 2.4,
+                        linewidth = REGION_LW,
                     )
                 end
                 CairoMakie.Colorbar(

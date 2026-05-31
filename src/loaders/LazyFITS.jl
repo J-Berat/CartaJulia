@@ -20,6 +20,15 @@
 # long-lived handle: FITSIO's `FITS` object is not safe to share across
 # tasks, and the viewer is heavily Observable-driven (so reads happen
 # from inside `lift` closures on the main thread).
+#
+# Async prefetch:
+#   Call `prefetch_slice!(L, axis, idx)` right after `read_slice!` to start
+#   loading the next slice in the background via `@async`. The next
+#   `read_slice!` call for that (axis, idx) pair will `take!` the ready
+#   result instead of hitting disk again, shaving the full read latency.
+#   The design assumes single-threaded cooperative scheduling (the default
+#   Julia runtime). If MANTA is ever moved to `Threads.@spawn`, a
+#   `ReentrantLock` guard will be needed around the prefetch fields.
 
 using FITSIO
 
@@ -59,11 +68,18 @@ mutable struct LazyFITSCube{T<:Real} <: AbstractLazyFITS{T,3}
     cache_axis::Int
     cache_idx::Int
     cache_data::Union{Nothing, Matrix{T}}
+    # Async prefetch state.
+    # `prefetch_ch` holds a Channel{Matrix{T}}(1) that the background task will
+    # `put!` its result into. The key (prefetch_axis, prefetch_idx) identifies
+    # which slice is being loaded. Set to `nothing` when no prefetch is pending.
+    prefetch_axis::Int
+    prefetch_idx::Int
+    prefetch_ch::Union{Nothing, Channel{Matrix{T}}}
 end
 
 function LazyFITSCube{T}(path::AbstractString, hdu::Integer,
                          sz::NTuple{3,Integer}) where {T<:Real}
-    LazyFITSCube{T}(String(path), Int(hdu), Int.(sz), 0, 0, nothing)
+    LazyFITSCube{T}(String(path), Int(hdu), Int.(sz), 0, 0, nothing, 0, 0, nothing)
 end
 
 Base.size(L::LazyFITSCube) = L.sz
@@ -76,19 +92,11 @@ function Base.getindex(L::LazyFITSCube{T}, i::Int, j::Int, k::Int) where {T}
     end
 end
 
-"""
-    read_slice!(L::LazyFITSCube, axis, idx) -> Matrix
-
-Materialise a single 2D slice along `axis` (1, 2, or 3) at index `idx`.
-Cached internally so the viewer can hover/zoom without hitting disk.
-"""
-function read_slice!(L::LazyFITSCube{T}, axis::Integer, idx::Integer) where {T}
-    a, k = Int(axis), Int(idx)
-    if a == L.cache_axis && k == L.cache_idx && L.cache_data !== nothing
-        return L.cache_data
-    end
+# Private: open the FITS file and read exactly the requested slice.
+# Called both by `read_slice!` (synchronous path) and the prefetch task.
+function _read_slice_raw(L::LazyFITSCube{T}, a::Int, k::Int) where {T}
     nx, ny, nz = L.sz
-    slice = FITS(L.path) do f
+    return FITS(L.path) do f
         if a == 1
             1 <= k <= nx || throw(BoundsError(L, (k, :, :)))
             raw = read(f[L.hdu], k:k, 1:ny, 1:nz)
@@ -105,10 +113,111 @@ function read_slice!(L::LazyFITSCube{T}, axis::Integer, idx::Integer) where {T}
             throw(ArgumentError("axis must be 1, 2 or 3, got $(a)"))
         end
     end
+end
+
+"""
+    read_slice!(L::LazyFITSCube, axis, idx) -> Matrix
+
+Materialise a single 2D slice along `axis` (1, 2, or 3) at index `idx`.
+Result is cached so the viewer can hover/zoom without hitting disk.
+
+If `prefetch_slice!` was called earlier for the same `(axis, idx)`, the
+background load is awaited and the ready result is returned directly —
+avoiding the full synchronous disk read latency.
+"""
+function read_slice!(L::LazyFITSCube{T}, axis::Integer, idx::Integer) where {T}
+    a, k = Int(axis), Int(idx)
+
+    # 1. Cache hit — free.
+    if a == L.cache_axis && k == L.cache_idx && L.cache_data !== nothing
+        return L.cache_data
+    end
+
+    # 2. Prefetch hit — the background task is already loading (or has loaded)
+    #    exactly this slice.  `take!` blocks until the result arrives (usually
+    #    it is already there by the time the user moves to the next slice).
+    slice = if a == L.prefetch_axis && k == L.prefetch_idx &&
+               L.prefetch_ch !== nothing
+        ch = L.prefetch_ch
+        L.prefetch_ch = nothing   # consume the channel; clear the slot
+        if isopen(ch)
+            try
+                take!(ch)
+            catch
+                # The background task failed (e.g. I/O error). Fall back.
+                _read_slice_raw(L, a, k)
+            end
+        else
+            # Channel was closed before being filled — fall back.
+            _read_slice_raw(L, a, k)
+        end
+    else
+        # 3. Cold path — cancel any stale prefetch and read synchronously.
+        if L.prefetch_ch !== nothing
+            close(L.prefetch_ch)
+            L.prefetch_ch = nothing
+        end
+        _read_slice_raw(L, a, k)
+    end
+
     L.cache_axis = a
     L.cache_idx  = k
     L.cache_data = slice
     return slice
+end
+
+"""
+    prefetch_slice!(L::LazyFITSCube, axis, idx)
+
+Start loading the slice at `(axis, idx)` in the background so that the next
+`read_slice!(L, axis, idx)` call can return immediately without waiting for
+disk I/O.  Safe to call speculatively: if the slice is already cached, or a
+prefetch for the same key is already in flight, this is a no-op.
+
+Typical usage in a CubeView `on` callback:
+
+```julia
+slice = read_slice!(cube, axis, k)
+prefetch_slice!(cube, axis, k + 1)   # speculatively load next channel
+```
+"""
+function prefetch_slice!(L::LazyFITSCube{T},
+                         axis::Integer, idx::Integer) where {T}
+    a, k = Int(axis), Int(idx)
+
+    # Bounds check — avoid launching a task that will immediately throw.
+    a in (1, 2, 3) || return nothing
+    1 <= k <= L.sz[a] || return nothing
+
+    # Already cached — nothing to do.
+    a == L.cache_axis && k == L.cache_idx && L.cache_data !== nothing &&
+        return nothing
+
+    # Already prefetching the same slice — nothing to do.
+    if a == L.prefetch_axis && k == L.prefetch_idx && L.prefetch_ch !== nothing
+        return nothing
+    end
+
+    # Cancel any previous (now stale) prefetch.
+    if L.prefetch_ch !== nothing
+        close(L.prefetch_ch)
+    end
+
+    ch = Channel{Matrix{T}}(1)
+    L.prefetch_axis = a
+    L.prefetch_idx  = k
+    L.prefetch_ch   = ch
+
+    @async begin
+        try
+            put!(ch, _read_slice_raw(L, a, k))
+        catch
+            # Silently close; `read_slice!` will fall back to the sync path.
+            isopen(ch) && close(ch)
+        end
+    end
+
+    return nothing
 end
 
 """
@@ -166,7 +275,7 @@ function open_lazy_fits(path::AbstractString; hdu::Integer = 1)
             tuple(Int.(size(h))...)
         catch e
             rethrow_actionable(e, path;
-                format_hint = "L'HDU #$(hdu) ne semble pas être une ImageHDU.")
+                format_hint = "HDU #$(hdu) does not appear to be an ImageHDU.")
         end
     end
     if length(dims) == 2
@@ -175,11 +284,232 @@ function open_lazy_fits(path::AbstractString; hdu::Integer = 1)
         return (header, LazyFITSCube{eltype_T}(String(path), Int(hdu), dims), n_hdus)
     else
         throw(DatasetShapeError(
-            "le chargement lazy ne supporte que les images 2D et cubes 3D " *
-            "(HDU #$(hdu) dans $(path) a $(length(dims)) dimensions).",
-            "Désactive `lazy = true` ou choisis une autre HDU."))
+            "lazy loading only supports 2D images and 3D cubes " *
+            "(HDU #$(hdu) in $(path) has $(length(dims)) dimensions).",
+            "Disable `lazy = true` or choose a different HDU."))
     end
 end
 
+# ---- MANTA helper overrides for lazy types ----------------------------
+#
+# All four overrides live here (rather than in the helpers/ files) because
+# `AbstractLazyFITS` is only in scope *after* the loaders are included.
+# helpers/ is included first, so adding the methods there would require a
+# forward declaration of the type — this is the cleaner alternative.
+
+# 1. as_float32 --------------------------------------------------------
+#
+# `as_float32(::AbstractArray)` in UIBits.jl calls `Array{Float32}(x)` /
+# `Float32.(x)`, both of which materialise the whole array.
+# `LazyFITSCube{Float32}` / `LazyFITSImage{Float32}` already satisfy the
+# `AbstractArray{Float32}` contract the viewer needs — no copy required.
+as_float32(x::AbstractLazyFITS) = x
+
+# 2. Spectrum-shaped Base.view -----------------------------------------
+#
+# `@views data[i, j, :]` (and its axis-1/axis-2 siblings) in
+# SpectrumBundle.jl and CubeView.jl's init block dispatch to
+# `Base.view(data, i, j, Colon())`.  Without these methods the fallback
+# constructs a `SubArray` that calls `getindex` once per channel —
+# O(n_channels) file opens for a single spectrum.  Each method below
+# issues exactly ONE FITSIO `read` call.
+Base.view(L::LazyFITSCube{T}, i::Int, j::Int, ::Colon) where {T} =
+    FITS(L.path) do f
+        Vector{T}(vec(read(f[L.hdu], i:i, j:j, 1:L.sz[3])))
+    end
+Base.view(L::LazyFITSCube{T}, i::Int, ::Colon, k::Int) where {T} =
+    FITS(L.path) do f
+        Vector{T}(vec(read(f[L.hdu], i:i, 1:L.sz[2], k:k)))
+    end
+Base.view(L::LazyFITSCube{T}, ::Colon, j::Int, k::Int) where {T} =
+    FITS(L.path) do f
+        Vector{T}(vec(read(f[L.hdu], 1:L.sz[1], j:j, k:k)))
+    end
+
+# 3. moment_map (slice-first) ------------------------------------------
+#
+# The generic `moment_map` calls `_channel_value(data, axis, u, v, c)`
+# which is a single-element `getindex` — O(nx·ny·n_channels) file opens.
+# This override iterates channels in the outer loop and reads one 2-D
+# slice per channel: O(n_channels) opens, O(nx·ny) peak memory.
+#
+# nsigma + sigma=nothing note:
+#   Per-pixel robust-σ estimation (MAD) requires the full spectrum per
+#   pixel, which brings us back to O(nx·ny·nz) reads.  When `nsigma` is
+#   requested without an explicit `sigma`, we fall back to the absolute
+#   `threshold` and emit a warning so the caller knows.
+function moment_map(
+    data::AbstractLazyFITS{T,3},
+    axis::Integer,
+    order::Integer;
+    coords    = collect(Float32, 1:size(data, axis)),
+    channels  = 1:size(data, axis),
+    threshold = 0.0,
+    nsigma    = nothing,
+    sigma     = nothing,
+    dx        = nothing,
+    mask::Union{Nothing,AbstractArray{Bool,3}} = nothing,
+) where {T}
+    1 <= axis <= 3 || throw(ArgumentError("axis must be 1, 2, or 3"))
+    order in (0, 1, 2) || throw(ArgumentError("moment order must be 0, 1, or 2"))
+    if mask !== nothing && size(mask) != size(data)
+        throw(DimensionMismatch(
+            "mask size $(size(mask)) must match data size $(size(data))"))
+    end
+
+    u_max, v_max = axis == 1 ? (size(data, 2), size(data, 3)) :
+                   axis == 2 ? (size(data, 1), size(data, 3)) :
+                               (size(data, 1), size(data, 2))
+    out      = fill(NaN32, u_max, v_max)
+    chan_vec = [c for c in channels if 1 <= c <= size(data, axis)]
+    isempty(chan_vec) && return out
+
+    x      = Float32[Float32(coords[c]) for c in chan_vec]
+    widths = _channel_widths(x, dx)
+
+    # Threshold resolution.
+    thr = if nsigma !== nothing && sigma !== nothing
+        Float64(nsigma) * Float64(sigma)
+    elseif nsigma !== nothing
+        @warn "moment_map on lazy FITS: `nsigma` without explicit `sigma` falls " *
+              "back to absolute `threshold=$(threshold)` (per-pixel MAD estimation " *
+              "would require O(nx·ny·nz) file opens). Pass `sigma=<value>` to " *
+              "enable σ-clipping with lazy data."
+        Float64(threshold)
+    else
+        Float64(threshold)
+    end
+
+    # Float64 accumulators for M0 and M1.
+    acc0    = zeros(Float64, u_max, v_max)
+    acc1    = zeros(Float64, u_max, v_max)
+    any_hit = falses(u_max, v_max)
+    m1_map  = zeros(Float64, u_max, v_max)   # filled in if order >= 1
+
+    # ---- Pass 1: M0 (and M1 for order ≥ 1) ---- #
+    for (n, c) in pairs(chan_vec)
+        s  = get_slice_view(data, axis, c)   # one FITSIO read via read_slice!
+        xi = Float64(x[n])
+        wi = Float64(widths[n])
+        @inbounds for v in 1:v_max
+            for u in 1:u_max
+                if mask !== nothing
+                    mval = if axis == 1; mask[c, u, v]
+                           elseif axis == 2; mask[u, c, v]
+                           else; mask[u, v, c]; end
+                    mval || continue
+                end
+                yi = Float64(Float32(s[u, v]))
+                if isfinite(yi) && yi > thr
+                    any_hit[u, v] = true
+                    acc0[u, v]   += yi * wi
+                    order >= 1 && (acc1[u, v] += yi * xi * wi)
+                end
+            end
+        end
+    end
+
+    if order == 0
+        @inbounds for v in 1:v_max, u in 1:u_max
+            any_hit[u, v] && acc0[u, v] != 0.0 &&
+                (out[u, v] = Float32(acc0[u, v]))
+        end
+        return out
+    end
+
+    @inbounds for v in 1:v_max, u in 1:u_max
+        if any_hit[u, v] && acc0[u, v] != 0.0
+            m1_map[u, v] = acc1[u, v] / acc0[u, v]
+        end
+    end
+
+    if order == 1
+        @inbounds for v in 1:v_max, u in 1:u_max
+            any_hit[u, v] && acc0[u, v] != 0.0 &&
+                (out[u, v] = Float32(m1_map[u, v]))
+        end
+        return out
+    end
+
+    # ---- Pass 2: M2 dispersion ---- #
+    acc2 = zeros(Float64, u_max, v_max)
+    for (n, c) in pairs(chan_vec)
+        s  = get_slice_view(data, axis, c)
+        xi = Float64(x[n])
+        wi = Float64(widths[n])
+        @inbounds for v in 1:v_max
+            for u in 1:u_max
+                if mask !== nothing
+                    mval = if axis == 1; mask[c, u, v]
+                           elseif axis == 2; mask[u, c, v]
+                           else; mask[u, v, c]; end
+                    mval || continue
+                end
+                yi = Float64(Float32(s[u, v]))
+                if isfinite(yi) && yi > thr && any_hit[u, v] && acc0[u, v] != 0.0
+                    acc2[u, v] += yi * (xi - m1_map[u, v])^2 * wi
+                end
+            end
+        end
+    end
+    @inbounds for v in 1:v_max, u in 1:u_max
+        if any_hit[u, v] && acc0[u, v] != 0.0
+            m2_2 = acc2[u, v] / acc0[u, v]
+            out[u, v] = m2_2 >= 0.0 ? Float32(sqrt(m2_2)) : NaN32
+        end
+    end
+    return out
+end
+
+# 4. mean_region_spectrum (slice-first) --------------------------------
+#
+# The generic version iterates `for chan in 1:n, (u,v) in uv_indices` and
+# calls `data[u, v, chan]` — O(n_channels · |region|) file opens.
+# This override reads one slice per channel: O(n_channels) opens.
+function mean_region_spectrum(
+    data::AbstractLazyFITS{T,3},
+    axis::Integer,
+    uv_indices;
+    mask::Union{Nothing,AbstractArray{Bool,3}} = nothing,
+) where {T}
+    1 <= axis <= 3 || throw(ArgumentError("axis must be 1, 2, or 3"))
+    if mask !== nothing && size(mask) != size(data)
+        throw(DimensionMismatch(
+            "mean_region_spectrum: mask size $(size(mask)) does not match data size $(size(data))"))
+    end
+    n = size(data, axis)
+    y = fill(Float32(NaN), n)
+    isempty(uv_indices) && return y
+
+    @inbounds for chan in 1:n
+        s   = get_slice_view(data, axis, chan)   # one FITSIO read
+        acc = 0.0
+        cnt = 0
+        if mask === nothing
+            for (u, v) in uv_indices
+                fv = Float32(s[u, v])
+                if isfinite(fv)
+                    acc += Float64(fv)
+                    cnt += 1
+                end
+            end
+        else
+            for (u, v) in uv_indices
+                mval = if axis == 1; mask[chan, u, v]
+                       elseif axis == 2; mask[u, chan, v]
+                       else; mask[u, v, chan]; end
+                mval || continue
+                fv = Float32(s[u, v])
+                if isfinite(fv)
+                    acc += Float64(fv)
+                    cnt += 1
+                end
+            end
+        end
+        y[chan] = cnt == 0 ? Float32(NaN) : Float32(acc / cnt)
+    end
+    return y
+end
+
 export LazyFITSImage, LazyFITSCube, AbstractLazyFITS
-export read_slice!, read_spectrum, open_lazy_fits
+export read_slice!, prefetch_slice!, read_spectrum, open_lazy_fits

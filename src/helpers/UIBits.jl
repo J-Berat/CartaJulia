@@ -7,8 +7,9 @@
 # (`get_box_str`), figure-size / screen detection
 # (`_DEFAULT_FIG_SIZE`, `_MIN_FIG_SIZE`, `_detect_screen_size`,
 # `_pick_fig_size`, `_axis_render_height`), input validation parsers
-# (`parse_manual_clims`, `parse_histogram_bins`, `parse_histogram_xlimits`,
-# `parse_histogram_ylimits`, `parse_spectrum_ylimits`, `parse_gif_request`)
+# (`parse_textbox`, `parse_manual_clims`, `parse_histogram_bins`,
+# `parse_histogram_xlimits`, `parse_histogram_ylimits`,
+# `parse_spectrum_ylimits`, `parse_gif_request`)
 # and viewer settings TOML I/O (`save_viewer_settings`,
 # `load_viewer_settings`). Extracted from helpers/Helpers.jl.
 
@@ -173,7 +174,45 @@ function to_cmap(name::Union{Symbol,String})
     return Makie.to_colormap(cmap_name)
 end
 
-const MANTA_COLORMAP_OPTIONS = ("viridis", "cividis", "magma", "inferno", "plasma", "gray")
+############################
+# Micro-icons
+############################
+
+"""
+    MANTA_ICONS
+
+Unicode micro-icons for UI labels and button prefixes.
+All code-points are in the Basic Multilingual Plane and covered by
+DejaVu Sans (GLMakie's bundled font).
+
+| key       | char | meaning                              |
+|-----------|------|--------------------------------------|
+| save      | ⬇   | downward arrow → write to disk       |
+| contrast  | ◐   | circle left-half black → half-tone   |
+| selection | ⊕   | circled plus → crosshair / target    |
+| histogram | ▂▄▇ | ascending blocks → bar chart profile |
+| mask      | ⊟   | squared minus → stencil / filter     |
+"""
+const MANTA_ICONS = (
+    save      = "⬇",    # U+2B07
+    contrast  = "◐",    # U+25D0
+    selection = "⊕",    # U+2295
+    histogram = "▂▄▇",  # U+2582 U+2584 U+2587
+    mask      = "⊟",    # U+229F
+)
+
+# Core sequential / perceptual colormaps.
+# "okabe_ito" — 8-colour Okabe-Ito palette (colorblind-safe, ColorSchemes.jl).
+# "tab10"     — Tableau-10 palette (colorblind-safe), registered in Makie's
+#               gradient registry under the matplotlib-compatible alias :tab10.
+#               (ColorSchemes.jl's "tableau_10_medium" is *not* in Makie's
+#               gradient registry and would error via to_colormap(::Symbol).)
+# Both are categorical by origin but Makie interpolates them smoothly when
+# used as continuous colormaps, which works well for 2-D intensity maps.
+const MANTA_COLORMAP_OPTIONS = (
+    "viridis", "cividis", "magma", "inferno", "plasma", "gray",
+    "okabe_ito", "tab10",
+)
 
 ui_colormap_options() = collect(MANTA_COLORMAP_OPTIONS)
 
@@ -334,42 +373,48 @@ end
 ############################
 
 """
+    parse_textbox(s; type, fallback[, hint_ok, hint_empty, hint_fail])
+      -> (ok::Bool, value::T, hint::String)
+
+Single-field textbox parser: strip → empty-check → `tryparse`.
+
+| input      | `ok`  | `value`    | `hint`       |
+|------------|-------|------------|--------------|
+| empty      | true  | `fallback` | `hint_empty` |
+| bad parse  | false | `fallback` | `hint_fail`  |
+| good parse | true  | parsed     | `hint_ok`    |
+
+Leave `hint_ok` at its default `""` when the caller builds the final
+message from the returned value; the empty-vs-success branch can then be
+detected by `isempty(hint)` on an `ok == true` result.
+"""
+function parse_textbox(
+    s::AbstractString;
+    type::Type{T},
+    fallback::T,
+    hint_ok::AbstractString    = "",
+    hint_empty::AbstractString = "Value unchanged.",
+    hint_fail::AbstractString  = "Invalid number.",
+) where {T}
+    raw = strip(String(s))
+    isempty(raw) && return (true, fallback, String(hint_empty))
+    val = tryparse(T, raw)
+    val === nothing && return (false, fallback, String(hint_fail))
+    return (true, val, String(hint_ok))
+end
+
+"""
     parse_manual_clims(min_txt, max_txt; fallback=(0f0, 1f0))
       -> (ok, use_manual, clims, message)
 
 Validate and normalize user-provided contrast limits.
 """
-function parse_manual_clims(
+parse_manual_clims(
     min_txt::AbstractString,
     max_txt::AbstractString;
-    fallback::Tuple{Float32,Float32} = (0f0, 1f0)
-)
-    smin = strip(String(min_txt))
-    smax = strip(String(max_txt))
-    if isempty(smin) && isempty(smax)
-        return (true, false, fallback, "Automatic contrast enabled.")
-    end
-    if isempty(smin) ⊻ isempty(smax)
-        return (false, false, fallback, "Fill both min and max, or clear both for auto mode.")
-    end
-    vmin = tryparse(Float32, smin)
-    vmax = tryparse(Float32, smax)
-    if vmin === nothing || vmax === nothing
-        return (false, false, fallback, "Contrast limits must be valid numbers.")
-    end
-    lo = Float32(vmin)
-    hi = Float32(vmax)
-    if lo > hi
-        lo, hi = hi, lo
-        return (true, true, (lo, hi), "Contrast limits were swapped because min > max.")
-    end
-    if lo == hi
-        lo = prevfloat(lo)
-        hi = nextfloat(hi)
-        return (true, true, (lo, hi), "Expanded equal min/max contrast limits to avoid zero width.")
-    end
-    return (true, true, (lo, hi), "Manual contrast applied.")
-end
+    fallback::Tuple{Float32,Float32} = (0f0, 1f0),
+) = _parse_axis_limits(min_txt, max_txt;
+        fallback = fallback, axis_name = "contrast", check_finite = false)
 
 """
     parse_histogram_bins(txt; fallback=64, min_bins=4, max_bins=512)
@@ -383,16 +428,16 @@ function parse_histogram_bins(
     min_bins::Int = 4,
     max_bins::Int = 512,
 )
-    s = strip(String(txt))
-    isempty(s) && return (true, clamp(fallback, min_bins, max_bins), "Histogram bin count unchanged.")
-    parsed = tryparse(Int, s)
-    if parsed === nothing
-        return (false, fallback, "Histogram bins must be an integer.")
-    end
-    bins = clamp(parsed, min_bins, max_bins)
-    if bins != parsed
-        return (true, bins, "Histogram bins were clamped to $(bins).")
-    end
+    ok, raw, msg = parse_textbox(String(txt);
+        type       = Int,
+        fallback   = fallback,
+        hint_empty = "Histogram bin count unchanged.",
+        hint_fail  = "Histogram bins must be an integer.",
+    )
+    ok || return (false, fallback, msg)
+    isempty(msg) || return (true, clamp(fallback, min_bins, max_bins), msg)  # empty input
+    bins = clamp(raw, min_bins, max_bins)
+    bins != raw && return (true, bins, "Histogram bins were clamped to $(bins).")
     return (true, bins, "Histogram bins set to $(bins).")
 end
 
@@ -403,46 +448,21 @@ end
 Validate user-provided histogram x-axis limits. Empty fields restore automatic
 limits, which follow the current color scale limits.
 """
-function parse_histogram_xlimits(
+parse_histogram_xlimits(
     min_txt::AbstractString,
     max_txt::AbstractString;
     fallback::Tuple{Float32,Float32} = (0f0, 1f0),
-)
-    smin = strip(String(min_txt))
-    smax = strip(String(max_txt))
-    if isempty(smin) && isempty(smax)
-        return (true, false, fallback, "Automatic histogram x-axis enabled.")
-    end
-    if isempty(smin) ⊻ isempty(smax)
-        return (false, false, fallback, "Fill both histogram x min and max, or clear both for auto mode.")
-    end
-    xmin = tryparse(Float32, smin)
-    xmax = tryparse(Float32, smax)
-    if xmin === nothing || xmax === nothing
-        return (false, false, fallback, "Histogram x-axis limits must be valid numbers.")
-    end
-    lo = Float32(xmin)
-    hi = Float32(xmax)
-    if !(isfinite(lo) && isfinite(hi))
-        return (false, false, fallback, "Histogram x-axis limits must be finite numbers.")
-    end
-    if lo > hi
-        lo, hi = hi, lo
-        return (true, true, (lo, hi), "Histogram x-axis limits were swapped because min > max.")
-    end
-    if lo == hi
-        lo = prevfloat(lo)
-        hi = nextfloat(hi)
-        return (true, true, (lo, hi), "Expanded equal histogram x-axis limits to avoid zero width.")
-    end
-    return (true, true, (lo, hi), "Manual histogram x-axis applied.")
-end
+) = _parse_axis_limits(min_txt, max_txt; fallback = fallback, axis_name = "histogram x-axis")
 
+# Generic backend shared by all axis-limit parsers (xlimits / ylimits /
+# spectrum ylimits / contrast clims). Pass `check_finite = false` for cases
+# where ±Inf inputs should not be rejected outright (e.g. contrast limits).
 function _parse_axis_limits(
     min_txt::AbstractString,
     max_txt::AbstractString;
     fallback::Tuple{Float32,Float32} = (0f0, 1f0),
     axis_name::AbstractString = "axis",
+    check_finite::Bool = true,
 )
     smin = strip(String(min_txt))
     smax = strip(String(max_txt))
@@ -452,19 +472,18 @@ function _parse_axis_limits(
     if isempty(smin) ⊻ isempty(smax)
         return (false, false, fallback, "Fill both $(axis_name) min and max, or clear both for auto mode.")
     end
-    vmin = tryparse(Float32, smin)
-    vmax = tryparse(Float32, smax)
-    if vmin === nothing || vmax === nothing
-        return (false, false, fallback, "$(axis_name) limits must be valid numbers.")
-    end
-    lo = Float32(vmin)
-    hi = Float32(vmax)
-    if !(isfinite(lo) && isfinite(hi))
-        return (false, false, fallback, "$(axis_name) limits must be finite numbers.")
+    # Both non-empty: parse each field through the common combinator.
+    name     = uppercasefirst(axis_name)
+    fail_msg = "$(name) limits must be valid numbers."
+    ok_lo, lo, _ = parse_textbox(smin; type = Float32, fallback = fallback[1], hint_fail = fail_msg)
+    ok_hi, hi, _ = parse_textbox(smax; type = Float32, fallback = fallback[2], hint_fail = fail_msg)
+    (ok_lo && ok_hi) || return (false, false, fallback, fail_msg)
+    if check_finite && !(isfinite(lo) && isfinite(hi))
+        return (false, false, fallback, "$(name) limits must be finite numbers.")
     end
     if lo > hi
         lo, hi = hi, lo
-        return (true, true, (lo, hi), "$(axis_name) limits were swapped because min > max.")
+        return (true, true, (lo, hi), "$(name) limits were swapped because min > max.")
     end
     if lo == hi
         lo = prevfloat(lo)
@@ -510,13 +529,18 @@ function parse_gif_request(
 )
     amax < 1 && return (false, Int[], 12, "Cannot export GIF: axis length must be >= 1.")
 
-    parse_int_or_default(txt::AbstractString, default::Int) =
-        isempty(strip(txt)) ? default : something(tryparse(Int, strip(txt)), typemin(Int))
+    # Parse a single integer GIF field: empty → use default; bad parse → typemin(Int) sentinel.
+    function _gif_field(txt::AbstractString, default::Int)
+        raw = strip(txt)
+        isempty(raw) && return default
+        _, val, _ = parse_textbox(raw; type = Int, fallback = typemin(Int))
+        return val
+    end
 
-    startv = parse_int_or_default(start_txt, 1)
-    stopv  = parse_int_or_default(stop_txt, amax)
-    stepv  = parse_int_or_default(step_txt, 1)
-    fpsv   = parse_int_or_default(fps_txt, 12)
+    startv = _gif_field(start_txt, 1)
+    stopv  = _gif_field(stop_txt, amax)
+    stepv  = _gif_field(step_txt, 1)
+    fpsv   = _gif_field(fps_txt, 12)
 
     if startv == typemin(Int) || stopv == typemin(Int) || stepv == typemin(Int) || fpsv == typemin(Int)
         return (false, Int[], 12, "GIF fields must be integers.")
