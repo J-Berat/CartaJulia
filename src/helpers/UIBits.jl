@@ -68,8 +68,11 @@ make_spec_title(i::Int, j::Int, k::Int) =
 Inline format; no line breaks to keep layout stable.
 """
 make_info_tex(i::Int, j::Int, k::Int, u::Int, v::Int, val::Real) = latexstring(
-    "\\mathbf{pixel}\\,(i,j,k)=($i,$j,$k)\\quad\\mathbf{slice}\\,(\\text{row},\\text{col})=($u,$v)\\quad\\mathbf{intensity}= ",
-    isnan(val) ? "NaN" : string(round(Float32(val); digits=4))
+    "\\mathrm{pixel}\\,(i,j,k)=\\mathbf{($i,$j,$k)}\\quad",
+    "\\mathrm{slice}\\,(\\mathrm{row},\\mathrm{col})=\\mathbf{($u,$v)}\\quad",
+    "\\mathrm{intensity}=\\mathbf{",
+    isnan(val) ? "NaN" : string(round(Float32(val); digits=4)),
+    "}"
 )
 
 """
@@ -187,6 +190,14 @@ DejaVu Sans (GLMakie's bundled font).
 
 | key       | char | meaning                              |
 |-----------|------|--------------------------------------|
+| nav       | ⌖   | position marker → navigation         |
+| analysis  | ◐   | half-tone circle → analysis          |
+| export_icon | ⬇ | downward arrow → write to disk       |
+| help      | ?   | question mark → help                 |
+| undo      | ⟲   | counter-clockwise arrow → undo       |
+| redo      | ⟳   | clockwise arrow → redo               |
+| compare   | ⇄   | two-way arrows → A/B comparison      |
+| fit       | ⊡   | framed dot → fit view / fit control  |
 | save      | ⬇   | downward arrow → write to disk       |
 | contrast  | ◐   | circle left-half black → half-tone   |
 | selection | ⊕   | circled plus → crosshair / target    |
@@ -194,6 +205,14 @@ DejaVu Sans (GLMakie's bundled font).
 | mask      | ⊟   | squared minus → stencil / filter     |
 """
 const MANTA_ICONS = (
+    nav       = "⌖",    # U+2316
+    analysis  = "◐",    # U+25D0
+    export_icon = "⬇",  # U+2B07
+    help      = "?",     # U+003F
+    undo      = "⟲",    # U+27F2
+    redo      = "⟳",    # U+27F3
+    compare   = "⇄",    # U+21C4
+    fit       = "⊡",    # U+22A1
     save      = "⬇",    # U+2B07
     contrast  = "◐",    # U+25D0
     selection = "⊕",    # U+2295
@@ -201,20 +220,139 @@ const MANTA_ICONS = (
     mask      = "⊟",    # U+229F
 )
 
-# Core sequential / perceptual colormaps.
-# "okabe_ito" — 8-colour Okabe-Ito palette (colorblind-safe, ColorSchemes.jl).
-# "tab10"     — Tableau-10 palette (colorblind-safe), registered in Makie's
-#               gradient registry under the matplotlib-compatible alias :tab10.
-#               (ColorSchemes.jl's "tableau_10_medium" is *not* in Makie's
-#               gradient registry and would error via to_colormap(::Symbol).)
-# Both are categorical by origin but Makie interpolates them smoothly when
-# used as continuous colormaps, which works well for 2-D intensity maps.
+# Compact set of visually distinct colormaps for the in-view picker:
+# two sequential maps, grayscale, and one diverging map for signed residuals.
 const MANTA_COLORMAP_OPTIONS = (
-    "viridis", "cividis", "magma", "inferno", "plasma", "gray",
-    "okabe_ito", "tab10",
+    "viridis", "inferno", "gray", "coolwarm",
 )
 
 ui_colormap_options() = collect(MANTA_COLORMAP_OPTIONS)
+
+"""
+    ColormapSelector
+
+Compact visual colormap picker. It intentionally exposes a `selection`
+observable like Makie's `Menu`, so existing viewer callbacks can treat it as a
+drop-in replacement while the UI shows colormap swatches instead of names.
+"""
+struct ColormapSelector
+    selection::Observable{String}
+    height::Observable{Int}
+    width::Observable{Union{Nothing,Int}}
+    fontsize::Observable{Int}
+    textpadding::Observable{NTuple{4,Int}}
+    dropdown_arrow_size::Observable{Int}
+    layout::GridLayout
+end
+
+function _colormap_swatch!(layout, pos, name::AbstractString,
+                           selection::Observable{String}, theme;
+                           height::Int = 30)
+    ax = Axis(
+        layout[pos...];
+        backgroundcolor = theme.surface,
+        xgridvisible = false,
+        ygridvisible = false,
+        xticksvisible = false,
+        yticksvisible = false,
+        xticklabelsvisible = false,
+        yticklabelsvisible = false,
+        topspinevisible = false,
+        bottomspinevisible = false,
+        leftspinevisible = false,
+        rightspinevisible = false,
+        xautolimitmargin = (0, 0),
+        yautolimitmargin = (0, 0),
+        aspect = nothing,
+        height = height,
+    )
+    hidedecorations!(ax)
+    hidespines!(ax)
+
+    vals = reshape(Float32.(range(0, 1; length = 48)), 48, 1)
+    heatmap!(ax, range(0, 1; length = 49), [0, 1], vals;
+             colormap = to_cmap(name), colorrange = (0, 1))
+    xlims!(ax, 0, 1)
+    ylims!(ax, 0, 1)
+
+    border_color = lift(selection) do selected
+        selected == String(name) ? theme.accent : theme.border
+    end
+    border_width = lift(selection) do selected
+        selected == String(name) ? 2.2 : 0.8
+    end
+    lines!(ax, [0, 1, 1, 0, 0], [0, 0, 1, 1, 0];
+           color = border_color, linewidth = border_width)
+
+    on(ax.scene.events.mousebutton) do event
+        if event.button == Mouse.left &&
+           event.action == Mouse.release &&
+           Makie.is_mouseinside(ax.scene)
+            selection[] = String(name)
+            return Consume(true)
+        end
+        return Consume(false)
+    end
+
+    return ax
+end
+
+"""
+    colormap_selector!(parent; cmap = :viridis, width = nothing, compact = false,
+                       theme = current_ui_theme())
+
+Add a visual colormap selector to `parent`. The selected value is available as
+`selector.selection[]`, mirroring Makie's `Menu`.
+"""
+function colormap_selector!(parent;
+                            options = ui_colormap_options(),
+                            cmap::Union{Symbol,String} = :viridis,
+                            width::Union{Nothing,Int} = nothing,
+                            compact::Bool = false,
+                            theme = current_ui_theme())
+    names = String.(collect(options))
+    selected = String(cmap)
+    selected in names || (selected = first(names))
+
+    h = compact ? 30 : 34
+    gap = compact ? 2 : 3
+    ncols = length(names)
+    nrows = cld(length(names), ncols)
+    swatch_w = width === nothing ?
+        (compact ? 28 : 34) :
+        max(18, floor(Int, (width - gap * (ncols - 1)) / ncols))
+    swatch_h(total_h) = max(10, floor(Int, (total_h - gap * (nrows - 1)) / nrows))
+
+    layout = GridLayout(parent; alignmode = Inside())
+    colgap!(layout, gap)
+    rowgap!(layout, gap)
+
+    selection = Observable(selected)
+    height_obs = Observable(h)
+    for (i, name) in enumerate(names)
+        row = fld(i - 1, ncols) + 1
+        col = mod(i - 1, ncols) + 1
+        _colormap_swatch!(layout, (row, col), name, selection, theme; height = swatch_h(h))
+    end
+    function update_swatch_sizes!(new_height)
+        foreach(r -> rowsize!(layout, r, Fixed(swatch_h(new_height))), 1:nrows)
+        foreach(c -> colsize!(layout, c, Fixed(swatch_w)), 1:ncols)
+    end
+    update_swatch_sizes!(h)
+    on(height_obs) do new_height
+        update_swatch_sizes!(new_height)
+    end
+
+    return ColormapSelector(
+        selection,
+        height_obs,
+        Observable(width),
+        Observable(compact ? 13 : 14),
+        Observable(compact ? (8, 8, 5, 5) : (10, 10, 7, 7)),
+        Observable(compact ? 10 : 11),
+        layout,
+    )
+end
 
 """
     get_box_str(textbox) -> String
@@ -660,4 +798,141 @@ Read a viewer settings dict from TOML.
 """
 function load_viewer_settings(path::AbstractString)::Dict{String,Any}
     return Dict{String,Any}(TOML.parsefile(path))
+end
+
+############################
+# Startup defaults (~/.manta/defaults.toml)
+############################
+
+"""
+    manta_defaults_path() -> String
+
+Location of the optional user defaults file, `~/.manta/defaults.toml`. The
+`MANTA_DEFAULTS` environment variable overrides it (useful for tests and for
+site-wide configs).
+"""
+manta_defaults_path() =
+    get(ENV, "MANTA_DEFAULTS", joinpath(homedir(), ".manta", "defaults.toml"))
+
+"""
+    load_manta_defaults(path = manta_defaults_path()) -> Dict{Symbol,Any}
+
+Read the user's startup defaults from `path` (TOML). Returns an empty `Dict`
+when the file is absent. A malformed file is *not* fatal — it is reported via
+`@warn` and treated as empty so a typo never blocks the viewer from opening.
+Keys are returned as `Symbol`s so callers can match them against `manta`
+keyword names; values keep their TOML-native types (coerce at the call site
+with the `_manta_default_*` helpers).
+"""
+function load_manta_defaults(path::AbstractString = manta_defaults_path())::Dict{Symbol,Any}
+    out = Dict{Symbol,Any}()
+    isfile(path) || return out
+    parsed = try
+        TOML.parsefile(String(path))
+    catch e
+        @warn "MANTA: ignoring malformed defaults file" path=path exception=e
+        return out
+    end
+    for (k, v) in parsed
+        out[Symbol(k)] = v
+    end
+    return out
+end
+
+# Typed coercion helpers used at the `manta(...)` entry to apply file defaults
+# over keyword values. Each returns `current` unchanged when the key is absent
+# or the stored value cannot be coerced (so a bad entry degrades gracefully).
+function _manta_default_symbol(d::AbstractDict, key::Symbol, current)
+    haskey(d, key) || return current
+    v = d[key]
+    return v isa AbstractString ? Symbol(v) : (v isa Symbol ? v : current)
+end
+
+function _manta_default_bool(d::AbstractDict, key::Symbol, current)
+    haskey(d, key) || return current
+    v = d[key]
+    return v isa Bool ? v : current
+end
+
+function _manta_default_int(d::AbstractDict, key::Symbol, current)
+    haskey(d, key) || return current
+    v = d[key]
+    return v isa Integer ? Int(v) : current
+end
+
+function _manta_default_real(d::AbstractDict, key::Symbol, current)
+    haskey(d, key) || return current
+    v = d[key]
+    return v isa Real ? v : current
+end
+
+function _manta_default_string(d::AbstractDict, key::Symbol, current)
+    haskey(d, key) || return current
+    v = d[key]
+    return v isa AbstractString ? String(v) : current
+end
+
+# figsize is stored as a 2-element array [width, height] in TOML.
+function _manta_default_figsize(d::AbstractDict, key::Symbol, current)
+    haskey(d, key) || return current
+    v = d[key]
+    if v isa AbstractVector && length(v) == 2 && all(x -> x isa Integer, v)
+        return (Int(v[1]), Int(v[2]))
+    end
+    return current
+end
+
+############################
+# WCS sky graticule overlay (Makie)
+############################
+
+"""
+    draw_wcs_graticule!(ax, wcs, ni, nj; visible=true, n=6, line_color, linewidth) -> handle
+
+Overlay an iso-longitude / iso-latitude celestial graticule on a rectilinear
+2-D image axis whose pixel centres span `1:ni × 1:nj`. The lines are computed
+by contouring the per-pixel sky-coordinate grids from [`wcs_sky_grids`](@ref),
+which reuses the same WCS deprojection (`sky_world_coords`) as the cursor
+readout — so no separate inverse projection is needed. Meridians (constant
+longitude) are dotted and parallels (constant latitude) dashed.
+
+Returns a NamedTuple `(plots, lon_levels, lat_levels)`. Toggle visibility with
+[`set_wcs_graticule_visible!`](@ref). When `wcs` has no sky pair (or the field
+is degenerate) `plots` is empty and the call is a no-op overlay.
+
+Longitude wrap-around is handled by [`wcs_sky_grids`](@ref); all-sky `CAR`
+fields spanning the full 360° seam may still show one spurious meridian.
+"""
+function draw_wcs_graticule!(ax, wcs, ni::Integer, nj::Integer;
+        visible::Bool = true,
+        n::Integer = 6,
+        line_color = RGBAf(1, 1, 1, 0.35),
+        linewidth::Real = 0.9)
+    lon, lat = wcs_sky_grids(wcs, ni, nj)
+    lon_levels, lat_levels = wcs_graticule_levels(lon, lat; n = n)
+    xs = collect(1.0:Float64(ni))
+    ys = collect(1.0:Float64(nj))
+    plots = Any[]
+    if !isempty(lon_levels)
+        push!(plots, contour!(ax, xs, ys, lon; levels = lon_levels,
+            color = line_color, linewidth = linewidth,
+            linestyle = :dot, visible = visible))
+    end
+    if !isempty(lat_levels)
+        push!(plots, contour!(ax, xs, ys, lat; levels = lat_levels,
+            color = line_color, linewidth = linewidth,
+            linestyle = :dash, visible = visible))
+    end
+    return (plots = plots, lon_levels = lon_levels, lat_levels = lat_levels)
+end
+
+"""
+    set_wcs_graticule_visible!(graticule, visible::Bool) -> graticule
+
+Show / hide all line plots of a graticule handle returned by
+[`draw_wcs_graticule!`](@ref).
+"""
+function set_wcs_graticule_visible!(graticule, visible::Bool)
+    foreach(p -> (p.visible[] = visible), graticule.plots)
+    return graticule
 end

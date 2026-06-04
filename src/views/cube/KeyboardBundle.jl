@@ -57,6 +57,7 @@ function _cube_keyboard_bundle!(fig, ax_img;
     axis_menu,
     axes_labels,
     img_scale_menu,
+    invert_chk,
     contour_chk,
     clim_auto_btn,
     btn_save_img,
@@ -71,6 +72,8 @@ function _cube_keyboard_bundle!(fig, ax_img;
     reset_zoom!,
     clear_region!,
     update_region_from_drag!,
+    toggle_dark_mode!,
+    toggle_focus_image!,
     set_status!,
     # --- mode / re-entrancy guards ---
     bypass_mode_gate,
@@ -152,8 +155,7 @@ function _cube_keyboard_bundle!(fig, ax_img;
     end
 
     function cycle_log_scale!()
-        next = img_scale_mode[] === :lin   ? :log10 :
-               img_scale_mode[] === :log10 ? :ln    : :lin
+        next = cycle_scale_mode(img_scale_mode[])
         bypass_mode_gate[] = true
         try
             img_scale_menu.selection[] = String(next)
@@ -163,11 +165,22 @@ function _cube_keyboard_bundle!(fig, ax_img;
         set_status!("Image scale: $(String(next)).")
     end
 
+    function toggle_invert_shortcut!()
+        new_val = !invert_cmap[]
+        bypass_mode_gate[] = true
+        try
+            invert_chk.checked[] = new_val
+        finally
+            bypass_mode_gate[] = false
+        end
+        set_status!(new_val ? "Colormap inverted." : "Colormap restored.")
+    end
+
     # ------------------------------------------------------------------
     # Shortcut table
     # ------------------------------------------------------------------
     shortcut_bindings = ShortcutBinding[
-        ShortcutBinding(Keyboard.i,         () -> (invert_cmap[] = !invert_cmap[]);
+        ShortcutBinding(Keyboard.i,         toggle_invert_shortcut!;
                         description = "invert cmap"),
         ShortcutBinding(Keyboard.left,      () -> _move_uv!(0, -1)),
         ShortcutBinding(Keyboard.right,     () -> _move_uv!(0,  1)),
@@ -202,13 +215,25 @@ function _cube_keyboard_bundle!(fig, ax_img;
                         description = "contours"),
         ShortcutBinding(Keyboard.l,         () -> cycle_log_scale!();
                         description = "cycle scale"),
+        ShortcutBinding(Keyboard.d,         () -> toggle_dark_mode!();
+                        description = "dark mode"),
+        ShortcutBinding(Keyboard.f,         () -> toggle_focus_image!();
+                        description = "focus image"),
     ]
+
+    # `+`/`-` (and numpad) centered zoom. The compare axis is kept in sync
+    # only while it is visible — mirroring the right-drag zoom-box behaviour.
+    append!(shortcut_bindings,
+            zoom_shortcut_bindings(ax_img;
+                also      = () -> (compare_visible[] ? ax_cmp : nothing,),
+                on_change = set_status!))
 
     # `?` (Shift + /) opens a dedicated figure listing every binding.
     function _open_help_cube!()
         try
+            theme = ui_theme isa Base.RefValue ? ui_theme[] : ui_theme
             open_shortcut_help_window(shortcut_bindings;
-                title = "MANTA — Cube view shortcuts", theme = ui_theme)
+                title = "MANTA — Cube view shortcuts", theme = theme)
         catch e
             @warn "Could not open shortcut help window" exception = (e, catch_backtrace())
         end
@@ -231,11 +256,38 @@ function _cube_keyboard_bundle!(fig, ax_img;
     # ------------------------------------------------------------------
     # Mouse-button handler (left click = pixel pick / region drag;
     #                       right drag = zoom box)
+    #
+    # Guard: events propagate from the root scene so this handler fires for
+    # any click on the figure — including the control panel, colorbars, etc.
+    # We use `Makie.is_mouseinside(ax.scene)` to restrict interactions to the
+    # two heatmap axes, and call `mouseposition` on the axis that actually
+    # received the click so coordinates are not shifted when compare is active.
     # ------------------------------------------------------------------
+
+    # Which axis initiated the current drag (:img or :cmp).
+    _drag_src = Ref{Symbol}(:img)
+
+    # Return true when the pointer is inside ax's plot area.
+    _on_img() = Makie.is_mouseinside(ax_img.scene)
+    _on_cmp() = compare_visible[] && Makie.is_mouseinside(ax_cmp.scene)
+
+    # Data-space mouse position from the axis the pointer is currently over.
+    # Returns (source_symbol, Point2f) — source is :none when outside both axes.
+    function _active_mp()
+        _on_img() && return (:img, mouseposition(ax_img))
+        _on_cmp() && return (:cmp, mouseposition(ax_cmp))
+        return (:none, Point2f(NaN32, NaN32))
+    end
+
+    # Data-space mouse position from the axis that started the drag.
+    _drag_mp() = _drag_src[] === :cmp ? mouseposition(ax_cmp) : mouseposition(ax_img)
+
     on(events(ax_img).mousebutton) do ev
         if ev.button == Mouse.right && ev.action == Mouse.press
-            p = mouseposition(ax_img)
+            src, p = _active_mp()
+            src === :none && return           # ignore clicks outside both axes
             any(isnan, p) && return
+            _drag_src[] = src
             zoom_drag_start[] = Point2f(p[1], p[2])
             zoom_drag_end[]   = Point2f(p[1], p[2])
             zoom_drag_active[] = true
@@ -244,7 +296,7 @@ function _cube_keyboard_bundle!(fig, ax_img;
 
         elseif ev.button == Mouse.right && ev.action == Mouse.release
             zoom_drag_active[] || return
-            p = mouseposition(ax_img)
+            p = _drag_mp()
             if !any(isnan, p)
                 zoom_drag_end[] = Point2f(p[1], p[2])
             end
@@ -269,8 +321,10 @@ function _cube_keyboard_bundle!(fig, ax_img;
             return
 
         elseif ev.button == Mouse.left && ev.action == Mouse.press && selection_mode[] != :point
-            p = mouseposition(ax_img)
+            src, p = _active_mp()
+            src === :none && return           # ignore clicks outside both axes
             any(isnan, p) && return
+            _drag_src[] = src
             u_max, v_max = slice_dims(axis[])
             p0 = Point2f(clamp(p[1], 1, v_max), clamp(p[2], 1, u_max))
             region_start[]      = p0
@@ -282,7 +336,7 @@ function _cube_keyboard_bundle!(fig, ax_img;
             return
 
         elseif ev.button == Mouse.left && ev.action == Mouse.release && region_drag_active[]
-            p = mouseposition(ax_img)
+            p = _drag_mp()
             u_max, v_max = slice_dims(axis[])
             if !any(isnan, p)
                 region_end[] = Point2f(clamp(p[1], 1, v_max), clamp(p[2], 1, u_max))
@@ -299,7 +353,8 @@ function _cube_keyboard_bundle!(fig, ax_img;
             return
 
         elseif ev.button == Mouse.left && ev.action == Mouse.press
-            p = mouseposition(ax_img)
+            src, p = _active_mp()
+            src === :none && return           # ignore clicks outside both axes
             any(isnan, p) && return
             clear_region!()
             u_max, v_max = slice_dims(axis[])
@@ -316,10 +371,17 @@ function _cube_keyboard_bundle!(fig, ax_img;
     end
 
     # Live rubber-band update while dragging.
-    on(events(ax_img).mouseposition) do p
-        if zoom_drag_active[] && !any(isnan, p)
+    # We ignore the raw event payload and re-derive data coordinates from the
+    # axis that initiated the drag, so that dragging across both axes stays
+    # coherent and coordinates are never projected through the wrong camera.
+    on(events(ax_img).mouseposition) do _
+        if zoom_drag_active[]
+            p = _drag_mp()
+            any(isnan, p) && return
             zoom_drag_end[] = Point2f(p[1], p[2])
-        elseif region_drag_active[] && !any(isnan, p)
+        elseif region_drag_active[]
+            p = _drag_mp()
+            any(isnan, p) && return
             u_max, v_max = slice_dims(axis[])
             region_end[] = Point2f(clamp(p[1], 1, v_max), clamp(p[2], 1, u_max))
         end

@@ -24,6 +24,17 @@
 # Entry point: `_cube_ui_callbacks_bundle!(; kwargs...)`.
 # Returns `syncing_slice_controls::Ref{Bool}` (needed by KeyboardBundle).
 
+function _apply_gaussian_smoothing_toggle!(v, gauss_on, refresh_spectrum!,
+                                           layout_mode, render_power_spectrum_layout!,
+                                           set_status!)
+    enabled = Bool(v)
+    gauss_on[] = enabled
+    refresh_spectrum!()
+    layout_mode[] === :power_spectrum && render_power_spectrum_layout!()
+    set_status!(enabled ? "Gaussian smoothing enabled." : "Gaussian smoothing disabled.")
+    return enabled
+end
+
 """
     _cube_ui_callbacks_bundle!(; kwargs...) -> Ref{Bool}
 
@@ -42,6 +53,7 @@ function _cube_ui_callbacks_bundle!(;
     refresh_control_mode!,
     set_status!,
     set_box_text!,
+    flag_box!,
     # --- mode buttons ---
     mode_nav_btn,
     mode_analysis_btn,
@@ -67,6 +79,9 @@ function _cube_ui_callbacks_bundle!(;
     refresh_labels!,
     render_power_spectrum_layout!,
     layout_mode,
+    view_product,
+    data,
+    slice_plot_preview,
     # --- scale / colourmap ---
     img_scale_mode,
     spec_scale_mode,
@@ -158,6 +173,10 @@ function _cube_ui_callbacks_bundle!(;
     contour_chk,
     contour_apply_btn,
     contour_levels_box,
+    asinh_softening::Real = ASINH_SOFTENING_DEFAULT,
+    slice_debounce_seconds::Real = 0.12,
+    slice_preview_max_pixels::Integer = 1024,
+    slice_preview_min_interval::Real = 1 / 30,
 )
     # ------------------------------------------------------------------ #
     # Helpers local to this bundle
@@ -178,6 +197,79 @@ function _cube_ui_callbacks_bundle!(;
         try; block.visible[] = visible; catch; end
         try; block.scene.visible[] = visible; catch; end
         try; block.blockscene.visible[] = visible; catch; end
+        nothing
+    end
+
+    # ------------------------------------------------------------------ #
+    # Debounced slice navigation
+    # ------------------------------------------------------------------ #
+    _slice_commit_generation = Ref(0)
+    _last_preview_idx = Ref(idx[])
+    _last_preview_time_ns = Ref(0)
+
+    function _commit_slice_index!(n::Integer)
+        n_clamped = clamp(Int(n), 1, siz[axis[]])
+        if n_clamped == idx[]
+            slice_plot_preview[] = nothing
+            refresh_labels!()
+            return nothing
+        end
+        idx[] = n_clamped
+        ii, jj, kk = uv_to_ijk(u_idx[], v_idx[], axis[], n_clamped)
+        i_idx[] = clamp(ii, 1, siz[1])
+        j_idx[] = clamp(jj, 1, siz[2])
+        k_idx[] = clamp(kk, 1, siz[3])
+        refresh_labels!()
+        refresh_spectrum!()
+        layout_mode[] === :power_spectrum && render_power_spectrum_layout!()
+        nothing
+    end
+
+    function _preview_slice_index!(n::Integer)
+        try
+            if view_product[] !== :slice
+                return nothing
+            end
+            if slice_preview_max_pixels <= 0
+                return nothing
+            end
+            a = axis[]
+            n_clamped = clamp(Int(n), 1, siz[a])
+            now_ns = time_ns()
+            min_interval_ns = round(Int, max(0, Float64(slice_preview_min_interval)) * 1e9)
+            if n_clamped == _last_preview_idx[] || now_ns - _last_preview_time_ns[] < min_interval_ns
+                return nothing
+            end
+            raw = get_slice_view(data, a, n_clamped)
+            stride = downsample_factor(size(raw), slice_preview_max_pixels)
+            small = stride == 1 ? Float32.(raw) : downsample_subsample(raw, stride)
+            scaled = apply_scale_display(small, img_scale_mode[]; asinh_softening = asinh_softening)
+            slice_plot_preview[] = (;
+                x = downsample_centers(size(raw, 2), stride),
+                y = downsample_centers(size(raw, 1), stride),
+                z = permutedims(scaled),
+            )
+            _last_preview_idx[] = n_clamped
+            _last_preview_time_ns[] = now_ns
+        catch e
+            @debug "Slice preview failed" exception=(e, catch_backtrace())
+        end
+        nothing
+    end
+
+    function _schedule_slice_commit!(n::Integer)
+        _slice_commit_generation[] += 1
+        generation = _slice_commit_generation[]
+        delay = max(0, Float64(slice_debounce_seconds))
+        @async begin
+            try
+                sleep(delay)
+                generation == _slice_commit_generation[] || return
+                _commit_slice_index!(n)
+            catch e
+                @warn "Debounced slice update failed" exception=(e, catch_backtrace())
+            end
+        end
         nothing
     end
 
@@ -210,6 +302,8 @@ function _cube_ui_callbacks_bundle!(;
         sel === nothing && return
         new_axis = findfirst(==(String(sel)), axes_labels)
         new_axis === nothing && return
+        _slice_commit_generation[] += 1
+        slice_plot_preview[] = nothing
         axis[] = new_axis
         new_range = 1:siz[new_axis]
         syncing_slice_controls[] = true
@@ -234,14 +328,16 @@ function _cube_ui_callbacks_bundle!(;
     # ------------------------------------------------------------------ #
     on_mode(slice_slider.value, :navigation) do v
         syncing_slice_controls[] && return
-        idx[] = Int(round(v))
-        ii, jj, kk = uv_to_ijk(u_idx[], v_idx[], axis[], idx[])
-        i_idx[] = clamp(ii, 1, siz[1])
-        j_idx[] = clamp(jj, 1, siz[2])
-        k_idx[] = clamp(kk, 1, siz[3])
-        refresh_labels!()
-        refresh_spectrum!()
-        layout_mode[] === :power_spectrum && render_power_spectrum_layout!()
+        n = clamp(Int(round(v)), 1, siz[axis[]])
+        if bypass_mode_gate[]
+            slice_plot_preview[] = nothing
+            _slice_commit_generation[] += 1
+            _commit_slice_index!(n)
+            return
+        end
+        _preview_slice_index!(n)
+        set_status!("Preview slice $(n) / $(siz[axis[]]) along axis $(axis[]).")
+        _schedule_slice_commit!(n)
     end
 
     on_mode(compare_slice_slider.value, :navigation) do v
@@ -285,6 +381,9 @@ function _cube_ui_callbacks_bundle!(;
             get_box_str(hist_xmin_box),
             get_box_str(hist_xmax_box);
             fallback = hist_xlimits_manual_value[])
+        flag_box!(hist_bins_box, ok_bins)
+        flag_box!(hist_xmin_box, ok_x)
+        flag_box!(hist_xmax_box, ok_x)
         if !ok_bins
             set_status!(bins_msg); return
         end
@@ -310,6 +409,8 @@ function _cube_ui_callbacks_bundle!(;
         hist_xlimits_manual[] = false
         set_box_text!(hist_xmin_box, "")
         set_box_text!(hist_xmax_box, "")
+        flag_box!(hist_xmin_box, true)
+        flag_box!(hist_xmax_box, true)
         set_status!("Automatic histogram x-axis enabled.")
     end
 
@@ -317,6 +418,8 @@ function _cube_ui_callbacks_bundle!(;
         hist_ylimits_manual[] = false
         set_box_text!(hist_ymin_box, "")
         set_box_text!(hist_ymax_box, "")
+        flag_box!(hist_ymin_box, true)
+        flag_box!(hist_ymax_box, true)
         refresh_hist_axes!()
         set_status!("Automatic histogram y-axis enabled.")
     end
@@ -326,6 +429,8 @@ function _cube_ui_callbacks_bundle!(;
             get_box_str(hist_ymin_box),
             get_box_str(hist_ymax_box);
             fallback = hist_ylimits_manual_value[])
+        flag_box!(hist_ymin_box, ok_y)
+        flag_box!(hist_ymax_box, ok_y)
         set_status!(y_msg)
         ok_y || return
         hist_ylimits_manual_value[] = ylim
@@ -353,6 +458,8 @@ function _cube_ui_callbacks_bundle!(;
             get_box_str(spec_ymin_box),
             get_box_str(spec_ymax_box);
             fallback = spec_ylimits_value[])
+        flag_box!(spec_ymin_box, ok)
+        flag_box!(spec_ymax_box, ok)
         set_status!(msg)
         ok || return
         if manual
@@ -372,6 +479,8 @@ function _cube_ui_callbacks_bundle!(;
         spec_ylimits_source[] = :auto
         set_box_text!(spec_ymin_box, "")
         set_box_text!(spec_ymax_box, "")
+        flag_box!(spec_ymin_box, true)
+        flag_box!(spec_ymax_box, true)
         refresh_spec_ylim!()
         set_status!("Automatic spectrum y-axis enabled.")
     end
@@ -384,10 +493,9 @@ function _cube_ui_callbacks_bundle!(;
     end
 
     on_mode(gauss_chk.checked, :navigation) do v
-        gauss_on[] = v
-        refresh_spectrum!()
-        layout_mode[] === :power_spectrum && render_power_spectrum_layout!()
-        set_status!(v ? "Gaussian smoothing enabled." : "Gaussian smoothing disabled.")
+        _apply_gaussian_smoothing_toggle!(
+            v, gauss_on, refresh_spectrum!,
+            layout_mode, render_power_spectrum_layout!, set_status!)
     end
 
     on_mode(crosshair_chk.checked, :navigation) do v
@@ -453,10 +561,14 @@ function _cube_ui_callbacks_bundle!(;
         use_manual[] = false
         set_box_text!(clim_min_box, "")
         set_box_text!(clim_max_box, "")
+        flag_box!(clim_min_box, true)
+        flag_box!(clim_max_box, true)
         if spec_ylimits_source[] === :contrast
             spec_ylimits_source[] = :auto
             set_box_text!(spec_ymin_box, "")
             set_box_text!(spec_ymax_box, "")
+            flag_box!(spec_ymin_box, true)
+            flag_box!(spec_ymax_box, true)
         end
         refresh_spec_ylim!()
         set_status!("Automatic contrast enabled.")
@@ -470,10 +582,14 @@ function _cube_ui_callbacks_bundle!(;
         use_manual[] = true
         set_box_text!(clim_min_box, string(first(fixed_clims)))
         set_box_text!(clim_max_box, string(last(fixed_clims)))
+        flag_box!(clim_min_box, true)
+        flag_box!(clim_max_box, true)
         if spec_ylimits_source[] === :contrast
             spec_ylimits_value[] = fixed_clims
             set_box_text!(spec_ymin_box, string(first(fixed_clims)))
             set_box_text!(spec_ymax_box, string(last(fixed_clims)))
+            flag_box!(spec_ymin_box, true)
+            flag_box!(spec_ymax_box, true)
         end
         refresh_spec_ylim!()
         set_status!("Colorbar fixed to current limits.")
@@ -493,6 +609,8 @@ function _cube_ui_callbacks_bundle!(;
         txtmax = get_box_str(clim_max_box)
         ok, new_manual, parsed_clims, msg = parse_manual_clims(
             txtmin, txtmax; fallback = clims_manual[])
+        flag_box!(clim_min_box, ok)
+        flag_box!(clim_max_box, ok)
         set_status!(msg)
         if !ok
             @warn "Could not apply contrast limits" txtmin txtmax msg; return
@@ -570,6 +688,7 @@ function _cube_ui_callbacks_bundle!(;
             get_box_str(contour_levels_box);
             fallback_levels = contour_manual_levels[],
             fallback_colors = contour_manual_colors[])
+        flag_box!(contour_levels_box, ok)
         set_status!(msg)
         if !ok
             @warn "Could not apply contour levels" msg; return

@@ -44,6 +44,9 @@ function _cube_mask_bundle(;
     refresh_spectrum!,
     set_status!,
     set_box_text!,
+    ui_mask,
+    ui_error,
+    ui_text_muted,
 )
     # ------------------------------------------------------------------
     # Parse "a" or "a:b" strings from integer-range textboxes.
@@ -73,6 +76,7 @@ function _cube_mask_bundle(;
     function _set_mask_status!(src::MaskSource, bits::Union{Nothing,AbstractArray{Bool,3}})
         if src isa NoMaskSource || bits === nothing
             mask_status_obs[] = "No mask applied"
+            mask_status_label.color[] = ui_text_muted
         else
             kept = count(bits)
             tot  = length(bits)
@@ -89,6 +93,7 @@ function _cube_mask_bundle(;
             end
             mask_status_obs[] = "$(label): $(kept)/$(tot) px kept (" *
                                 string(round(100 * frac; digits = 2)) * "%)"
+            mask_status_label.color[] = ui_mask
         end
         mask_status_label.text[] = mask_status_obs[]
         nothing
@@ -151,10 +156,13 @@ function _cube_mask_bundle(;
             lo = isempty(lo_str) ? 0.0 : something(tryparse(Float64, lo_str), 0.0)
             hi = isempty(hi_str) ? 0.0 : something(tryparse(Float64, hi_str), 0.0)
             if op == :ge && isempty(lo_str)
+                mask_status_label.color[] = ui_error
                 return (nothing, "threshold ≥ requires 'lo'")
             elseif op == :le && isempty(hi_str)
+                mask_status_label.color[] = ui_error
                 return (nothing, "threshold ≤ requires 'hi'")
             elseif op in (:range, :outside) && (isempty(lo_str) || isempty(hi_str))
+                mask_status_label.color[] = ui_error
                 return (nothing, "threshold $(op_label) requires both 'lo' and 'hi'")
             end
             try

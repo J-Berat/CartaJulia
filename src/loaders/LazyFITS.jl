@@ -11,8 +11,8 @@
 # Implementation strategy:
 #   * Open the FITS file via FITSIO inside a `do` block for every read,
 #     using `read(hdu, r1, r2, ...)` to fetch the needed sub-array only.
-#   * Cache the last requested slice (cube case) so that successive
-#     accesses along the same channel are essentially free.
+#   * Keep a small LRU cache of requested slices (cube case) so quick
+#     forward/backward scrolling does not repeatedly hit disk.
 #   * Convert to `Float32` once, at the boundary, because the rest of
 #     MANTA assumes Float32 display arrays.
 #
@@ -33,6 +33,8 @@
 using FITSIO
 
 abstract type AbstractLazyFITS{T,N} <: AbstractArray{T,N} end
+
+const DEFAULT_FITS_SLICE_CACHE_CAPACITY = 7
 
 # ---- 2D image ---------------------------------------------------------
 
@@ -64,10 +66,14 @@ mutable struct LazyFITSCube{T<:Real} <: AbstractLazyFITS{T,3}
     path::String
     hdu::Int
     sz::NTuple{3,Int}
-    # Last slice cache: keyed on (axis, idx). Invalidated when the user moves.
+    # Most-recent slice mirror, kept for cheap hits and historical introspection.
     cache_axis::Int
     cache_idx::Int
     cache_data::Union{Nothing, Matrix{T}}
+    # Small LRU cache keyed on (axis, idx). The last key in cache_lru is MRU.
+    cache_capacity::Int
+    slice_cache::Dict{Tuple{Int,Int},Matrix{T}}
+    cache_lru::Vector{Tuple{Int,Int}}
     # Async prefetch state.
     # `prefetch_ch` holds a Channel{Matrix{T}}(1) that the background task will
     # `put!` its result into. The key (prefetch_axis, prefetch_idx) identifies
@@ -78,8 +84,14 @@ mutable struct LazyFITSCube{T<:Real} <: AbstractLazyFITS{T,3}
 end
 
 function LazyFITSCube{T}(path::AbstractString, hdu::Integer,
-                         sz::NTuple{3,Integer}) where {T<:Real}
-    LazyFITSCube{T}(String(path), Int(hdu), Int.(sz), 0, 0, nothing, 0, 0, nothing)
+                         sz::NTuple{3,Integer};
+                         cache_capacity::Integer = DEFAULT_FITS_SLICE_CACHE_CAPACITY) where {T<:Real}
+    cap = max(1, Int(cache_capacity))
+    LazyFITSCube{T}(
+        String(path), Int(hdu), Int.(sz), 0, 0, nothing,
+        cap, Dict{Tuple{Int,Int},Matrix{T}}(), Tuple{Int,Int}[],
+        0, 0, nothing,
+    )
 end
 
 Base.size(L::LazyFITSCube) = L.sz
@@ -115,11 +127,48 @@ function _read_slice_raw(L::LazyFITSCube{T}, a::Int, k::Int) where {T}
     end
 end
 
+function _touch_slice_cache_key!(L::LazyFITSCube, key::Tuple{Int,Int})
+    pos = findfirst(==(key), L.cache_lru)
+    pos !== nothing && deleteat!(L.cache_lru, pos)
+    push!(L.cache_lru, key)
+    return nothing
+end
+
+function _remember_slice!(L::LazyFITSCube{T}, a::Int, k::Int,
+                          slice::Matrix{T}) where {T}
+    key = (a, k)
+    L.slice_cache[key] = slice
+    _touch_slice_cache_key!(L, key)
+    while length(L.cache_lru) > L.cache_capacity
+        stale = popfirst!(L.cache_lru)
+        delete!(L.slice_cache, stale)
+    end
+    L.cache_axis = a
+    L.cache_idx  = k
+    L.cache_data = slice
+    return slice
+end
+
+function _cached_slice!(L::LazyFITSCube{T}, a::Int, k::Int) where {T}
+    key = (a, k)
+    slice = get(L.slice_cache, key, nothing)
+    slice === nothing && return nothing
+    _touch_slice_cache_key!(L, key)
+    L.cache_axis = a
+    L.cache_idx  = k
+    L.cache_data = slice
+    return slice
+end
+
+_has_cached_slice(L::LazyFITSCube, a::Int, k::Int) =
+    haskey(L.slice_cache, (a, k))
+
 """
     read_slice!(L::LazyFITSCube, axis, idx) -> Matrix
 
 Materialise a single 2D slice along `axis` (1, 2, or 3) at index `idx`.
-Result is cached so the viewer can hover/zoom without hitting disk.
+Result is cached in a small LRU window so the viewer can hover/zoom or reverse
+scroll direction without hitting disk.
 
 If `prefetch_slice!` was called earlier for the same `(axis, idx)`, the
 background load is awaited and the ready result is returned directly —
@@ -129,9 +178,8 @@ function read_slice!(L::LazyFITSCube{T}, axis::Integer, idx::Integer) where {T}
     a, k = Int(axis), Int(idx)
 
     # 1. Cache hit — free.
-    if a == L.cache_axis && k == L.cache_idx && L.cache_data !== nothing
-        return L.cache_data
-    end
+    slice_cached = _cached_slice!(L, a, k)
+    slice_cached !== nothing && return slice_cached
 
     # 2. Prefetch hit — the background task is already loading (or has loaded)
     #    exactly this slice.  `take!` blocks until the result arrives (usually
@@ -160,10 +208,7 @@ function read_slice!(L::LazyFITSCube{T}, axis::Integer, idx::Integer) where {T}
         _read_slice_raw(L, a, k)
     end
 
-    L.cache_axis = a
-    L.cache_idx  = k
-    L.cache_data = slice
-    return slice
+    return _remember_slice!(L, a, k, slice)
 end
 
 """
@@ -190,8 +235,7 @@ function prefetch_slice!(L::LazyFITSCube{T},
     1 <= k <= L.sz[a] || return nothing
 
     # Already cached — nothing to do.
-    a == L.cache_axis && k == L.cache_idx && L.cache_data !== nothing &&
-        return nothing
+    _has_cached_slice(L, a, k) && return nothing
 
     # Already prefetching the same slice — nothing to do.
     if a == L.prefetch_axis && k == L.prefetch_idx && L.prefetch_ch !== nothing
@@ -218,6 +262,37 @@ function prefetch_slice!(L::LazyFITSCube{T},
     end
 
     return nothing
+end
+
+"""
+    prefetch_adjacent!(L::LazyFITSCube, axis, idx_new, last_idx) -> Int
+
+Direction-aware speculative prefetch for cube scrolling. Infers the scroll
+direction by comparing `idx_new` with `last_idx` (`+1` ascending, `-1`
+descending, defaulting to `+1` when the index is unchanged), then starts an
+async [`prefetch_slice!`](@ref) for the neighbouring slice along `axis` when
+that neighbour is in bounds.
+
+Returns `idx_new` so the caller can update its "last index" tracker in a
+single expression:
+
+```julia
+last_idx_ref[] = prefetch_adjacent!(cube, axis[], idx[], last_idx_ref[])
+```
+
+An out-of-range `axis`, or a neighbour outside `1:size(L, axis)` (i.e. the
+user sits at either end of the cube), makes this a no-op — it still returns
+`idx_new` so the tracker stays correct.
+"""
+function prefetch_adjacent!(L::LazyFITSCube, axis::Integer, idx_new::Integer,
+                            last_idx::Integer)
+    a  = Int(axis)
+    id = Int(idx_new)
+    a in (1, 2, 3) || return id
+    dir = id > Int(last_idx) ? 1 : id < Int(last_idx) ? -1 : 1
+    nbr = id + dir
+    1 <= nbr <= L.sz[a] && prefetch_slice!(L, a, nbr)
+    return id
 end
 
 """

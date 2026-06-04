@@ -136,6 +136,104 @@ function register_shortcuts!(fig::Makie.Figure,
     return fig
 end
 
+# ---------------------------------------------------------------------------
+# Centered zoom — reusable `+` / `-` machinery shared by every interactive view
+# ---------------------------------------------------------------------------
+
+"""
+Default multiplicative factors applied to the current view span on each
+`+` / `-` press. `< 1` zooms in (tighter span), `> 1` zooms out.
+"""
+const ZOOM_IN_FACTOR  = 0.8
+const ZOOM_OUT_FACTOR = 1.25
+
+"""
+    zoom_limits((xmin, xmax, ymin, ymax), factor) -> (xmin, xmax, ymin, ymax)
+
+Pure helper: scale each axis span by `factor` about its own midpoint and
+return the new `(xmin, xmax, ymin, ymax)`. `factor < 1` zooms in, `> 1`
+zooms out. The scaling is uniform across both axes, so an aspect-locked
+(`DataAspect`) view stays consistent.
+
+The inputs are returned unchanged when any limit is non-finite, when
+`factor` is not a finite positive number, or when a span collapses to zero —
+so the caller can never produce `NaN`/inverted limits.
+"""
+function zoom_limits(lims::NTuple{4,<:Real}, factor::Real)
+    xmin, xmax, ymin, ymax = lims
+    all(isfinite, (xmin, xmax, ymin, ymax)) || return lims
+    (isfinite(factor) && factor > 0) || return lims
+    xc = (xmin + xmax) / 2
+    yc = (ymin + ymax) / 2
+    xh = (xmax - xmin) / 2 * factor
+    yh = (ymax - ymin) / 2 * factor
+    (xh == 0 || yh == 0) && return lims
+    return (xc - xh, xc + xh, yc - yh, yc + yh)
+end
+
+"""
+    zoom_axis!(ax, factor) -> ax
+
+Zoom Makie `Axis` `ax` by `factor` about the centre of its *currently
+displayed* view (`ax.finallimits`). `factor < 1` zooms in, `> 1` zooms out.
+Reading `finallimits` (rather than `targetlimits`) means the zoom always
+starts from what the user actually sees, including any `DataAspect`
+adjustment. No-ops on degenerate / non-finite limits.
+"""
+function zoom_axis!(ax, factor::Real)
+    fl   = ax.finallimits[]
+    o, w = fl.origin, fl.widths
+    xmin = Float64(o[1]); ymin = Float64(o[2])
+    cur  = (xmin, xmin + Float64(w[1]), ymin, ymin + Float64(w[2]))
+    nlim = zoom_limits(cur, factor)
+    nlim === cur && return ax
+    limits!(ax, nlim[1], nlim[2], nlim[3], nlim[4])
+    return ax
+end
+
+"""
+    zoom_shortcut_bindings(ax; also=(), zoom_in=ZOOM_IN_FACTOR,
+                           zoom_out=ZOOM_OUT_FACTOR, on_change=nothing)
+        -> Vector{ShortcutBinding}
+
+Build the standard centered-zoom bindings for `ax`: `=`/`+` and numpad `+`
+zoom in, `-` and numpad `-` zoom out. The numpad variants carry no
+description so the help window lists each action only once.
+
+Keyword arguments:
+- `also`: extra axes kept in sync. Either an iterable of axes, or a zero-arg
+  function returning such an iterable (use the function form when the set of
+  axes changes at runtime, e.g. a compare axis that toggles visibility).
+  `nothing` entries are skipped, so `() -> (visible ? ax2 : nothing,)` works.
+- `on_change`: optional one-arg callback invoked with a short status string
+  (`"Zoomed in."` / `"Zoomed out."`) after each zoom — wire it to the view's
+  `set_status!` to echo the action in the status bar.
+"""
+function zoom_shortcut_bindings(ax;
+                                also = (),
+                                zoom_in::Real  = ZOOM_IN_FACTOR,
+                                zoom_out::Real = ZOOM_OUT_FACTOR,
+                                on_change::Union{Nothing,Function} = nothing)
+    _extra() = also isa Function ? also() : also
+    function _zoom(factor::Real, label::AbstractString)
+        zoom_axis!(ax, factor)
+        for a in _extra()
+            a === nothing && continue
+            zoom_axis!(a, factor)
+        end
+        on_change === nothing || on_change(label)
+        return nothing
+    end
+    return ShortcutBinding[
+        ShortcutBinding(Keyboard.equal,       () -> _zoom(zoom_in,  "Zoomed in.");
+                        description = "zoom in"),
+        ShortcutBinding(Keyboard.kp_add,      () -> _zoom(zoom_in,  "Zoomed in.")),
+        ShortcutBinding(Keyboard.minus,       () -> _zoom(zoom_out, "Zoomed out.");
+                        description = "zoom out"),
+        ShortcutBinding(Keyboard.kp_subtract, () -> _zoom(zoom_out, "Zoomed out.")),
+    ]
+end
+
 """
     _key_label(key) -> String
 
@@ -154,6 +252,10 @@ function _key_label(key::Makie.Keyboard.Button)
         "end"       => "End",
         "escape"    => "Esc",
         "slash"     => "/",
+        "equal"       => "+",
+        "minus"       => "−",
+        "kp_add"      => "+",
+        "kp_subtract" => "−",
         "tab"       => "Tab",
         "space"     => "Space",
         "enter"     => "Enter",

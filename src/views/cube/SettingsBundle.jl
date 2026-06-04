@@ -62,8 +62,10 @@ function _cube_settings_bundle!(;
     mask_source_obs,
     compare_visible,
     compare_path_current,
+    spec_ylimits_source,
     spec_ylimits_value,
     spec_y_buf,
+    refresh_spec_ylim!,
     # --- voxel indices (used by make_name) ---
     i_idx, j_idx, k_idx,
     # --- axes ---
@@ -153,6 +155,13 @@ function _cube_settings_bundle!(;
         "use_manual_clims"  => use_manual[],
         "clim_min"          => use_manual[] ? first(clims_manual[]) : first(clims_auto[]),
         "clim_max"          => use_manual[] ? last(clims_manual[])  : last(clims_auto[]),
+        # Spectrum y-axis policy: :auto (autolimits), :manual (user limits)
+        # or :contrast (limits track the colour-scale clims). The numeric
+        # bounds are only meaningful for the manual/contrast sources but are
+        # always stored so a saved manual range survives an auto round-trip.
+        "spec_ylimits_source" => String(spec_ylimits_source[]),
+        "spec_ymin"           => first(spec_ylimits_value[]),
+        "spec_ymax"           => last(spec_ylimits_value[]),
         # The mask source is the *declarative* description (kind + params);
         # the materialised BitArray is regenerated from `data` on reload.
         "mask"              => mask_source_to_toml(mask_source_obs[]),
@@ -208,6 +217,41 @@ function _cube_settings_bundle!(;
     end
 
     # ------------------------------------------------------------------ #
+    # _restore_spec_ylimits!  — replay the persisted spectrum y-axis policy
+    #
+    # Shared by both `apply_inline_state!` (recipe `state=`) and
+    # `_apply_loaded_settings!` (TOML load) so the two paths stay in sync.
+    # Accepts the same Dict/NamedTuple shape via `state_get`. Unknown or
+    # missing sources fall back to :auto. The numeric bounds are routed
+    # through `parse_spectrum_ylimits` so they are normalised/ordered the
+    # same way as live UI input before being applied.
+    # ------------------------------------------------------------------ #
+    function _restore_spec_ylimits!(st)
+        src = lowercase(String(state_get(st, "spec_ylimits_source", String(spec_ylimits_source[]))))
+        if src == "manual" || src == "contrast"
+            ymin = _safe_float32(state_get(st, "spec_ymin", first(spec_ylimits_value[])), first(spec_ylimits_value[]))
+            ymax = _safe_float32(state_get(st, "spec_ymax", last(spec_ylimits_value[])),  last(spec_ylimits_value[]))
+            ok, manual, ylim, _ = parse_spectrum_ylimits(string(ymin), string(ymax); fallback = spec_ylimits_value[])
+            if ok && manual
+                spec_ylimits_value[]  = ylim
+                spec_ylimits_source[] = src == "contrast" ? :contrast : :manual
+                set_box_text!(spec_ymin_box, string(first(ylim)))
+                set_box_text!(spec_ymax_box, string(last(ylim)))
+            else
+                spec_ylimits_source[] = :auto
+                set_box_text!(spec_ymin_box, "")
+                set_box_text!(spec_ymax_box, "")
+            end
+        else
+            spec_ylimits_source[] = :auto
+            set_box_text!(spec_ymin_box, "")
+            set_box_text!(spec_ymax_box, "")
+        end
+        refresh_spec_ylim!()
+        nothing
+    end
+
+    # ------------------------------------------------------------------ #
     # apply_inline_state!  — replay a Dict / NamedTuple on the live viewer
     # ------------------------------------------------------------------ #
     # Writes widget selections, Observables, and textbox texts so the viewer
@@ -225,10 +269,10 @@ function _cube_settings_bundle!(;
         compare_slice_slider.value[] = compare_idx_val
 
         img_scale_val = String(state_get(st, "img_scale", String(img_scale_mode[])))
-        img_scale_val in ("lin", "log10", "ln") && (img_scale_menu.selection[] = img_scale_val)
+        img_scale_val in scale_menu_options() && (img_scale_menu.selection[] = img_scale_val)
 
         spec_scale_val = String(state_get(st, "spec_scale", String(spec_scale_mode[])))
-        spec_scale_val in ("lin", "log10", "ln") && (spec_scale_menu.selection[] = spec_scale_val)
+        spec_scale_val in scale_menu_options() && (spec_scale_menu.selection[] = spec_scale_val)
 
         cmap_val = Symbol(String(state_get(st, "colormap", String(cmap_name[]))))
         try
@@ -261,6 +305,10 @@ function _cube_settings_bundle!(;
             set_box_text!(clim_min_box, "")
             set_box_text!(clim_max_box, "")
         end
+
+        # Spectrum y-axis policy is restored after the clims so a :contrast
+        # source replays against the just-applied colour-scale limits.
+        _restore_spec_ylimits!(st)
 
         mask_dict = state_get(st, "mask", nothing)
         if mask_dict isa AbstractDict
@@ -306,10 +354,10 @@ function _cube_settings_bundle!(;
         compare_slice_slider.value[] = compare_idx_val
 
         img_scale_val = String(get(st, "img_scale", String(img_scale_mode[])))
-        img_scale_val in ("lin", "log10", "ln") && (img_scale_menu.selection[] = img_scale_val)
+        img_scale_val in scale_menu_options() && (img_scale_menu.selection[] = img_scale_val)
 
         spec_scale_val = String(get(st, "spec_scale", String(spec_scale_mode[])))
-        spec_scale_val in ("lin", "log10", "ln") && (spec_scale_menu.selection[] = spec_scale_val)
+        spec_scale_val in scale_menu_options() && (spec_scale_menu.selection[] = spec_scale_val)
 
         cmap_val = Symbol(String(get(st, "colormap", String(cmap_name[]))))
         try
@@ -400,6 +448,11 @@ function _cube_settings_bundle!(;
             autolimits!(ax_spec)
             xlims!(ax_spec, 0f0, Float32(max(0, length(spec_y_buf) - 1)))
         end
+
+        # Restore the spectrum y-axis policy last so it has the final say on
+        # ax_spec limits (overriding the contrast-driven defaults above when
+        # the user had pinned a manual/contrast range).
+        _restore_spec_ylimits!(st)
     end
 
     # ------------------------------------------------------------------ #

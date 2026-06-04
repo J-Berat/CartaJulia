@@ -123,3 +123,26 @@ end
 
 export downsample_factor, downsample_block_mean, downsample_subsample
 export auto_downsample
+
+"""
+    downsample_centers(n, stride) -> Vector{Float32}
+
+Return native-coordinate centers for the blocks produced by downsampling a
+1-D axis of length `n` with integer `stride`.  For example, `n=5, stride=2`
+returns `[1.5, 3.5, 5.0]`, matching blocks `1:2`, `3:4`, and `5:5`.
+"""
+function downsample_centers(n::Integer, stride::Integer)
+    n_int = Int(n)
+    s = Int(stride)
+    n_int >= 1 || throw(ArgumentError("n must be positive"))
+    s >= 1 || throw(ArgumentError("stride must be ≥ 1"))
+    out = Vector{Float32}(undef, cld(n_int, s))
+    @inbounds for b in eachindex(out)
+        lo = (b - 1) * s + 1
+        hi = min(b * s, n_int)
+        out[b] = Float32(0.5 * (lo + hi))
+    end
+    return out
+end
+
+export downsample_centers

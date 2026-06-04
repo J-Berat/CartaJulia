@@ -11,6 +11,7 @@ function _view_healpix_map(
     vmax = nothing,
     invert::Bool = false,
     scale::Symbol = :lin,
+    asinh_softening::Real = ASINH_SOFTENING_DEFAULT,
     nx::Int = 1400,
     ny::Int = 700,
     figsize::Union{Nothing,Tuple{Int,Int}} = nothing,
@@ -18,7 +19,7 @@ function _view_healpix_map(
     activate_gl::Bool = true,
     display_fig::Bool = true,
     hist_mode::Symbol = :bars,
-    hist_bins::Int = 64,
+    hist_bins::Int = HIST_BINS_DEFAULT,
     hist_xlimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
     hist_ylimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
 )
@@ -32,8 +33,8 @@ function _view_healpix_map(
     # ---------- Reprojection (once, kept in memory) ----------
     # why: project once, then gather into both the displayed image and the
     # pixel-index grid used for region selection. Avoids running the
-    # Mollweide trig + ang2pixRing twice.
-    ipix_grid = mollweide_pixel_index(m.resolution, nx, ny)
+    # Mollweide trig + ang2pix once; the map-aware grid preserves RING/NESTED.
+    ipix_grid = _cached_mollweide_pixel_index(m, nx, ny)
     img_raw   = mollweide_apply_index(ipix_grid, m)
 
     # ---------- State ----------
@@ -50,7 +51,7 @@ function _view_healpix_map(
         on ? nan_gaussian_filter(img_raw, σ) : img_raw
     end
     img_disp = lift(img_proc, scale_mode) do im, m_
-        out = apply_scale(im, m_)
+        out = apply_scale(im, m_; asinh_softening = asinh_softening)
         # protect: NaN/Inf already turned to NaN by apply_scale in log modes
         out2 = similar(out, Float32)
         @inbounds for k in eachindex(out)
@@ -85,7 +86,7 @@ function _view_healpix_map(
     end
 
     contour_auto_levels = lift(img_disp) do im
-        automatic_contour_levels(im; n = 7)
+        automatic_contour_levels(im; n = CONTOUR_N_LEVELS_DEFAULT)
     end
     contour_use_manual = Observable(false)
     contour_manual_levels = Observable(Float32[])
@@ -138,6 +139,7 @@ function _view_healpix_map(
     zoom_drag_start  = Observable(Point2f(NaN32, NaN32))
     zoom_drag_end    = Observable(Point2f(NaN32, NaN32))
     show_graticule   = Observable(true)
+    focus_image      = Observable(false)
     selection_mode = Observable(:point)
     region_shape = Observable(:box)
     region_drag_active = Observable(false)
@@ -184,6 +186,7 @@ function _view_healpix_map(
         bottomspinevisible = false, topspinevisible = false,
         leftspinevisible   = false, rightspinevisible = false,
         width = map_w_px,
+        height = map_h_px,
         tellwidth = false,
         tellheight = false,
         halign = :center,
@@ -250,10 +253,10 @@ function _view_healpix_map(
     end
     lines!(ax_img, region_segments; color=(ui_selection, REGION_ALPHA), linewidth=REGION_LW_HP)
 
-    Colorbar(
+    map_colorbar = Colorbar(
         main_grid[2, 1],
         hm;
-        label = unit_label_tex,
+        label = lift(m_ -> scale_label_tex(m_, unit_label), scale_mode),
         vertical = false,
         height = 18,
         width = map_w_px,
@@ -317,21 +320,55 @@ function _view_healpix_map(
         nothing
     end
 
-    # -- card factory (verbatim from CubeView) --
+    focus_bar = GridLayout(
+        main_grid[2, 1];
+        alignmode = Outside(0),
+        halign = :center,
+        valign = :center,
+        tellwidth = false,
+        tellheight = false,
+    )
+    colgap!(focus_bar, tight_layout ? 4 : 6)
+    Box(focus_bar[1, 1:5];
+        color = RGBAf(ui_theme.panel.r, ui_theme.panel.g, ui_theme.panel.b, 0.94),
+        strokecolor = RGBAf(ui_theme.border.r, ui_theme.border.g, ui_theme.border.b, 0.75),
+        strokewidth = 0.9,
+        cornerradius = 8,
+        z = -5)
+    Label(focus_bar[1, 1];
+        text = "Focus",
+        halign = :left,
+        tellwidth = false,
+        fontsize = tight_layout ? 12 : 13,
+        color = ui_theme.text,
+        padding = (10, 4, 5, 5))
+    focus_exit_btn = Button(focus_bar[1, 2]; label = "Exit", width = 62, height = tight_layout ? 28 : 30)
+    focus_fit_btn = Button(focus_bar[1, 3]; label = MANTA_ICONS.fit, width = 42, height = tight_layout ? 28 : 30)
+    focus_auto_btn = Button(focus_bar[1, 4]; label = MANTA_ICONS.contrast, width = 42, height = tight_layout ? 28 : 30)
+    focus_help_btn = Button(focus_bar[1, 5]; label = MANTA_ICONS.help, width = 42, height = tight_layout ? 28 : 30)
+    foreach(c -> colsize!(focus_bar, c, Auto()), 1:5)
+
+    # -- card factory (mirrors CubeView card styling) --
     function control_card!(parent, row, col, title::AbstractString; rows::Int = 4, cols::Int = 4)
         card = parent[row, col] = GridLayout(;
             alignmode = Outside(card_pad), tellwidth = false, tellheight = false)
         body_rows = rows + 1
-        Box(card[1:body_rows, 1:cols]; color = ui_theme.panel, strokecolor = ui_theme.border,
-            strokewidth = 1.0, cornerradius = 8, z = -6)
-        Box(card[1, 1:cols]; color = ui_theme.panel_header, strokecolor = (:transparent, 0.0),
-            strokewidth = 0.0, cornerradius = 8, z = -5)
-        Label(card[1, 1:cols]; text = uppercase(title), halign = :left, tellwidth = false,
-            fontsize = 13, font = :bold, color = ui_theme.accent_strong,
-            padding = (10, 10, 6, 6))
+        card_is_dark = ui_theme.background.r < 0.5
+        card_border = RGBAf(ui_theme.border.r, ui_theme.border.g, ui_theme.border.b,
+                            card_is_dark ? 0.58 : 0.82)
+        header_divider = RGBAf(ui_theme.border.r, ui_theme.border.g, ui_theme.border.b,
+                               card_is_dark ? 0.30 : 0.50)
+        Box(card[1:body_rows, 1:cols]; color = ui_theme.panel, strokecolor = card_border,
+            strokewidth = card_is_dark ? 0.8 : 0.9, cornerradius = 8, z = -6)
+        Box(card[1, 1:cols]; color = ui_theme.panel_header, strokecolor = header_divider,
+            strokewidth = 0.8, cornerradius = 8, z = -5)
+        Label(card[1, 1:cols]; text = title, halign = :left, tellwidth = false,
+            fontsize = 12, color = ui_theme.text,
+            padding = (10, 10, 5, 5))
         Box(card[body_rows, 1:cols]; color = :transparent, strokewidth = 0, z = -7)
+        rowsize!(card, 1, Fixed(compact_layout ? 28 : 32))
         rowsize!(card, body_rows, Fixed(compact_layout ? 10 : 12))
-        rowgap!(card, card_gap)
+        rowgap!(card, tight_layout ? 5 : compact_layout ? 7 : 9)
         colgap!(card, card_gap)
         return card
     end
@@ -340,29 +377,34 @@ function _view_healpix_map(
 
     # ── Mode bar (full width) ─────────────────────────────────────────────
     mode_bar = ctrl_grid[3, 1:3] = GridLayout(; alignmode = Outside(0), halign = :center)
-    colgap!(mode_bar, compact_layout ? 6 : 10)
+    colgap!(mode_bar, compact_layout ? 8 : 12)
     tab_h = tight_layout ? 28 : 32
-    mode_nav_btn      = Button(mode_bar[1, 1]; label = "Navigation", width = tight_layout ? 118 : 130, height = tab_h)
-    mode_analysis_btn = Button(mode_bar[1, 2]; label = "Analysis",   width = tight_layout ? 104 : 112, height = tab_h)
-    mode_export_btn   = Button(mode_bar[1, 3]; label = "Export",     width = tight_layout ? 90  : 96,  height = tab_h)
-    help_btn          = Button(mode_bar[1, 4]; label = "Help",       width = tight_layout ? 70  : 74,  height = tab_h)
-    btn_undo          = Button(mode_bar[1, 5]; label = "⟲ Undo",     width = tight_layout ? 86  : 92,  height = tab_h)
-    btn_redo          = Button(mode_bar[1, 6]; label = "⟳ Redo",     width = tight_layout ? 86  : 92,  height = tab_h)
-    foreach(c -> colsize!(mode_bar, c, Auto()), 1:6)
+    mode_segment = mode_bar[1, 1] = GridLayout(; alignmode = Outside(0))
+    colgap!(mode_segment, 0)
+    mode_nav_btn      = Button(mode_segment[1, 1]; label = "$(MANTA_ICONS.nav) Navigation", width = tight_layout ? 136 : 148, height = tab_h)
+    mode_analysis_btn = Button(mode_segment[1, 2]; label = "$(MANTA_ICONS.analysis) Analysis", width = tight_layout ? 122 : 132, height = tab_h)
+    mode_export_btn   = Button(mode_segment[1, 3]; label = "$(MANTA_ICONS.export_icon) Export", width = tight_layout ? 106 : 114, height = tab_h)
+    foreach(c -> colsize!(mode_segment, c, Auto()), 1:3)
+    help_btn          = Button(mode_bar[1, 2]; label = MANTA_ICONS.help, width = tight_layout ? 42 : 46, height = tab_h)
+    focus_btn         = Button(mode_bar[1, 3]; label = "Focus", width = tight_layout ? 68 : 76, height = tab_h)
+    btn_undo          = Button(mode_bar[1, 4]; label = MANTA_ICONS.undo, width = tight_layout ? 42 : 46, height = tab_h)
+    btn_redo          = Button(mode_bar[1, 5]; label = MANTA_ICONS.redo, width = tight_layout ? 42 : 46, height = tab_h)
+    foreach(c -> colsize!(mode_bar, c, Auto()), 1:5)
     control_mode = Observable(:navigation)
 
     # ── NAVIGATION: Display card (row 1 col 1) ────────────────────────────
     display_card = control_card!(ctrl_grid, 1, 1, "Display"; rows = 4, cols = 5)
     ctrl_lbl!(display_card, (2, 1), "Scale")
-    scale_menu = Menu(display_card[2, 2:3]; options = ["lin", "log10", "ln"],
+    scale_menu = Menu(display_card[2, 2:3]; options = scale_menu_options(),
                       prompt = String(scale), width = compact_layout ? 88 : 102)
     invert_chk = Checkbox(display_card[2, 4])
     Label(display_card[2, 5]; text = "Invert", halign = :left, tellwidth = false,
           fontsize = 13, color = ui_theme.text)
     invert_chk.checked[] = invert_cmap[]
     ctrl_lbl!(display_card, (3, 1), "Colormap")
-    cmap_menu = Menu(display_card[3, 2:5]; options = ui_colormap_options(),
-                     prompt = String(cmap), width = compact_layout ? 144 : 164)
+    cmap_menu = colormap_selector!(display_card[3, 2:5];
+                     cmap = cmap, width = compact_layout ? 144 : 164,
+                     compact = compact_layout, theme = ui_theme)
     gauss_chk = Checkbox(display_card[4, 1])
     Label(display_card[4, 2]; text = "Smoothing", halign = :left, tellwidth = false,
           fontsize = 13, color = ui_theme.text)
@@ -380,7 +422,7 @@ function _view_healpix_map(
     Label(nav_view_card[2, 2]; text = "Graticule", halign = :left, tellwidth = false,
           fontsize = 13, color = ui_theme.text)
     graticule_chk.checked[] = show_graticule[]
-    reset_zoom_btn = Button(nav_view_card[3, 1:2]; label = "Reset zoom", width = 122, height = 32)
+    reset_zoom_btn = Button(nav_view_card[3, 1:2]; label = "$(MANTA_ICONS.fit) Fit", width = 88, height = 32)
     foreach(c -> colsize!(nav_view_card, c, Auto()), 1:4)
 
     # ── ANALYSIS: Contrast card (row 1 col 1) ────────────────────────────
@@ -439,7 +481,7 @@ function _view_healpix_map(
 
     # ── EXPORT: Output card (row 1 col 1) ────────────────────────────────
     output_card = control_card!(ctrl_grid, 1, 1, "Output"; rows = 3, cols = 3)
-    save_btn = Button(output_card[2, 1]; label = "Save PNG", width = 110, height = 32)
+    save_btn = Button(output_card[2, 1]; label = "$(MANTA_ICONS.export_icon) PNG", width = 90, height = 32)
     foreach(c -> colsize!(output_card, c, Auto()), 1:3)
 
     # ── Grid sizing ───────────────────────────────────────────────────────
@@ -451,17 +493,19 @@ function _view_healpix_map(
     # ── Style ─────────────────────────────────────────────────────────────
     foreach(w -> manta_style_menu!(w, ui_theme),
             (scale_menu, cmap_menu, region_mode_menu, hist_mode_menu))
-    # Mode navigation buttons (tab-like; state managed by set_mode_button_active!)
-    foreach(w -> manta_style_button!(w, ui_theme),
-            (mode_nav_btn, mode_analysis_btn, mode_export_btn, p1_btn, p5_btn))
+    # Mode navigation segmented control (state managed by set_mode_button_active!)
+    foreach(w -> manta_style_segmented_button!(w, ui_theme),
+            (mode_nav_btn, mode_analysis_btn, mode_export_btn))
+    foreach(w -> manta_style_button!(w, ui_theme), (p1_btn, p5_btn))
     # Primary actions (accent)
     foreach(w -> manta_style_button_primary!(w, ui_theme),
             (apply_btn, save_btn, contour_apply_btn,
              hist_apply_btn, hist_y_apply_btn))
     # Resets, Clear, and utilities (unobtrusive)
     foreach(w -> manta_style_button_ghost!(w, ui_theme),
-            (help_btn, btn_undo, btn_redo, auto_btn, reset_zoom_btn, region_clear_btn,
-             hist_auto_btn, hist_y_auto_btn))
+            (help_btn, focus_btn, btn_undo, btn_redo, auto_btn, reset_zoom_btn,
+             region_clear_btn, hist_auto_btn, hist_y_auto_btn,
+             focus_exit_btn, focus_fit_btn, focus_auto_btn, focus_help_btn))
     foreach(w -> manta_style_checkbox!(w, ui_theme),
             (invert_chk, graticule_chk, gauss_chk, contour_chk))
     foreach(w -> manta_style_textbox!(w, ui_theme),
@@ -474,17 +518,21 @@ function _view_healpix_map(
     nav_cards_hp      = (display_card, nav_view_card)
     analysis_cards_hp = (contrast_card, selection_card, contour_card, hist_card)
     export_cards_hp   = (output_card,)
+    set_layout_contents_visible!(focus_bar, false)
 
     function set_mode_button_active!(btn, active::Bool)
-        btn.buttoncolor[]       = active ? ui_theme.surface_active : ui_theme.surface
-        btn.buttoncolor_hover[] = active ? ui_theme.surface_active : ui_theme.surface_hover
-        btn.labelcolor[]        = active ? ui_theme.accent_strong  : ui_theme.text
-        btn.labelcolor_hover[]  = ui_theme.accent_strong
-        btn.strokecolor[]       = active ? ui_theme.accent : ui_theme.border
+        manta_style_segmented_button!(btn, ui_theme; active = active)
         nothing
     end
     function refresh_control_mode!()
+        if focus_image[]
+            set_layout_contents_visible!(ctrl_grid, false)
+            set_layout_contents_visible!(focus_bar, true)
+            return nothing
+        end
         mode = control_mode[]
+        set_layout_contents_visible!(ctrl_grid, true)
+        set_layout_contents_visible!(focus_bar, false)
         for card in nav_cards_hp;      set_layout_contents_visible!(card, mode === :navigation); end
         for card in analysis_cards_hp; set_layout_contents_visible!(card, mode === :analysis);   end
         for card in export_cards_hp;   set_layout_contents_visible!(card, mode === :export);     end
@@ -640,8 +688,8 @@ function _view_healpix_map(
         valstr = isfinite(mean_val) ? string(round(mean_val; digits=4)) : "NaN"
         shape = region_shape[] === :circle ? "circle" : "box"
         info_obs[] = latexstring(
-            "\\text{region ", shape, "}\\;N=", length(ips),
-            "\\;\\text{mean}=", valstr,
+            "\\mathrm{region}\\,\\text{", shape, "}\\;N=\\mathbf{", length(ips), "}",
+            "\\;\\mathrm{mean}=\\mathbf{", valstr, "}",
             "\\;\\mathrm{", latex_safe(unit_label), "}"
         )
         nothing
@@ -652,6 +700,58 @@ function _view_healpix_map(
         use_manual[] = true
         set_box_text!(clim_min_box, string(first(clims)))
         set_box_text!(clim_max_box, string(last(clims)))
+        nothing
+    end
+
+    focus_map_w = max(map_w_px, min(fig_size[1] - 48, 2 * (fig_size[2] - 72)))
+    focus_map_h = max(map_h_px, focus_map_w ÷ 2)
+    function apply_focus_image_mode!()
+        if focus_image[]
+            set_layout_contents_visible!(ctrl_grid, false)
+            set_layout_contents_visible!(focus_bar, true)
+            rowsize!(main_grid, 1, Relative(1))
+            for r in 2:5
+                rowsize!(main_grid, r, Fixed(0))
+            end
+            rowsize!(main_grid, 2, Fixed(tight_layout ? 34 : 38))
+            rowgap!(main_grid, 0)
+            ax_img.width[] = focus_map_w
+            ax_img.height[] = focus_map_h
+            set_block_visible!(map_colorbar, false)
+            set_block_visible!(ax_hist, false)
+            info_obs[] = latexstring("\\text{Focus image: controls hidden. Press f or Exit to return.}")
+        else
+            set_layout_contents_visible!(focus_bar, false)
+            rowgap!(main_grid, -8)
+            rowsize!(main_grid, 1, Fixed(map_h_px))
+            rowsize!(main_grid, 2, Fixed(cbar_h_px))
+            rowsize!(main_grid, 3, Fixed(info_h_px))
+            rowsize!(main_grid, 4, Fixed(hist_h_px))
+            rowsize!(main_grid, 5, Fixed(ctrl_total_h))
+            ax_img.width[] = map_w_px
+            ax_img.height[] = map_h_px
+            set_block_visible!(map_colorbar, true)
+            set_block_visible!(ax_hist, true)
+            refresh_control_mode!()
+            info_obs[] = latexstring("\\text{Focus image closed.}")
+        end
+        nothing
+    end
+
+    on(focus_image) do _
+        apply_focus_image_mode!()
+    end
+
+    on(focus_btn.clicks) do _
+        focus_image[] = true
+    end
+
+    on(focus_exit_btn.clicks) do _
+        focus_image[] = false
+    end
+
+    toggle_focus_image!() = begin
+        focus_image[] = !focus_image[]
         nothing
     end
 
@@ -687,9 +787,27 @@ function _view_healpix_map(
         show_graticule[] = v
         set_graticule_visible!(graticule, v)
     end
-    on(reset_zoom_btn.clicks) do _
+    function reset_hp_zoom!()
         set_mollweide_view!(ax_img, full_map_bounds...)
         refresh_graticule_labels!(graticule, ax_img; bounds=full_map_bounds)
+        nothing
+    end
+    on(reset_zoom_btn.clicks) do _
+        reset_hp_zoom!()
+    end
+    on(focus_fit_btn.clicks) do _
+        focus_image[] || return
+        reset_hp_zoom!()
+        info_obs[] = latexstring("\\text{Focus image: view fitted.}")
+    end
+    on(focus_auto_btn.clicks) do _
+        focus_image[] || return
+        use_manual[] = false
+        set_box_text!(clim_min_box, "")
+        set_box_text!(clim_max_box, "")
+    end
+    on(focus_help_btn.clicks) do _
+        help_btn.clicks[] = help_btn.clicks[] + 1
     end
     on(apply_btn.clicks) do _
         ok, manual, clims, _msg = parse_manual_clims(
@@ -849,15 +967,16 @@ function _view_healpix_map(
             l_disp = mod(l_deg, 360)
             θhp = deg2rad(90 - b_deg)
             φhp = deg2rad(mod(l_deg, 360))
-            ipix = Healpix.ang2pixRing(m.resolution, θhp, φhp)
+            ipix = Healpix.ang2pix(m, θhp, φhp)
             val  = m.pixels[ipix]
             valstr = (isfinite(val) && val != Healpix.UNSEEN) ?
                      string(round(Float32(val); digits=4)) : "NaN"
             info_obs[] = latexstring(
-                "(l, b) = (",
-                string(round(l_disp; digits=2)), "^\\circ, ",
-                string(round(b_deg; digits=2)), "^\\circ),\\;",
-                "\\text{", latex_safe(unit_label), "} = ", valstr
+                "\\mathrm{(l,b)}=\\mathbf{(",
+                string(round(l_disp; digits=2)), "^\\circ,",
+                string(round(b_deg; digits=2)), "^\\circ)}\\;",
+                "\\mathrm{pix}=\\mathbf{", string(ipix), "}\\;",
+                "\\mathrm{", latex_safe(unit_label), "}=\\mathbf{", valstr, "}"
             )
         end
     end
@@ -887,8 +1006,7 @@ function _view_healpix_map(
         _set_status_hp!(new_val ? "Contours enabled." : "Contours hidden.")
     end
     function _cycle_log_scale_hp!()
-        next = scale_mode[] === :lin   ? :log10 :
-               scale_mode[] === :log10 ? :ln    : :lin
+        next = cycle_scale_mode(scale_mode[])
         scale_menu.selection[] = String(next)
         _set_status_hp!("Image scale: $(String(next)).")
     end
@@ -909,7 +1027,17 @@ function _view_healpix_map(
                         description = "contours"),
         ShortcutBinding(Keyboard.l,  () -> _cycle_log_scale_hp!();
                         description = "cycle scale"),
+        ShortcutBinding(Keyboard.f,  () -> toggle_focus_image!();
+                        description = "focus image"),
     ]
+    # `g` toggles the graticule checkbox; its handler propagates to the
+    # overlay, keeping the UI control and the shortcut in sync.
+    push!(shortcuts_hp,
+          ShortcutBinding(Keyboard.g,
+                          () -> (graticule_chk.checked[] = !graticule_chk.checked[]);
+                          description = "toggle graticule"))
+    # `+`/`-` (and numpad) centered zoom on the Mollweide image axis.
+    append!(shortcuts_hp, zoom_shortcut_bindings(ax_img; on_change = _set_status_hp!))
     # Help: Shift+/ and the Help button open a dedicated Makie figure
     # with the full binding list; status bar keeps the one-line recap.
     function _open_help_hp!()
@@ -937,10 +1065,8 @@ function _view_healpix_map(
     )
 
     refresh_hist_axes!()
-    keepalive!(fig)
-    on(fig.scene.events.window_open) do is_open
-        is_open || forget!(fig)
-    end
+    register_window_close!(fig)  # anchor in GC root — see MANTA._KEEP_ALIVE block comment
+    enable_file_drop!(fig; activate_gl = activate_gl, display_fig = display_fig)
     display_fig && display(fig)
     return fig
 end

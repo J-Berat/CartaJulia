@@ -154,13 +154,63 @@ function _is_healpix_h5(attrs::AbstractDict)
     return false
 end
 
+function _select_hdf5_dataset(obj, address::AbstractString)
+    if obj isa HDF5.Dataset
+        return obj
+    elseif obj isa HDF5.Group || obj isa HDF5.File
+        # Look for a single dataset child or an attribute "default_dataset".
+        default = try
+            read_attribute(obj, "default_dataset")
+        catch
+            nothing
+        end
+        if default !== nothing && haskey(obj, String(default))
+            child = obj[String(default)]
+            child isa HDF5.Dataset || throw(ArgumentError(
+                "MANTA: HDF5 default_dataset=$(default) in $(address) is not a dataset."))
+            return child
+        end
+        children = collect(HDF5.keys(obj))
+        ds_children = filter(k -> obj[k] isa HDF5.Dataset, children)
+        length(ds_children) == 1 ||
+            throw(ArgumentError(
+                "MANTA: HDF5 group $(address) is ambiguous: contains $(length(ds_children)) datasets " *
+                "($(ds_children)). Specify the full address."))
+        return obj[ds_children[1]]
+    else
+        throw(ArgumentError("MANTA: HDF5 object at $(address) is neither a dataset nor a group"))
+    end
+end
+
+function _hdf5_chunk_tuple(ds::HDF5.Dataset, nd::Int)
+    HDF5.ischunked(ds) || return nothing
+    ch = Int.(HDF5.get_chunk(ds))
+    length(ch) == nd || return nothing
+    return nd == 2 ? (ch[1], ch[2]) :
+           nd == 3 ? (ch[1], ch[2], ch[3]) :
+                     nothing
+end
+
+function _lazy_hdf5_array(path::AbstractString, address::AbstractString,
+                          sz::Tuple, chunk)
+    length(sz) == 2 && return LazyHDF5Image{Float32}(
+        String(path), String(address), (Int(sz[1]), Int(sz[2])), chunk)
+    length(sz) == 3 && return LazyHDF5Cube{Float32}(
+        String(path), String(address), (Int(sz[1]), Int(sz[2]), Int(sz[3])), chunk)
+    throw(ArgumentError(
+        "MANTA: HDF5 lazy loading only supports 2D images and 3D cubes " *
+        "(dataset $(address) has ndims=$(length(sz)))."))
+end
+
 """
-    load_hdf5(path[, address]; column=1, v0=0.0, dv=1.0, vunit="km/s")
+    load_hdf5(path[, address]; column=1, v0=0.0, dv=1.0, vunit="km/s", lazy=false)
 
 Open `path` (HDF5 file), navigate to `address` (defaults to `"/"`), read the
-dataset and its attributes, and build an `AbstractMANTADataset`. When `address`
-points to a group, the loader picks a single child dataset (if unambiguous) or
-follows the `default_dataset` attribute when present.
+dataset metadata, and build an `AbstractMANTADataset`. With `lazy=true`, 2-D
+images and 3-D cubes are wrapped for on-demand hyperslab reads instead of
+materialising the full dataset. When `address` points to a group, the loader
+picks a single child dataset (if unambiguous) or follows the `default_dataset`
+attribute when present.
 """
 load_hdf5(path::AbstractString; kwargs...) = load_hdf5(path, "/"; kwargs...)
 
@@ -174,43 +224,33 @@ function load_hdf5(
     # `hdu` is FITS-only; accepted here so `load_dataset` can forward kwargs
     # uniformly without filtering.  It is silently ignored for HDF5 files.
     hdu::Integer = 1,
-    # `lazy` is intentionally NOT accepted here.  LoadDataset strips it and
-    # emits a clear warning before calling this function, so that callers
-    # receive an explicit message rather than a silent no-op.
+    lazy::Bool = false,
 )
     isfile(path) || throw(FileNotFoundError(String(path),
         "Check the path (cwd = $(pwd())) or use an absolute path."))
 
-    data, attrs_dict = try
+    data, attrs_dict, resolved_address = try
         h5open(path, "r") do f
             if !haskey(f, address) && address != "/"
                 throw(ArgumentError("MANTA: HDF5 address $(address) not found in $(abspath(path))"))
             end
             obj = address == "/" ? f : f[address]
-            ds = if obj isa HDF5.Dataset
-                obj
-            elseif obj isa HDF5.Group || obj isa HDF5.File
-                # Look for a single dataset child or an attribute "default_dataset".
-                default = try
-                    read_attribute(obj, "default_dataset")
-                catch
-                    nothing
-                end
-                if default !== nothing && haskey(obj, String(default))
-                    obj[String(default)]
-                else
-                    children = collect(HDF5.keys(obj))
-                    ds_children = filter(k -> obj[k] isa HDF5.Dataset, children)
-                    length(ds_children) == 1 ||
-                        throw(ArgumentError(
-                            "MANTA: HDF5 group $(address) is ambiguous: contains $(length(ds_children)) datasets " *
-                            "($(ds_children)). Specify the full address."))
-                    obj[ds_children[1]]
-                end
+            ds = _select_hdf5_dataset(obj, address)
+            attrs = read_attrs(ds)
+            resolved = String(HDF5.name(ds))
+            if lazy && !_is_healpix_h5(attrs)
+                sz = size(ds)
+                nd = length(sz)
+                nd in (2, 3) || throw(ArgumentError(
+                    "MANTA: HDF5 lazy loading only supports 2D images and 3D cubes " *
+                    "(dataset $(resolved) has ndims=$(nd))."))
+                eltype(ds) <: Real || throw(ArgumentError(
+                    "MANTA: HDF5 lazy loading requires a numeric dataset " *
+                    "($(resolved) has eltype=$(eltype(ds)))."))
+                (_lazy_hdf5_array(path, resolved, sz, _hdf5_chunk_tuple(ds, nd)), attrs, resolved)
             else
-                throw(ArgumentError("MANTA: HDF5 object at $(address) is neither a dataset nor a group"))
+                (read(ds), attrs, resolved)
             end
-            (read(ds), read_attrs(ds))
         end
     catch e
         e isa ArgumentError && rethrow()
@@ -219,7 +259,7 @@ function load_hdf5(
             "Original error: $(sprint(showerror, e))"))
     end
 
-    return _build_dataset_from_h5(path, address, data, attrs_dict;
+    return _build_dataset_from_h5(path, resolved_address, data, attrs_dict;
         column = column, v0 = v0, dv = dv, vunit = vunit)
 end
 
@@ -243,6 +283,10 @@ function _build_dataset_from_h5(path, address, data, attrs::AbstractDict;
     base_meta = Dict{Symbol,Any}(:hdf5_path => abspath(String(path)),
                                  :hdf5_address => String(address),
                                  :hdf5_attrs => attrs)
+    if data isa AbstractLazyHDF5
+        base_meta[:lazy] = true
+        data.chunk === nothing || (base_meta[:hdf5_chunk] = data.chunk)
+    end
 
     nd = ndims(data)
 

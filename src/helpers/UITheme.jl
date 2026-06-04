@@ -3,6 +3,8 @@
 #          set_dark_mode!, is_dark_mode, _makie_theme_for
 
 struct MANTAUITheme
+    panel::RGBf
+    panel_header::RGBf
     accent::RGBf
     accent_dim::RGBf
     accent_strong::RGBf
@@ -10,8 +12,6 @@ struct MANTAUITheme
     surface::RGBf
     surface_hover::RGBf
     surface_active::RGBf
-    panel::RGBf
-    panel_header::RGBf
     border::RGBf
     border_strong::RGBf
     text::RGBf
@@ -20,9 +20,13 @@ struct MANTAUITheme
     selection::RGBf
     compare::RGBf
     success::RGBf
+    mask::RGBf
+    error::RGBf
 end
 
 default_ui_theme() = MANTAUITheme(
+    RGBf(0.958, 0.960, 0.958), # panel        — soft grey panels
+    RGBf(0.902, 0.910, 0.914), # panel_header — clearer grey header
     RGBf(0.36, 0.39, 0.92),    # accent       — indigo-500
     RGBf(0.68, 0.70, 0.95),    # accent_dim   — indigo-300
     RGBf(0.28, 0.31, 0.82),    # accent_strong — indigo-700
@@ -30,8 +34,6 @@ default_ui_theme() = MANTAUITheme(
     RGBf(0.985, 0.985, 0.982), # surface      — neutral card
     RGBf(0.94, 0.945, 0.945),  # surface_hover
     RGBf(0.90, 0.91, 0.91),    # surface_active
-    RGBf(0.958, 0.960, 0.958), # panel
-    RGBf(0.925, 0.930, 0.930), # panel_header
     RGBf(0.76, 0.78, 0.80),    # border
     RGBf(0.58, 0.61, 0.65),    # border_strong
     RGBf(0.10, 0.12, 0.20),    # text
@@ -40,6 +42,8 @@ default_ui_theme() = MANTAUITheme(
     RGBf(1.00, 0.68, 0.12),    # selection    — amber/orange
     RGBf(0.90, 0.30, 0.16),    # compare      — red-orange residuals
     RGBf(0.10, 0.58, 0.42),    # success      — green saved/loaded
+    RGBf(0.04, 0.62, 0.72),    # mask         — cyan mask affordance
+    RGBf(0.72, 0.16, 0.18),    # error        — sober red
 )
 
 """
@@ -51,16 +55,16 @@ without competing with data, and bright amber/orange accents echo the
 warm glow of emission maps.
 """
 dark_ui_theme() = MANTAUITheme(
-    RGBf(0.42, 0.58, 1.00),    # accent       — bright periwinkle
-    RGBf(0.60, 0.73, 1.00),    # accent_dim   — sky blue tint
-    RGBf(0.62, 0.79, 1.00),    # accent_strong — ice blue highlight
+    RGBf(0.14, 0.16, 0.20),    # panel        — deep anthracite
+    RGBf(0.08, 0.10, 0.14),    # panel_header — deeper anthracite header
+    RGBf(0.50, 0.58, 0.96),    # accent       — luminous indigo
+    RGBf(0.64, 0.70, 1.00),    # accent_dim   — indigo tint
+    RGBf(0.72, 0.78, 1.00),    # accent_strong — light indigo highlight
     RGBf(0.26, 0.29, 0.34),    # track        — dark slate
     RGBf(0.17, 0.19, 0.23),    # surface      — night-grey cards
     RGBf(0.21, 0.24, 0.29),    # surface_hover
     RGBf(0.25, 0.28, 0.34),    # surface_active
-    RGBf(0.14, 0.16, 0.20),    # panel        — deep anthracite
-    RGBf(0.11, 0.13, 0.17),    # panel_header — darkest anthracite
-    RGBf(0.27, 0.30, 0.36),    # border
+    RGBf(0.23, 0.26, 0.32),    # border
     RGBf(0.38, 0.42, 0.50),    # border_strong
     RGBf(0.87, 0.89, 0.93),    # text         — off-white
     RGBf(0.52, 0.57, 0.66),    # text_muted   — muted blue-grey
@@ -68,6 +72,8 @@ dark_ui_theme() = MANTAUITheme(
     RGBf(1.00, 0.72, 0.18),    # selection    — bright amber
     RGBf(1.00, 0.42, 0.24),    # compare      — hot orange
     RGBf(0.22, 0.84, 0.58),    # success      — vivid mint
+    RGBf(0.35, 0.86, 0.92),    # mask         — bright cyan
+    RGBf(0.92, 0.30, 0.34),    # error        — clear sober red
 )
 
 ############################
@@ -189,7 +195,7 @@ end
 
 function manta_style_button!(btn, theme::MANTAUITheme = current_ui_theme(); compact::Bool = false)
     btn.height[] = compact ? 30 : 34
-    btn.cornerradius[] = 8
+    btn.cornerradius[] = UI_CORNER_RADIUS
     btn.strokewidth[] = 1.0
     btn.strokecolor[] = theme.border
     btn.buttoncolor[] = theme.surface
@@ -198,7 +204,7 @@ function manta_style_button!(btn, theme::MANTAUITheme = current_ui_theme(); comp
     btn.labelcolor[] = theme.text
     btn.labelcolor_hover[] = theme.accent_strong
     btn.labelcolor_active[] = theme.accent_strong
-    btn.fontsize[] = compact ? 13 : 14
+    btn.fontsize[] = compact ? UI_FS_CAPTION : UI_FS_BODY
     btn.padding[] = compact ? (9, 9, 5, 5) : (12, 12, 7, 7)
     btn
 end
@@ -240,11 +246,32 @@ function manta_style_button_ghost!(btn, theme::MANTAUITheme = current_ui_theme()
     btn
 end
 
+"""
+    manta_style_segmented_button!(btn, theme; compact, active)
+
+Segmented mode switch button for Navigation / Analysis / Export. Uses the
+calmer panel surface, reserving the accent for the active label and border.
+"""
+function manta_style_segmented_button!(btn, theme::MANTAUITheme = current_ui_theme();
+                                       compact::Bool = false, active::Bool = false)
+    manta_style_button!(btn, theme; compact)
+    btn.cornerradius[]       = compact ? 6 : 7
+    btn.strokewidth[]        = active ? 1.2 : 0.8
+    btn.strokecolor[]        = active ? theme.accent : theme.border
+    btn.buttoncolor[]        = active ? theme.surface_active : theme.panel
+    btn.buttoncolor_hover[]  = active ? theme.surface_active : theme.surface_hover
+    btn.buttoncolor_active[] = theme.surface_active
+    btn.labelcolor[]         = active ? theme.accent_strong : theme.text_muted
+    btn.labelcolor_hover[]   = active ? theme.accent_strong : theme.text
+    btn.labelcolor_active[]  = theme.accent_strong
+    btn
+end
+
 function manta_style_menu!(menu, theme::MANTAUITheme = current_ui_theme(); compact::Bool = false)
     menu.height[] = compact ? 30 : 34
     menu.width[] = max(something(menu.width[], 0), 96)
     menu.textcolor[] = theme.text
-    menu.fontsize[] = compact ? 13 : 14
+    menu.fontsize[] = compact ? UI_FS_CAPTION : UI_FS_BODY
     menu.dropdown_arrow_color[] = theme.accent
     menu.dropdown_arrow_size[] = compact ? 10 : 11
     menu.textpadding[] = compact ? (8, 8, 5, 5) : (10, 10, 7, 7)
@@ -256,9 +283,19 @@ function manta_style_menu!(menu, theme::MANTAUITheme = current_ui_theme(); compa
     menu
 end
 
+function manta_style_menu!(selector::ColormapSelector, theme::MANTAUITheme = current_ui_theme(); compact::Bool = false)
+    h = compact ? 30 : 34
+    selector.height[] = h
+    selector.fontsize[] = compact ? UI_FS_CAPTION : UI_FS_BODY
+    selector.textpadding[] = compact ? (8, 8, 5, 5) : (10, 10, 7, 7)
+    selector.dropdown_arrow_size[] = compact ? 10 : 11
+    rowsize!(selector.layout, 1, Fixed(h))
+    selector
+end
+
 function manta_style_textbox!(tb, theme::MANTAUITheme = current_ui_theme(); compact::Bool = false)
     tb.height[] = compact ? 30 : 34
-    tb.fontsize[] = compact ? 13 : 14
+    tb.fontsize[] = compact ? UI_FS_CAPTION : UI_FS_BODY
     tb.textcolor[] = theme.text
     tb.textcolor_placeholder[] = theme.text_muted
     tb.boxcolor[] = theme.surface
@@ -268,7 +305,32 @@ function manta_style_textbox!(tb, theme::MANTAUITheme = current_ui_theme(); comp
     tb.bordercolor_hover[] = theme.accent_dim
     tb.bordercolor_focused[] = theme.accent
     tb.borderwidth[] = 1.4
-    tb.cornerradius[] = 8
+    tb.cornerradius[] = UI_CORNER_RADIUS
     tb.textpadding[] = compact ? (8, 8, 5, 5) : (10, 10, 7, 7)
     tb
+end
+
+"""
+    manta_flag_textbox!(tb, ok::Bool, theme = current_ui_theme())
+
+Paint a textbox border to signal input validity. When `ok` is `false`
+(the parser rejected the field — empty-but-required or malformed) all three
+border states are painted with the theme `error` red so the offending box
+is visually obvious instead of failing silently; when `ok` is `true` the
+normal themed border palette (matching `manta_style_textbox!`) is restored.
+
+Only the border colours are touched, so the box keeps the size / padding /
+text colours set at construction. Returns `tb`.
+"""
+function manta_flag_textbox!(tb, ok::Bool, theme::MANTAUITheme = current_ui_theme())
+    if ok
+        tb.bordercolor[]         = theme.border
+        tb.bordercolor_hover[]   = theme.accent_dim
+        tb.bordercolor_focused[] = theme.accent
+    else
+        tb.bordercolor[]         = theme.error
+        tb.bordercolor_hover[]   = theme.error
+        tb.bordercolor_focused[] = theme.error
+    end
+    return tb
 end

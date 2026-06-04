@@ -419,28 +419,44 @@ function wcs_axis_label(wcs, dim::Integer; fallback::AbstractString = "pixel")
     elseif ax.kind === :spectral
         spectral_quantity_word(ax.spectral_quantity)
     elseif isempty(ax.ctype_base)
-        "world $(dim)"
+        String(fallback)
     else
         ax.ctype_base
     end
-    unit = isempty(ax.cunit) ? "" : " [$(ax.cunit)]"
+    # CUNIT can be whitespace-only (blank-padded FITS keyword); treat it as
+    # absent so the label never gains an empty "[ ]" suffix. Mirrors the
+    # normalisation already done in `format_world_value`.
+    unit_clean = strip(String(ax.cunit))
+    unit = isempty(unit_clean) ? "" : " [$(unit_clean)]"
     return latexstring("\\text{", latex_safe(name * unit), "}")
 end
 
-function format_world_coord(wcs, dim::Integer, pix::Real)
+"""
+    format_world_value(wcs, dim, val) -> String
+
+Format an *already-computed* world value `val` along axis `dim` as
+`"CTYPE=val unit"`, reusing the FITS `CTYPE` / `CUNIT` of `wcs[dim]`. This
+is the formatting half of [`format_world_coord`](@ref); it is factored out
+so callers that obtain a world coordinate by a non-linear route (e.g. the
+exact celestial deprojection in [`cursor_world_strings`](@ref) via
+[`sky_world_coords`](@ref)) format it consistently rather than by hand.
+"""
+function format_world_value(wcs, dim::Integer, val::Real)
     if !has_wcs(wcs, dim)
-        return "pix$(dim)=" * string(round(Float64(pix); digits = 2))
+        return "pix$(dim)=" * string(round(Float64(val); digits = 2))
     end
     ax = wcs[dim]
     # CTYPE/CUNIT can be whitespace-only strings (malformed FITS header);
     # normalise them to avoid ugly "  =0.0" labels.
     ctype_clean = strip(String(ax.ctype))
     ctype = isempty(ctype_clean) ? "axis$(dim)" : ctype_clean
-    val = world_coord(wcs, dim, pix)
     unit_clean = strip(String(ax.cunit))
     unit = isempty(unit_clean) ? "" : " $(unit_clean)"
-    return "$(ctype)=" * string(round(val; digits = 5)) * unit
+    return "$(ctype)=" * string(round(Float64(val); digits = 5)) * unit
 end
+
+format_world_coord(wcs, dim::Integer, pix::Real) =
+    format_world_value(wcs, dim, world_coord(wcs, dim, pix))
 
 """
     data_unit_label(header; fallback="value") -> String
@@ -453,4 +469,214 @@ function data_unit_label(header; fallback::AbstractString = "value")
     unit = header_get(header, "BUNIT", "")
     s = strip(String(unit))
     return isempty(s) ? String(fallback) : s
+end
+
+############################
+# Cursor readout (DS9 / CARTA style)
+############################
+
+_readout_pixel(v) = string(Int(round(Float64(v))))
+
+function _readout_value(v)
+    v === missing && return "NaN"
+    x = Float64(v)
+    isfinite(x) || return "NaN"
+    return string(round(x; sigdigits = 6))
+end
+
+"""
+    format_cursor_readout(pixels, value, unit, world) -> String
+
+Compose a single-line, DS9/CARTA-style cursor readout that the FITS viewers
+push into their status / info label on every pointer move.
+
+Arguments:
+
+- `pixels`  : vector of `name => coord` pairs (e.g. `["x" => 34, "y" => 12]`).
+              `coord` is rounded to the nearest integer FITS pixel.
+- `value`   : the *raw* data value under the cursor (`nothing` / `NaN` /
+              `missing` → rendered as `"NaN"`).
+- `unit`    : data unit label appended to the value (e.g. `"Jy/beam"`); blank
+              units are omitted.
+- `world`   : vector of pre-formatted world-coordinate strings, typically the
+              output of [`format_world_coord`](@ref) so the WCS rules
+              (CTYPE / CUNIT / projection) stay centralised. Empty entries are
+              skipped.
+
+Empty sections are dropped so the same helper serves the 2-D image, cube-slice
+and HEALPix views. The function is pure (no Observables, no Makie) and is the
+unit-tested core of the live readout feature.
+"""
+function format_cursor_readout(pixels::AbstractVector,
+                               value = nothing,
+                               unit::AbstractString = "",
+                               world::AbstractVector = String[])
+    segments = String[]
+
+    if !isempty(pixels)
+        toks = String[]
+        for (name, coord) in pixels
+            push!(toks, string(name, "=", _readout_pixel(coord)))
+        end
+        push!(segments, join(toks, " "))
+    end
+
+    if value !== nothing
+        vstr = _readout_value(value)
+        u = strip(String(unit))
+        push!(segments, isempty(u) ? vstr : string(vstr, " ", u))
+    end
+
+    wtoks = String[]
+    for w in world
+        s = strip(String(w))
+        isempty(s) || push!(wtoks, String(s))
+    end
+    isempty(wtoks) || push!(segments, join(wtoks, "  "))
+
+    return join(segments, "   ")
+end
+
+"""
+    cursor_world_strings(wcs, xform, dims, pix) -> Vector{String}
+
+Build the world-coordinate readout strings for the image axes `dims` (FITS
+axis indices under the cursor, given in display order) with pixel positions
+`pix` (same length and order).
+
+When `xform` is a [`WCSTransform`](@ref) whose celestial pair is *fully*
+contained in `dims`, that pair is deprojected **exactly** through
+[`sky_world_coords`](@ref) — honouring the CD/PC matrix and the `CTYPE`
+projection (TAN/SIN/CAR/…). Every remaining axis, and the whole vector when
+`xform === nothing` or the deprojection is out of domain, falls back to the
+per-axis linear [`world_coord`](@ref). Axes without WCS are skipped, so the
+result is empty when no axis carries a world coordinate.
+
+This keeps the live cursor readout exact for rotated frames and wide-field
+projections while never formatting a coordinate by hand (all strings go
+through [`format_world_value`](@ref)).
+"""
+function cursor_world_strings(wcs, xform,
+                              dims::AbstractVector{<:Integer},
+                              pix::AbstractVector{<:Real})
+    length(dims) == length(pix) ||
+        throw(ArgumentError("cursor_world_strings: dims and pix length mismatch"))
+    any(d -> has_wcs(wcs, d), dims) || return String[]
+
+    exact = Dict{Int,Float64}()
+    if xform isa WCSTransform
+        lon_d, lat_d = xform.sky_dims
+        if lon_d != 0 && lat_d != 0 && (lon_d in dims) && (lat_d in dims)
+            plon = pix[findfirst(==(lon_d), dims)]
+            plat = pix[findfirst(==(lat_d), dims)]
+            sc = sky_world_coords(xform, plon, plat)
+            if sc !== nothing
+                exact[lon_d] = sc[1]
+                exact[lat_d] = sc[2]
+            end
+        end
+    end
+
+    out = String[]
+    for (d, p) in zip(dims, pix)
+        has_wcs(wcs, d) || continue
+        val = get(exact, d, world_coord(wcs, d, p))
+        push!(out, format_world_value(wcs, d, val))
+    end
+    return out
+end
+
+############################
+# WCS sky graticule (rectilinear 2-D images)
+############################
+
+# Promote any WCS container to a `WCSTransform` so `sky_world_coords` is
+# available. A plain `Vector{SimpleWCSAxis}` has no CD/PC matrix, so the
+# transform falls back to the diagonal CDELT + per-axis projection — the same
+# information the 2-D image path already carries.
+_as_wcs_transform(w::WCSTransform) = w
+_as_wcs_transform(w::AbstractVector{<:SimpleWCSAxis}) =
+    WCSTransform(collect(SimpleWCSAxis, w), nothing, false, _sky_pair(w), _spectral_dim(w))
+
+"""
+    wcs_sky_grids(wcs, ni, nj) -> (lon::Matrix{Float64}, lat::Matrix{Float64})
+
+Evaluate the celestial WCS over an `ni × nj` pixel grid (pixel centres at the
+1-based integer indices) and return the longitude / latitude of every pixel in
+degrees. Entries are `NaN` where the deprojection is invalid (e.g. outside the
+valid domain of a `SIN` projection) and the whole result is `NaN` when `wcs`
+carries no identified sky pair. Longitudes are unwrapped relative to the
+reference longitude (`CRVAL` of the longitude axis) so an iso-longitude line
+stays continuous across the 0°/360° seam for a contiguous field — see
+[`wcs_graticule_levels`](@ref) and the consumers that contour these grids.
+"""
+function wcs_sky_grids(wcs, ni::Integer, nj::Integer)
+    wt = _as_wcs_transform(wcs)
+    lon = fill(NaN, Int(ni), Int(nj))
+    lat = fill(NaN, Int(ni), Int(nj))
+    lon_d, lat_d = wt.sky_dims
+    (lon_d == 0 || lat_d == 0) && return (lon, lat)
+    lon0 = wt.axes[lon_d].crval
+    @inbounds for j in 1:Int(nj), i in 1:Int(ni)
+        c = sky_world_coords(wt, i, j)
+        c === nothing && continue
+        l, b = c
+        # Unwrap longitude into (lon0-180, lon0+180] so contouring sees a
+        # single-valued, continuous field rather than a 360° jump.
+        lon[i, j] = lon0 + rem(l - lon0, 360.0, RoundNearest)
+        lat[i, j] = b
+    end
+    return (lon, lat)
+end
+
+"""
+    nice_graticule_step(span, n=6) -> Float64
+
+A "nice" tick step (1, 2, 2.5, 5 × 10ᵏ) that divides `span` into roughly `n`
+intervals. Used to pick graticule spacings in the WCS' native angular unit.
+Returns `1.0` for non-positive or non-finite spans.
+"""
+function nice_graticule_step(span::Real, n::Integer = 6)
+    s = Float64(span)
+    (isfinite(s) && s > 0) || return 1.0
+    raw = s / max(Int(n), 1)
+    mag = 10.0^floor(log10(raw))
+    for m in (1.0, 2.0, 2.5, 5.0)
+        m * mag >= raw && return m * mag
+    end
+    return 10.0 * mag
+end
+
+"""
+    wcs_graticule_levels(lon, lat; n=6) -> (lon_levels, lat_levels)
+
+Pick rounded iso-longitude / iso-latitude levels covering the finite range of
+the `lon` / `lat` grids returned by [`wcs_sky_grids`](@ref). Each is a
+`Vector{Float64}`; either may be empty when the corresponding grid has no
+finite values.
+"""
+function wcs_graticule_levels(lon::AbstractArray, lat::AbstractArray; n::Integer = 6)
+    return (_levels_for(lon, n), _levels_for(lat, n))
+end
+
+function _levels_for(grid::AbstractArray, n::Integer)
+    lo = Inf; hi = -Inf
+    @inbounds for v in grid
+        if isfinite(v)
+            v < lo && (lo = v)
+            v > hi && (hi = v)
+        end
+    end
+    (isfinite(lo) && isfinite(hi) && hi > lo) || return Float64[]
+    step = nice_graticule_step(hi - lo, n)
+    first_level = ceil(lo / step) * step
+    levels = Float64[]
+    lvl = first_level
+    # Guard the loop count so a degenerate step can never spin forever.
+    for _ in 1:1000
+        lvl > hi + 1e-9 && break
+        push!(levels, lvl)
+        lvl += step
+    end
+    return levels
 end

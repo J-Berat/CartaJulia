@@ -74,6 +74,16 @@ fig = MANTA.manta("path/to/cube.fits")
 display(fig)
 ```
 
+When running outside a REPL (e.g. from a script), keep the process alive until
+the user closes the window with `wait_until_closed`, which is more reliable than
+polling `isopen(fig.scene)`:
+
+```julia
+fig = MANTA.manta("path/to/cube.fits")
+display(fig)
+MANTA.wait_until_closed(fig)
+```
+
 With options:
 
 ```julia
@@ -102,7 +112,8 @@ every viewer; a few are specific to cubes or HEALPix data.
 | `cmap` | `Symbol` | `:viridis` | Makie colormap (`:magma`, `:inferno`, `:plasma`, `:cividis`, `:gray`, …) |
 | `invert` | `Bool` | `false` | Reverse the colormap |
 | `figsize` | `Tuple{Int,Int}` | auto | Window size in pixels, e.g. `(1400, 900)` |
-| `scale` | `Symbol` | `:lin` | Image scale: `:lin`, `:log10`, or `:ln` |
+| `scale` | `Symbol` | `:lin` | Image scale: `:lin`, `:log10`, `:ln`, `:asinh`, or `:sqrt` |
+| `asinh_softening` | `Real` | `1.0` | Softening length `a` for the `:asinh` stretch (`asinh(x/a)`); clamped > 0. Small `a` ≈ logarithmic, large `a` ≈ linear |
 
 ### Contrast
 
@@ -123,12 +134,12 @@ every viewer; a few are specific to cubes or HEALPix data.
 | `moment_nsigma` | `Real` | `nothing` | If set, threshold is computed as `nsigma × σ` of the data |
 | `moment_channels` | `AbstractVector{Int}` | `nothing` | Restrict moment calculations to these channel indices |
 
-### FITS-specific
+### FITS / HDF5-specific
 
 | kwarg | type | default | meaning |
 |---|---|---|---|
-| `hdu` | `Integer` | `1` | HDU index to read (1 = primary; 0 = auto-pick first non-empty HDU) |
-| `lazy` | `Bool` | `false` | Memory-map the cube: read slices on demand instead of loading the full file up-front. Ignored for non-FITS inputs. See [Lazy FITS Loading](#lazy-fits-loading). |
+| `hdu` | `Integer` | `1` | HDU index to read (1 = primary; 0 = auto-pick first non-empty HDU). FITS only; ignored for HDF5 |
+| `lazy` | `Bool` | `false` | Read slices on demand instead of loading the full file up-front. Supported for FITS cubes and for 2D/3D HDF5 datasets. Ignored for in-memory inputs. See [Lazy Loading](#lazy-loading). |
 
 ### Cube-specific
 
@@ -160,6 +171,29 @@ every viewer; a few are specific to cubes or HEALPix data.
 |---|---|---|---|
 | `save_dir` | `String` | `nothing` | Export directory; defaults to `~/Desktop` if it exists, otherwise the current directory |
 
+## Dark Mode
+
+MANTA ships with two UI themes: the default light theme and an anthracite dark
+theme. In the cube viewer, click the `☾` / `☀` button in the bottom mode bar
+or press `D` to toggle the active window.
+
+You can also choose the default theme for new viewers globally for the current
+Julia session with `set_dark_mode!`, called before opening a viewer:
+
+```julia
+using MANTA
+
+MANTA.set_dark_mode!(true)    # dark background, bright widgets
+MANTA.manta("path/to/cube.fits")
+
+MANTA.set_dark_mode!(false)   # back to the standard light theme
+```
+
+The toggle updates both MANTA's own panel and widget colours and the Makie
+global theme, so axes, tick labels, grid lines, and figure backgrounds follow
+along. Query or fetch the active theme programmatically with `is_dark_mode()`,
+`current_ui_theme()`, and `dark_ui_theme()`.
+
 ## Viewer Capabilities
 
 ### 3D Cube Viewer
@@ -169,7 +203,7 @@ Once a cube is open, the viewer lets you:
 - navigate slices along any of the three axes with a slider or keyboard arrows;
 - click a pixel to display its spectrum; draw a box or circular region to
   average spectra inside it;
-- switch image and spectrum scales between `:lin`, `:log10`, and `:ln`;
+- switch image and spectrum scales between `:lin`, `:log10`, `:ln`, `:asinh`, and `:sqrt`;
 - adjust contrast manually, automatically, or with one-click p1-p99 / p5-p95 presets;
 - change or invert the colormap; smooth the displayed image;
 - add automatic or manual contours;
@@ -279,21 +313,31 @@ display_fig=false`, so no interactive state is created. Files that fail to
 render are skipped with a `@warn` and do not abort the batch; the return value
 contains only the paths that were actually written.
 
-## Lazy FITS Loading
+## Lazy Loading
 
-By default, MANTA reads the full FITS cube into memory at startup. For large
-files this can be slow or exceed available RAM. Passing `lazy=true` enables
-on-demand slice reading:
+By default, MANTA reads the full cube into memory at startup. For large files
+this can be slow or exceed available RAM. Passing `lazy=true` enables on-demand
+slice reading:
 
 ```julia
+# FITS cube
 fig = MANTA.manta("path/to/large_cube.fits"; lazy=true)
+
+# HDF5 dataset (2D images and 3D cubes)
+fig = MANTA.manta("path/to/large.h5:/group/dataset"; lazy=true)
 ```
 
 With lazy loading, MANTA opens the file and reads only the currently displayed
-slice. An async prefetch mechanism starts loading the next slice in the
-background as soon as the current one is rendered, so interactive navigation
-stays smooth. Memory usage stays proportional to a single slice rather than
-the full cube.
+slice (via memory-mapping for FITS and hyperslab reads for HDF5). FITS cubes
+keep a small LRU cache of recently visited slices (7 by default), and an async
+prefetch mechanism starts loading the next slice in the background as soon as
+the current one is rendered, so interactive navigation stays smooth even when
+scrolling back and forth. Memory usage stays proportional to a handful of
+slices rather than the full cube.
+
+Lazy HDF5 loading covers 2D and 3D numeric datasets only; HEALPix datasets and
+non-numeric data are always read eagerly. The `lazy` flag is ignored for
+in-memory array inputs.
 
 > **Note:** lazy loading is a read-only view; exports that require the full
 > cube (e.g. "Save cube FITS") will materialise all slices at export time.
@@ -407,9 +451,10 @@ Common shortcuts in the **3D cube viewer**:
 | `1` | p1–p99 contrast preset |
 | `5` | p5–p95 contrast preset |
 | `i` | Invert colormap |
-| `l` | Cycle scale (lin → log10 → ln) |
+| `l` | Cycle scale (lin → log10 → ln → asinh → sqrt) |
 | `c` | Toggle contours |
 | `r` | Reset zoom |
+| `+` / `-` | Zoom in / out (centered) |
 | `s` | Save image |
 | `Ctrl-Z` | Undo |
 | `Ctrl-Shift-Z` | Redo |
@@ -423,10 +468,16 @@ Common shortcuts in the **2D image viewer**:
 | `1` | p1–p99 contrast preset |
 | `5` | p5–p95 contrast preset |
 | `i` | Invert colormap |
-| `l` | Cycle scale |
+| `l` | Cycle scale (lin → log10 → ln → asinh → sqrt) |
+| `g` | Toggle WCS graticule (when the image carries a sky WCS) |
 | `r` | Reset zoom |
+| `+` / `-` | Zoom in / out (centered) |
 | `s` | Save image (PNG) |
 | `Shift-/` | Open shortcut help window |
+
+The **HEALPix map and PPV-cube viewers** share the same conventions: `g`
+toggles the coordinate graticule and `+` / `-` zoom the Mollweide view in and
+out about its center (the numeric keypad `+` / `-` work too, in every viewer).
 
 ## Plugin System
 
@@ -542,10 +593,12 @@ If this fails, the issue is the graphical environment or OpenGL, not MANTA.
 julia --project=. scripts/setup.jl
 ```
 
-**`log10` / `ln` scales show empty or blank regions:**
+**`log10` / `ln` / `sqrt` scales show empty or blank regions:**
 Values ≤ 0 are invalid for these scales; MANTA converts them to `NaN` before
 display. Check that the data has strictly positive values in the region you are
-viewing.
+viewing. For data with both positive and negative pixels (e.g. low-SNR maps),
+prefer the `:asinh` stretch, which is defined on all of ℝ and keeps the sign;
+tune its softening length with `asinh_softening` (`asinh(x / a)`).
 
 **Lazy loading is slow on first slice:**
 The async prefetch covers the *next* slice; the very first read always hits
@@ -575,22 +628,30 @@ disk. On networked filesystems, consider a local copy.
 │   │   ├── FITSLoader.jl
 │   │   ├── HDF5Loader.jl
 │   │   ├── InMemoryLoader.jl
-│   │   └── LazyFITS.jl   On-demand slice reader with async prefetch
+│   │   ├── LazyFITS.jl   On-demand FITS slice reader with async prefetch
+│   │   └── LazyHDF5.jl   On-demand HDF5 hyperslab reader with async prefetch
 │   ├── masking/
 │   │   └── Mask.jl       Declarative voxel mask system
 │   ├── helpers/
-│   │   ├── Helpers.jl    UI utilities (colormaps, WCS, LaTeX, contours, …)
-│   │   ├── UITheme.jl    Colour constants and widget style helpers
+│   │   ├── Helpers.jl    UI utilities (colormaps, LaTeX, contour parsing, …)
+│   │   ├── UITheme.jl    Light/dark themes and widget style helpers
+│   │   ├── UIConstants.jl  Shared UI sizing/spacing constants
+│   │   ├── UIBits.jl     Reusable control-card / label builders
 │   │   ├── Shortcuts.jl  Keyboard shortcut registration
 │   │   ├── UndoRedo.jl   Bounded snapshot history (Ctrl-Z / Ctrl-Shift-Z)
 │   │   ├── Plugins.jl    Extension point registry
 │   │   ├── PowerSpectrum.jl  2D FFT + radial profile helpers
-│   │   └── …             (Moments, WCS, Stats, Scaling, …)
+│   │   └── …             (Backend, Contours, Downsample, Errors, FITSHeaders,
+│   │                      Images, Moments, Progress, Scaling, Slicing,
+│   │                      Stats, WCS)
 │   └── views/
 │       ├── CubeView.jl   3D cube viewer (main orchestrator)
-│       ├── HealpixMapView.jl  HEALPix map viewer
-│       ├── VectorView.jl     1D spectrum / vector viewer
+│       ├── HealpixMapView.jl   HEALPix map viewer
+│       ├── HealpixProjection.jl  Mollweide projection helpers
+│       ├── VectorView.jl       1D spectrum / vector viewer
 │       └── cube/         Cube-viewer sub-bundles
+│           ├── CubeViewState.jl
+│           ├── CubeLayout.jl
 │           ├── MaskBundle.jl
 │           ├── CompareBundle.jl
 │           ├── KeyboardBundle.jl
@@ -603,5 +664,12 @@ disk. On networked filesystems, consider a local copy.
 │           ├── SettingsBundle.jl
 │           └── AnimationRequest.jl
 └── test/
-    └── runtests.jl       Headless test suite
+    ├── runtests.jl       Headless test entry point
+    ├── cube_view.jl
+    ├── healpix.jl
+    ├── helpers.jl
+    ├── lazy_fits.jl
+    ├── lazy_hdf5.jl
+    ├── loaders.jl
+    └── masks.jl
 ```

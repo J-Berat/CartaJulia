@@ -38,29 +38,50 @@ function clamped_extrema(vals)::Tuple{Float32,Float32}
     return (mn, mx)
 end
 
-finite_float_values(vals) = begin
+"""
+    finite_float_values(vals; stride=1) -> Vector{Float32}
+
+Collect finite values as `Float32`. With `stride > 1`, only every `stride`-th
+element is kept — a cheap subsample for previews (e.g. during a slider drag).
+Subsampling requires an indexable `AbstractArray`; other iterables fall back to
+a full pass.
+"""
+function finite_float_values(vals; stride::Integer = 1)
     out = Float32[]
-    for v in vals
-        fv = Float32(v)
-        isfinite(fv) && push!(out, fv)
+    if stride > 1 && vals isa AbstractArray
+        @inbounds for i in firstindex(vals):stride:lastindex(vals)
+            fv = Float32(vals[i])
+            isfinite(fv) && push!(out, fv)
+        end
+    else
+        for v in vals
+            fv = Float32(v)
+            isfinite(fv) && push!(out, fv)
+        end
     end
     out
 end
 
 """
-    percentile_clims(vals, lo_pct, hi_pct) -> (Float32, Float32)
+    percentile_clims(vals, lo_pct, hi_pct; subsample=1) -> (Float32, Float32)
 
 Return finite-value percentile limits, expanding degenerate ranges.
-Percentiles are in `[0, 100]`.
+Percentiles are in `[0, 100]`. Pass `subsample > 1` to estimate the limits from
+1 element out of every `subsample` — enough for a live preview while dragging a
+slider, where a full-resolution pass over a large slice is wasteful.
 """
-function percentile_clims(vals, lo_pct::Real, hi_pct::Real)::Tuple{Float32,Float32}
-    xs = finite_float_values(vals)
+function percentile_clims(vals, lo_pct::Real, hi_pct::Real;
+                          subsample::Integer = 1)::Tuple{Float32,Float32}
+    xs = finite_float_values(vals; stride = max(1, Int(subsample)))
     isempty(xs) && return (0f0, 1f0)
     lo = clamp(Float64(lo_pct), 0.0, 100.0) / 100.0
     hi = clamp(Float64(hi_pct), 0.0, 100.0) / 100.0
     lo > hi && ((lo, hi) = (hi, lo))
-    qlo = Float32(quantile(xs, lo))
-    qhi = Float32(quantile(xs, hi))
+    # why: `quantile` sorts its input internally, so two separate calls sort the
+    # same vector twice. Requesting both probabilities at once sorts only once.
+    qlo_f, qhi_f = quantile(xs, (lo, hi))
+    qlo = Float32(qlo_f)
+    qhi = Float32(qhi_f)
     if qlo == qhi
         return (prevfloat(qlo), nextfloat(qhi))
     end

@@ -76,8 +76,4 @@ fig = MANTA.manta(
     invert=false,
 )
 
-#display(fig)
-display(fig)
-while isopen(fig.scene)
-    sleep(0.1)
-end
+MANTA.wait_until_closed(fig)

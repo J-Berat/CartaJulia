@@ -318,14 +318,14 @@ function _view_vector(
                 string(round(Float64(x); digits = 6))
         end
         latexstring(
-            "\\mathbf{N}=", s.n,
-            "\\quad\\mathbf{finite}=", s.n_finite,
-            "\\quad\\mathbf{NaN}=", s.n_nan,
-            "\\quad\\mathbf{min}=", latex_safe(_fmt(s.min)),
-            "\\quad\\mathbf{max}=", latex_safe(_fmt(s.max)),
-            "\\quad\\mathbf{mean}=", latex_safe(_fmt(s.mean)),
-            "\\quad\\mathbf{std}=", latex_safe(_fmt(s.std)),
-            "\\quad\\mathbf{median}=", latex_safe(_fmt(s.median)),
+            "\\mathrm{N}=\\mathbf{", s.n, "}",
+            "\\quad\\mathrm{finite}=\\mathbf{", s.n_finite, "}",
+            "\\quad\\mathrm{NaN}=\\mathbf{", s.n_nan, "}",
+            "\\quad\\mathrm{min}=\\mathbf{", latex_safe(_fmt(s.min)), "}",
+            "\\quad\\mathrm{max}=\\mathbf{", latex_safe(_fmt(s.max)), "}",
+            "\\quad\\mathrm{mean}=\\mathbf{", latex_safe(_fmt(s.mean)), "}",
+            "\\quad\\mathrm{std}=\\mathbf{", latex_safe(_fmt(s.std)), "}",
+            "\\quad\\mathrm{median}=\\mathbf{", latex_safe(_fmt(s.median)), "}",
         )
     end
     Label(grid[2, 1]; text = stats_label_obs,
@@ -351,13 +351,13 @@ function _view_vector(
 
     Label(ctrl[3, 1], text = "Export", halign = :left, tellwidth = false,
           fontsize = 14, color = ui_text_muted)
-    save_png_btn = Button(ctrl[3, 2]; label = "Save PNG", width = 110, height = 32)
-    save_pdf_btn = Button(ctrl[3, 3]; label = "Save PDF", width = 110, height = 32)
-    save_csv_btn = Button(ctrl[3, 4]; label = "Save CSV", width = 110, height = 32)
+    save_png_btn = Button(ctrl[3, 2]; label = "$(MANTA_ICONS.export_icon) PNG", width = 90, height = 32)
+    save_pdf_btn = Button(ctrl[3, 3]; label = "$(MANTA_ICONS.export_icon) PDF", width = 90, height = 32)
+    save_csv_btn = Button(ctrl[3, 4]; label = "$(MANTA_ICONS.export_icon) CSV", width = 90, height = 32)
 
     # Style consistent avec les autres vues MANTA.
-    foreach(w -> manta_style_button_primary!(w, ui_theme), (sel_apply_btn, save_png_btn))
-    foreach(w -> manta_style_button!(w, ui_theme),         (save_pdf_btn, save_csv_btn))
+    foreach(w -> manta_style_button_primary!(w, ui_theme),
+            (sel_apply_btn, save_png_btn, save_pdf_btn, save_csv_btn))
     manta_style_button_ghost!(sel_reset_btn, ui_theme)
     foreach(w -> manta_style_menu!(w, ui_theme),
             (xscale_menu, yscale_menu))
@@ -474,10 +474,8 @@ function _view_vector(
         end
     end
 
-    keepalive!(fig)
-    on(fig.scene.events.window_open) do is_open
-        is_open || forget!(fig)
-    end
+    register_window_close!(fig)  # anchor in GC root — see MANTA._KEEP_ALIVE block comment
+    enable_file_drop!(fig; activate_gl = activate_gl, display_fig = display_fig)
     display_fig && display(fig)
     return fig
 end

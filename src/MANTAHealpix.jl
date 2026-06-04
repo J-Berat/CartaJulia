@@ -67,6 +67,8 @@ include("views/HealpixProjection.jl")
 
 In-memory HEALPix map viewer (Mollweide projection).
 Accepts the same keyword arguments as `manta_healpix(filepath::String; …)`.
+
+Lifecycle: see `manta_healpix(filepath::String; …)`.
 """
 function manta_healpix(
     m::Healpix.HealpixMap;
@@ -82,7 +84,7 @@ function manta_healpix(
     activate_gl::Bool = true,
     display_fig::Bool = true,
     hist_mode::Symbol = :bars,
-    hist_bins::Int = 64,
+    hist_bins::Int = HIST_BINS_DEFAULT,
     hist_xlimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
     hist_ylimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
 )
@@ -130,14 +132,43 @@ function manta_healpix(
     ell_x = [2cos(t) for t in LinRange(0, 2π, 200)]
     ell_y = [sin(t) for t in LinRange(0, 2π, 200)]
     lines!(ax, ell_x, ell_y; color=:black, linewidth=0.8)
-    keepalive!(fig)
-    on(fig.scene.events.window_open) do is_open
-        is_open || forget!(fig)
-    end
+    register_window_close!(fig)  # anchor in GC root — see MANTA._KEEP_ALIVE block comment
+    enable_file_drop!(fig; activate_gl = activate_gl, display_fig = display_fig)
     display_fig && display(fig)
     return fig
 end
 
+"""
+    manta_healpix_panels(panels...; titles, cmaps, clims,
+                         nx=1400, ny=700, figsize,
+                         activate_gl=true, display_fig=true,
+                         show_graticule=true)
+
+Side-by-side Mollweide viewer for N HEALPix maps or RGB HEALPix pixel
+arrays.  Each element of `panels` becomes one column in a single `Figure`.
+
+- Scalar (1-D) panels are rasterised to a Mollweide grid and shown as
+  heatmaps with individual colorbars.
+- RGB/RGBA panels (`npix × 3/4` or compatible) are rendered as true-colour
+  Mollweide images.
+- A graticule (l/b grid lines) is drawn on every panel when
+  `show_graticule=true`.
+
+Kwargs:
+- `titles`  : panel titles (default: "panel 1", "panel 2", …).
+- `cmaps`   : colormaps for scalar panels (default `:inferno`).
+- `clims`   : explicit `(lo, hi)` per panel; `nothing` auto-scales.
+- `nx`, `ny`: Mollweide grid resolution in pixels (default 1400×700).
+- `figsize` : explicit `(width, height)`; falls back to `_pick_fig_size`.
+- `activate_gl`, `display_fig`: same semantics as `manta`.
+
+Returns the `Figure`.
+
+Lifecycle:
+The figure is pinned in `MANTA._KEEP_ALIVE` on construction and released
+automatically via the `window_open` event when the window is closed.
+See `keepalive!` / `forget!` for the full rationale.
+"""
 function manta_healpix_panels(
     panels::Vararg{Any,N};
     titles = nothing,
@@ -211,10 +242,8 @@ function manta_healpix_panels(
         ell_y = [sin(t) for t in LinRange(0, 2π, 200)]
         lines!(ax, ell_x, ell_y; color=:black, linewidth=0.8)
     end
-    keepalive!(fig)
-    on(fig.scene.events.window_open) do is_open
-        is_open || forget!(fig)
-    end
+    register_window_close!(fig)  # anchor in GC root — see MANTA._KEEP_ALIVE block comment
+    enable_file_drop!(fig; activate_gl = activate_gl, display_fig = display_fig)
     display_fig && display(fig)
     return fig
 end
@@ -337,6 +366,13 @@ Interactive HEALPix viewer in Mollweide projection.
   manual `vmin`/`vmax`.
 
 Returns the GLMakie `Figure`.
+
+Lifecycle:
+The returned `Figure` is pinned in `MANTA._KEEP_ALIVE` on construction to
+prevent Julia's GC from collecting the figure and its `Observable` graph
+while the window is open.  The reference is released automatically via a
+`window_open` listener when the user closes the window.  Storing the return
+value is optional.
 """
 function manta_healpix(
     filepath::String;
@@ -353,7 +389,7 @@ function manta_healpix(
     activate_gl::Bool = true,
     display_fig::Bool = true,
     hist_mode::Symbol = :bars,
-    hist_bins::Int = 64,
+    hist_bins::Int = HIST_BINS_DEFAULT,
     hist_xlimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
     hist_ylimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
 )
@@ -392,6 +428,11 @@ Controls:
 - scale, manual contrast, colormap, invert colormap, save PNG.
 
 `v0`, `dv`, `vunit` define the spectral axis `v(j) = v0 + (j-1)*dv`.
+
+Lifecycle:
+The returned `Figure` is pinned in `MANTA._KEEP_ALIVE` on construction and
+released automatically via the `window_open` event on close.  See
+`manta_healpix(filepath::String; …)` for the full explanation.
 """
 function manta_healpix_cube(
     filepath::String;
@@ -410,7 +451,7 @@ function manta_healpix_cube(
     activate_gl::Bool = true,
     display_fig::Bool = true,
     hist_mode::Symbol = :bars,
-    hist_bins::Int = 64,
+    hist_bins::Int = HIST_BINS_DEFAULT,
     hist_xlimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
     hist_ylimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
     spec_ylimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
@@ -462,6 +503,7 @@ function _view_healpix_cube(
     vmax = nothing,
     invert::Bool = false,
     scale::Symbol = :lin,
+    asinh_softening::Real = ASINH_SOFTENING_DEFAULT,
     nx::Int = 1200,
     ny::Int = 600,
     figsize::Union{Nothing,Tuple{Int,Int}} = nothing,
@@ -469,7 +511,7 @@ function _view_healpix_cube(
     activate_gl::Bool = true,
     display_fig::Bool = true,
     hist_mode::Symbol = :bars,
-    hist_bins::Int = 64,
+    hist_bins::Int = HIST_BINS_DEFAULT,
     hist_xlimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
     hist_ylimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
     spec_ylimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
@@ -507,7 +549,7 @@ function _view_healpix_cube(
 
     # ---------- Pre-compute Mollweide pixel index (once) ----------
     res = Healpix.Resolution(nside)
-    ipix_grid = mollweide_pixel_index(res, nx, ny)   # 0 = hors ellipse
+    ipix_grid = _cached_mollweide_pixel_index(res, nx, ny)   # 0 = hors ellipse
 
     function projected_vector_image(vals)
         out = fill(NaN32, ny, nx)
@@ -546,7 +588,7 @@ function _view_healpix_cube(
         on ? nan_gaussian_filter(im, σ) : im
     end
     img_disp = lift(img_proc, scale_mode) do im, m_
-        out = apply_scale(im, m_)
+        out = apply_scale(im, m_; asinh_softening = asinh_softening)
         out2 = similar(out, Float32)
         @inbounds for k in eachindex(out)
             x = out[k]; out2[k] = isfinite(x) ? Float32(x) : NaN32
@@ -561,18 +603,24 @@ function _view_healpix_cube(
     # after the log transform has been applied).
     use_manual = Observable(false)
     clims_manual = Observable((0f0, 1f0))
-    function _vector_clims(vals, mode::Symbol)
+    # Collect finite, non-UNSEEN raw samples then push them through the shared
+    # `apply_scale` transform so the auto contrast is computed in *exactly* the
+    # same display space as the heatmap (handles :lin/:log10/:ln/:asinh/:sqrt,
+    # with the same ≤0→NaN and asinh-softening rules — no inline duplication).
+    function _scaled_finite(raw::Vector{Float32}, mode::Symbol)
+        t = apply_scale(raw, mode; asinh_softening = asinh_softening)
         fin = Float32[]
-        if mode === :lin
-            @inbounds for v in vals
-                (isfinite(v) && v != Float32(Healpix.UNSEEN)) && push!(fin, Float32(v))
-            end
-        else
-            f = mode === :log10 ? log10 : log
-            @inbounds for v in vals
-                (isfinite(v) && v != Float32(Healpix.UNSEEN) && v > 0) && push!(fin, Float32(f(v)))
-            end
+        @inbounds for x in t
+            isfinite(x) && push!(fin, Float32(x))
         end
+        return fin
+    end
+    function _vector_clims(vals, mode::Symbol)
+        raw = Float32[]
+        @inbounds for v in vals
+            (isfinite(v) && v != Float32(Healpix.UNSEEN)) && push!(raw, Float32(v))
+        end
+        fin = _scaled_finite(raw, mode)
         isempty(fin) && return mode === :lin ? (0f0, 1f0) : (-1f0, 1f0)
         lo = Float32(quantile(fin, mode === :lin ? 0.01 : 0.05))
         hi = Float32(quantile(fin, 0.995))
@@ -581,22 +629,14 @@ function _view_healpix_cube(
     end
 
     function _global_clims(mode::Symbol)
-        if mode === :lin
-            fin = Float32[]
-            @inbounds for v in cube
-                (isfinite(v) && v != Float32(Healpix.UNSEEN)) && push!(fin, v)
-            end
-            isempty(fin) && return (0f0, 1f0)
-            return (Float32(quantile(fin, 0.01)), Float32(quantile(fin, 0.995)))
-        else
-            f = mode === :log10 ? log10 : log
-            fin = Float32[]
-            @inbounds for v in cube
-                (isfinite(v) && v != Float32(Healpix.UNSEEN) && v > 0) && push!(fin, Float32(f(v)))
-            end
-            isempty(fin) && return (-1f0, 1f0)
-            return (Float32(quantile(fin, 0.05)), Float32(quantile(fin, 0.995)))
+        raw = Float32[]
+        @inbounds for v in cube
+            (isfinite(v) && v != Float32(Healpix.UNSEEN)) && push!(raw, Float32(v))
         end
+        fin = _scaled_finite(raw, mode)
+        isempty(fin) && return mode === :lin ? (0f0, 1f0) : (-1f0, 1f0)
+        return (Float32(quantile(fin, mode === :lin ? 0.01 : 0.05)),
+                Float32(quantile(fin, 0.995)))
     end
     clims_auto = lift(scale_mode, show_moment, moment_order) do m_, show_mom, ord
         show_mom ? _vector_clims(moment_vector(ord), m_) : _global_clims(m_)
@@ -615,7 +655,7 @@ function _view_healpix_cube(
     end
 
     contour_auto_levels = lift(img_disp) do im
-        automatic_contour_levels(im; n = 7)
+        automatic_contour_levels(im; n = CONTOUR_N_LEVELS_DEFAULT)
     end
     contour_use_manual = Observable(false)
     contour_manual_levels = Observable(Float32[])
@@ -826,8 +866,9 @@ function _view_healpix_cube(
     end
     scatter!(ax_img, marker_pts; color=ui_accent, markersize=MARKER_SIZE_HP, marker=:cross)
 
-    map_unit_label = lift(show_moment, moment_order) do show_mom, ord
-        show_mom ? latexstring("\\text{", latex_safe(moment_label(ord)), "}") : data_unit_tex
+    map_unit_label = lift(show_moment, moment_order, scale_mode) do show_mom, ord, m_
+        show_mom ? latexstring("\\text{", latex_safe(moment_label(ord)), "}") :
+                   scale_label_tex(m_, data_unit)
     end
     Colorbar(
         map_grid[2, 1],
@@ -849,7 +890,7 @@ function _view_healpix_cube(
     # bounds (entered by the user in the same transformed space) are applied
     # as y-limits.
     spec_y_disp = lift(spec_y_obs, scale_mode) do y, m_
-        out = apply_scale(y, m_)
+        out = apply_scale(y, m_; asinh_softening = asinh_softening)
         out2 = similar(out, Float32)
         @inbounds for k in eachindex(out)
             x = out[k]; out2[k] = isfinite(x) ? Float32(x) : NaN32
@@ -861,9 +902,7 @@ function _view_healpix_cube(
         xlabel = is_channel_axis ?
             L"\text{channel}" :
             latexstring("v\\;[\\mathrm{", latex_safe(vunit_eff), "}]"),
-        ylabel = lift(m_ -> m_ === :lin   ? data_unit_tex :
-                            m_ === :log10 ? latexstring("\\log_{10}\\,\\text{", latex_safe(data_unit), "}") :
-                                            latexstring("\\ln\\,\\text{", latex_safe(data_unit), "}"), scale_mode),
+        ylabel = lift(m_ -> scale_label_tex(m_, data_unit), scale_mode),
         tellheight = false)
     lines!(ax_spec, spec_x, spec_y_disp; color=:black, linewidth=1.5)
     # vertical line at v(chan_idx)
@@ -963,16 +1002,19 @@ function _view_healpix_cube(
 
     # -- Mode bar (full width) --
     mode_bar = ctrl_grid[3, 1:3] = GridLayout(; alignmode = Outside(0), halign = :center)
-    colgap!(mode_bar, compact_layout ? 6 : 10)
+    colgap!(mode_bar, compact_layout ? 8 : 12)
     tab_h = tight_layout ? 28 : 32
-    mode_nav_btn      = Button(mode_bar[1, 1]; label = "Navigation", width = tight_layout ? 118 : 130, height = tab_h)
-    mode_analysis_btn = Button(mode_bar[1, 2]; label = "Analysis",   width = tight_layout ? 104 : 112, height = tab_h)
-    mode_export_btn   = Button(mode_bar[1, 3]; label = "Export",     width = tight_layout ? 90  : 96,  height = tab_h)
-    help_btn          = Button(mode_bar[1, 4]; label = "Help",       width = tight_layout ? 70  : 74,  height = tab_h)
-    btn_undo          = Button(mode_bar[1, 5]; label = "⟲ Undo",     width = tight_layout ? 86  : 92,  height = tab_h)
-    btn_redo          = Button(mode_bar[1, 6]; label = "⟳ Redo",     width = tight_layout ? 86  : 92,  height = tab_h)
-    foreach(c -> colsize!(mode_bar, c, Auto()), 1:6)
-    foreach(w -> manta_style_button!(w, ui_theme; compact = compact_layout),
+    mode_segment = mode_bar[1, 1] = GridLayout(; alignmode = Outside(0))
+    colgap!(mode_segment, 0)
+    mode_nav_btn      = Button(mode_segment[1, 1]; label = "$(MANTA_ICONS.nav) Navigation", width = tight_layout ? 136 : 148, height = tab_h)
+    mode_analysis_btn = Button(mode_segment[1, 2]; label = "$(MANTA_ICONS.analysis) Analysis", width = tight_layout ? 122 : 132, height = tab_h)
+    mode_export_btn   = Button(mode_segment[1, 3]; label = "$(MANTA_ICONS.export_icon) Export", width = tight_layout ? 106 : 114, height = tab_h)
+    foreach(c -> colsize!(mode_segment, c, Auto()), 1:3)
+    help_btn          = Button(mode_bar[1, 2]; label = MANTA_ICONS.help, width = tight_layout ? 42 : 46, height = tab_h)
+    btn_undo          = Button(mode_bar[1, 3]; label = MANTA_ICONS.undo, width = tight_layout ? 42 : 46, height = tab_h)
+    btn_redo          = Button(mode_bar[1, 4]; label = MANTA_ICONS.redo, width = tight_layout ? 42 : 46, height = tab_h)
+    foreach(c -> colsize!(mode_bar, c, Auto()), 1:4)
+    foreach(w -> manta_style_segmented_button!(w, ui_theme; compact = compact_layout),
             (mode_nav_btn, mode_analysis_btn, mode_export_btn))
     foreach(w -> manta_style_button_ghost!(w, ui_theme; compact = compact_layout),
             (help_btn, btn_undo, btn_redo))
@@ -993,12 +1035,14 @@ function _view_healpix_cube(
                 "\\,\\mathrm{", latex_safe(vunit_eff), "}"), chan_idx),
         fontsize = font_sz, halign = :left, tellwidth = false)
     ctrl_lbl!(channel_card, (3, 1), "Scale")
-    scale_menu = Menu(channel_card[3, 2:3]; options = ["lin", "log10", "ln"], prompt = String(scale))
+    scale_menu = Menu(channel_card[3, 2:3]; options = scale_menu_options(), prompt = String(scale))
     manta_style_menu!(scale_menu, ui_theme; compact = compact_layout)
 
     # display_card [nav col 2] — Colormap, Invert, Smoothing
     display_card = control_card!(ctrl_grid, 1, 2, "Display"; rows = 4, cols = 5)
-    cmap_menu = Menu(display_card[2, 1:3]; options = ui_colormap_options(), prompt = String(cmap))
+    cmap_menu = colormap_selector!(display_card[2, 1:3];
+        cmap = cmap, width = compact_layout ? 132 : 152,
+        compact = compact_layout, theme = ui_theme)
     manta_style_menu!(cmap_menu, ui_theme; compact = compact_layout)
     invert_chk = Checkbox(display_card[2, 4])
     invert_chk.checked[] = invert_cmap[]
@@ -1022,7 +1066,7 @@ function _view_healpix_cube(
     manta_style_checkbox!(graticule_chk, ui_theme; compact = compact_layout)
     Label(nav_view_card[2, 2]; text = "Graticule", halign = :left, tellwidth = false,
         fontsize = font_sz, color = ui_theme.text_muted)
-    reset_btn = Button(nav_view_card[2, 3:4]; label = "Reset zoom", height = 32)
+    reset_btn = Button(nav_view_card[2, 3:4]; label = "$(MANTA_ICONS.fit) Fit", height = 32)
     manta_style_button_ghost!(reset_btn, ui_theme; compact = compact_layout)
 
     # ---- ANALYSIS cards ----
@@ -1119,7 +1163,7 @@ function _view_healpix_cube(
 
     # ---- EXPORT cards ----
     output_card = control_card!(ctrl_grid, 1, 1, "Output"; rows = 3, cols = 3)
-    save_btn = Button(output_card[2, 1:2]; label = "$(MANTA_ICONS.save) Save PNG", height = 32)
+    save_btn = Button(output_card[2, 1:2]; label = "$(MANTA_ICONS.export_icon) PNG", height = 32)
     manta_style_button_primary!(save_btn, ui_theme; compact = compact_layout)
 
     # Grid sizing
@@ -1141,10 +1185,7 @@ function _view_healpix_cube(
     export_cards_hpc   = (output_card,)
 
     function set_mode_button_active!(btn, active::Bool)
-        btn.buttoncolor[]       = active ? ui_theme.accent        : ui_theme.surface
-        btn.buttoncolor_hover[] = active ? ui_theme.accent_strong : ui_theme.surface_hover
-        btn.labelcolor[]        = active ? :white                 : ui_theme.text
-        btn.labelcolor_hover[]  = active ? :white                 : ui_theme.accent_strong
+        manta_style_segmented_button!(btn, ui_theme; compact = compact_layout, active = active)
         nothing
     end
     function refresh_control_mode!()
@@ -1670,8 +1711,7 @@ function _view_healpix_cube(
         _set_status_hpc!(new_val ? "Contours enabled." : "Contours hidden.")
     end
     function _cycle_log_scale_hpc!()
-        next = scale_mode[] === :lin   ? :log10 :
-               scale_mode[] === :log10 ? :ln    : :lin
+        next = cycle_scale_mode(scale_mode[])
         scale_menu.selection[] = String(next)
         _set_status_hpc!("Image scale: $(String(next)).")
     end
@@ -1699,6 +1739,14 @@ function _view_healpix_cube(
         ShortcutBinding(Keyboard.l,         () -> _cycle_log_scale_hpc!();
                         description = "cycle scale"),
     ]
+    # `g` toggles the graticule checkbox; its handler propagates to the
+    # overlay, keeping the UI control and the shortcut in sync.
+    push!(shortcuts_hpc,
+          ShortcutBinding(Keyboard.g,
+                          () -> (graticule_chk.checked[] = !graticule_chk.checked[]);
+                          description = "toggle graticule"))
+    # `+`/`-` (and numpad) centered zoom on the Mollweide image axis.
+    append!(shortcuts_hpc, zoom_shortcut_bindings(ax_img; on_change = _set_status_hpc!))
     # Help: Shift+/ and the Help button open a dedicated Makie figure
     # listing every documented binding; status bar keeps the one-liner.
     function _open_help_hpc!()
@@ -1726,10 +1774,8 @@ function _view_healpix_cube(
         is_blocked = () -> zoom_drag_active[] || region_drag_active[],
     )
 
-    keepalive!(fig)
-    on(fig.scene.events.window_open) do is_open
-        is_open || forget!(fig)
-    end
+    register_window_close!(fig)  # anchor in GC root — see MANTA._KEEP_ALIVE block comment
+    enable_file_drop!(fig; activate_gl = activate_gl, display_fig = display_fig)
     display_fig && display(fig)
     return fig
 end

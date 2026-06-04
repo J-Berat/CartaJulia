@@ -79,6 +79,146 @@
     @test issorted(levels)
 end
 
+@testset "helpers: asinh/sqrt stretches" begin
+    A = Float32.([1, 10, 100, 0, -1])
+
+    # asinh keeps the sign and is defined on all of ℝ (0 and negatives finite),
+    # unlike log/ln. Default softening a = 1 → asinh(x).
+    as = MANTA.apply_scale(A, :asinh)
+    @test eltype(as) == Float32
+    @test all(isfinite, as)
+    @test isapprox(as[1], Float32(asinh(1.0));   atol = 1e-6)
+    @test isapprox(as[2], Float32(asinh(10.0));  atol = 1e-5)
+    @test as[4] == 0f0
+    @test as[5] < 0f0 && isapprox(as[5], -as[1]; atol = 1e-6)
+
+    # Softening: asinh(x / a). Larger a → smaller magnitude for the same x.
+    as2 = MANTA.apply_scale(A, :asinh; asinh_softening = 2.0)
+    @test isapprox(as2[2], Float32(asinh(10.0 / 2.0)); atol = 1e-5)
+    @test abs(as2[2]) < abs(as[2])
+    # Non-positive / non-finite softening collapses to the default (a = 1).
+    @test MANTA.apply_scale(A, :asinh; asinh_softening = -3.0) == as
+    @test MANTA.apply_scale(A, :asinh; asinh_softening = NaN) == as
+
+    # sqrt mirrors the log/ln rule: values ≤ 0 become NaN (0 included).
+    sq = MANTA.apply_scale(A, :sqrt)
+    @test eltype(sq) == Float32
+    @test isapprox(sq[2], Float32(sqrt(10.0)); atol = 1e-5)
+    @test sq[3] == 10f0
+    @test isnan(sq[4]) && isnan(sq[5])
+
+    # apply_scale_display never returns non-finite (NaN → 0) for both modes.
+    @test all(isfinite, MANTA.apply_scale_display(A, :sqrt))
+    @test all(isfinite, MANTA.apply_scale_display(A, :asinh; asinh_softening = 3.0))
+
+    # Centralised mode metadata (single source of truth for menus & cycling).
+    @test MANTA.scale_menu_options() == ["lin", "log10", "ln", "asinh", "sqrt"]
+    @test MANTA.cycle_scale_mode(:lin)   === :log10
+    @test MANTA.cycle_scale_mode(:ln)    === :asinh
+    @test MANTA.cycle_scale_mode(:asinh) === :sqrt
+    @test MANTA.cycle_scale_mode(:sqrt)  === :lin       # wraps around
+    @test MANTA.cycle_scale_mode(:bogus) === :lin       # unknown restarts cycle
+
+    # LaTeX label helper decorates the unit with the active stretch.
+    @test occursin("sqrt",  String(MANTA.scale_label_tex(:sqrt, "Jy")))
+    @test occursin("asinh", String(MANTA.scale_label_tex(:asinh, "Jy")))
+    @test occursin("log",   String(MANTA.scale_label_tex(:log10, "Jy")))
+    @test occursin("Jy",    String(MANTA.scale_label_tex(:lin, "Jy")))
+end
+
+@testset "helpers: wcs sky graticule (pure math)" begin
+    # CAR projection: lon = lon0 + (i-1)·CDELT1, lat = lat0 + (j-1)·CDELT2.
+    hdr_car = Dict{String,Any}(
+        "CTYPE1" => "GLON-CAR", "CUNIT1" => "deg",
+        "CRVAL1" => 30.0, "CRPIX1" => 1.0, "CDELT1" => 1.0,
+        "CTYPE2" => "GLAT-CAR", "CUNIT2" => "deg",
+        "CRVAL2" => 0.0,  "CRPIX2" => 1.0, "CDELT2" => 1.0,
+    )
+    wt = MANTA.read_wcs_transform(hdr_car, 2)
+    lon, lat = MANTA.wcs_sky_grids(wt, 4, 3)
+    @test size(lon) == (4, 3) && size(lat) == (4, 3)
+    @test all(isfinite, lon) && all(isfinite, lat)
+    @test isapprox(lon[1, 1], 30.0; atol = 1e-9)
+    @test isapprox(lon[4, 1], 33.0; atol = 1e-9)   # depends on i only
+    @test isapprox(lat[1, 1], 0.0;  atol = 1e-9)
+    @test isapprox(lat[1, 3], 2.0;  atol = 1e-9)   # depends on j only
+
+    lon_levels, lat_levels = MANTA.wcs_graticule_levels(lon, lat; n = 6)
+    @test !isempty(lon_levels) && !isempty(lat_levels)
+    @test issorted(lon_levels) && issorted(lat_levels)
+    @test all(l -> 30.0 - 1e-9 <= l <= 33.0 + 1e-9, lon_levels)
+    @test all(l -> 0.0  - 1e-9 <= l <= 2.0  + 1e-9, lat_levels)
+
+    # "nice" step selection and its degenerate guards.
+    @test MANTA.nice_graticule_step(3.0, 6) == 0.5
+    @test MANTA.nice_graticule_step(0.0) == 1.0
+    @test MANTA.nice_graticule_step(NaN) == 1.0
+
+    # No sky pair → all-NaN grids, empty levels, and a no-op overlay handle.
+    lon0, lat0 = MANTA.wcs_sky_grids(MANTA.SimpleWCSAxis[], 3, 3)
+    @test all(isnan, lon0) && all(isnan, lat0)
+    @test MANTA.wcs_graticule_levels(lon0, lat0) == (Float64[], Float64[])
+    # draw_wcs_graticule! never touches `ax` when there are no levels, so the
+    # no-op path is safe to exercise headlessly with a dummy axis argument.
+    grat = MANTA.draw_wcs_graticule!(nothing, MANTA.SimpleWCSAxis[], 3, 3)
+    @test isempty(grat.plots)
+    @test MANTA.set_wcs_graticule_visible!(grat, true) === grat   # no error
+end
+
+@testset "helpers: startup defaults" begin
+    # Typed coercers apply a value when present & well-typed, else keep current.
+    d = Dict{Symbol,Any}(
+        :cmap => "magma", :invert => true, :scale => "asinh",
+        :asinh_softening => 2.5, :hist_bins => 256, :nx => 1600,
+        :figsize => [1400, 900], :save_dir => "/tmp/out",
+    )
+    @test MANTA._manta_default_symbol(d, :cmap, :viridis) === :magma
+    @test MANTA._manta_default_bool(d, :invert, false) === true
+    @test MANTA._manta_default_symbol(d, :scale, :lin) === :asinh
+    @test MANTA._manta_default_real(d, :asinh_softening, 1.0) == 2.5
+    @test MANTA._manta_default_int(d, :hist_bins, 64) === 256
+    @test MANTA._manta_default_figsize(d, :figsize, nothing) === (1400, 900)
+    @test MANTA._manta_default_string(d, :save_dir, nothing) == "/tmp/out"
+    # Absent key → current is returned unchanged.
+    @test MANTA._manta_default_symbol(d, :missing, :keep) === :keep
+    @test MANTA._manta_default_int(d, :missing, 7) === 7
+    # Wrong-typed entry degrades gracefully (keeps current).
+    bad = Dict{Symbol,Any}(:hist_bins => "lots", :figsize => [1, 2, 3])
+    @test MANTA._manta_default_int(bad, :hist_bins, 64) === 64
+    @test MANTA._manta_default_figsize(bad, :figsize, nothing) === nothing
+
+    # Round-trip through a TOML file via the MANTA_DEFAULTS override.
+    saved = get(ENV, "MANTA_DEFAULTS", nothing)
+    try
+        dir = mktempdir()
+        path = joinpath(dir, "defaults.toml")
+        write(path, "cmap = \"inferno\"\nscale = \"sqrt\"\nhist_bins = 128\n")
+        ENV["MANTA_DEFAULTS"] = path
+        @test MANTA.manta_defaults_path() == path
+        loaded = MANTA.load_manta_defaults()
+        @test loaded[:cmap] == "inferno"
+        @test loaded[:scale] == "sqrt"
+        @test loaded[:hist_bins] == 128
+        @test MANTA._manta_default_symbol(loaded, :scale, :lin) === :sqrt
+
+        # Missing file → empty dict (no error).
+        ENV["MANTA_DEFAULTS"] = joinpath(dir, "does_not_exist.toml")
+        @test isempty(MANTA.load_manta_defaults())
+
+        # Malformed file → empty dict (warns, never fatal).
+        bad_path = joinpath(dir, "bad.toml")
+        write(bad_path, "this is = = not valid toml [[[")
+        ENV["MANTA_DEFAULTS"] = bad_path
+        @test isempty(MANTA.load_manta_defaults())
+    finally
+        if saved === nothing
+            delete!(ENV, "MANTA_DEFAULTS")
+        else
+            ENV["MANTA_DEFAULTS"] = saved
+        end
+    end
+end
+
 @testset "helpers: mapping" begin
     # bijection uv <-> ijk depending on the axis
     for axis in 1:3
@@ -223,7 +363,7 @@ end
     @test MANTA.to_cmap(:gray) == MANTA.to_cmap(:grayC)
     @test all(name -> length(MANTA.to_cmap(name)) > 0, MANTA.ui_colormap_options())
     @test MANTA.ui_colormap_options() == collect(MANTA.MANTA_COLORMAP_OPTIONS)
-    @test all(in(MANTA.ui_colormap_options()), ["viridis", "cividis", "magma", "inferno", "plasma", "gray"])
+    @test all(in(MANTA.ui_colormap_options()), ["viridis", "inferno", "gray", "coolwarm"])
 
     # get_box_str via mock (no Makie Textbox available)
     struct MockTB
@@ -349,6 +489,43 @@ end
     @test ok6 && val6 == 2.5f0
 end
 
+@testset "ui: manta_flag_textbox!" begin
+    # Red-border validity cue. Construct a real Makie Textbox headlessly
+    # (no backend activated) and toggle its border palette.
+    theme = MANTA.default_ui_theme()
+    fig = Makie.Figure()
+    tb = Makie.Textbox(fig[1, 1])
+
+    # Rejected input → all three border states painted with the error red.
+    ret = MANTA.manta_flag_textbox!(tb, false, theme)
+    @test ret === tb
+    @test RGBf(tb.bordercolor[])         == theme.error
+    @test RGBf(tb.bordercolor_hover[])   == theme.error
+    @test RGBf(tb.bordercolor_focused[]) == theme.error
+
+    # Accepted input → the normal themed palette (matches manta_style_textbox!).
+    MANTA.manta_flag_textbox!(tb, true, theme)
+    @test RGBf(tb.bordercolor[])         == theme.border
+    @test RGBf(tb.bordercolor_hover[])   == theme.accent_dim
+    @test RGBf(tb.bordercolor_focused[]) == theme.accent
+end
+
+@testset "ui: cube status footer tone" begin
+    theme = MANTA.default_ui_theme()
+
+    @test MANTA._cube_status_tone("Saved image to /tmp/out.png.") === :success
+    @test MANTA._cube_status_color("GIF exported to /tmp/out.gif.", theme) == theme.success
+
+    @test MANTA._cube_status_tone("Failed to save PNG: permission denied") === :error
+    @test MANTA._cube_status_color("Histogram bins must be an integer.", theme) == theme.error
+
+    @test MANTA._cube_status_tone("Draw a box with left drag on the image.") === :action
+    @test MANTA._cube_status_color("Colormap set to magma.", theme) == theme.accent
+
+    @test MANTA._cube_status_tone("x = 12, y = 42, value = 0.7") === :neutral
+    @test MANTA._cube_status_color("x = 12, y = 42, value = 0.7", theme) == theme.text_muted
+end
+
 @testset "helpers: validation" begin
     ok, use_manual, clims, msg = MANTA.parse_manual_clims("1.5", "2.5")
     @test ok && use_manual
@@ -430,6 +607,13 @@ end
     @test wcs[2].kind === :dec
     @test wcs[2].projection == "TAN"
     @test wcs[1].spectral_quantity === :other
+
+    unnamed_wcs = MANTA.read_simple_wcs(Dict{String,Any}("CRVAL1" => 0.0, "CDELT1" => 1.0), 1)
+    @test MANTA.has_wcs(unnamed_wcs, 1)
+    unnamed_label = String(MANTA.wcs_axis_label(unnamed_wcs, 1; fallback = "axis1 [pix]"))
+    @test occursin("axis1", unnamed_label)
+    @test occursin("[pix]", unnamed_label)
+    @test !occursin("world", lowercase(unnamed_label))
 end
 
 @testset "helpers: wcs transform" begin
@@ -535,6 +719,110 @@ end
     @test MANTA.SimpleWCSAxis("STOKES", "",    0, 1, 1, true).kind === :stokes
 end
 
+@testset "helpers: cursor readout" begin
+    # Pixel coordinates are rounded to the nearest integer FITS pixel.
+    s = MANTA.format_cursor_readout(["x" => 12.4, "y" => 7.8], 3.5, "Jy/beam")
+    @test occursin("x=12", s)
+    @test occursin("y=8", s)
+    @test occursin("3.5", s)
+    @test occursin("Jy/beam", s)
+
+    # Blank unit is omitted; the value still shows.
+    s_nounit = MANTA.format_cursor_readout(["x" => 1, "y" => 1], 2.0, "   ")
+    @test occursin("2.0", s_nounit)
+    @test !occursin("  2.0 ", s_nounit)  # no trailing unit separator
+
+    # NaN / nothing / missing all render as "NaN" (or are skipped for nothing).
+    @test occursin("NaN", MANTA.format_cursor_readout(["x" => 1], NaN, "K"))
+    @test occursin("NaN", MANTA.format_cursor_readout(["x" => 1], missing, "K"))
+    @test !occursin("NaN", MANTA.format_cursor_readout(["x" => 1], nothing, "K"))
+
+    # World-coordinate strings (from format_world_coord) are appended verbatim,
+    # empty ones skipped. Reuse the WCS header built above is overkill — build
+    # a tiny RA/DEC pair here.
+    hdr = Dict{String,Any}(
+        "CTYPE1" => "RA---TAN", "CUNIT1" => "deg",
+        "CRVAL1" => 120.0, "CRPIX1" => 1.0, "CDELT1" => -0.5,
+        "CTYPE2" => "DEC--TAN", "CUNIT2" => "deg",
+        "CRVAL2" => -30.0, "CRPIX2" => 2.0, "CDELT2" => 0.25,
+    )
+    w = MANTA.read_simple_wcs(hdr, 2)
+    world = [MANTA.format_world_coord(w, 1, 3), MANTA.format_world_coord(w, 2, 2)]
+    full = MANTA.format_cursor_readout(["x" => 3, "y" => 2], 9.0, "K", world)
+    @test occursin("RA---TAN", full)
+    @test occursin("DEC--TAN", full)
+    @test occursin("K", full)
+    # An empty world entry is dropped, not rendered as a stray separator.
+    @test !occursin("  =", MANTA.format_cursor_readout(["x" => 1], 1.0, "K", ["", "RA=1"]))
+
+    # Empty everything → empty string (no crash, no stray separators).
+    @test MANTA.format_cursor_readout([]) == ""
+
+    # format_world_value formats a *given* world value (no pixel→world step)
+    # and stays consistent with format_world_coord ∘ world_coord.
+    @test MANTA.format_world_value(w, 1, 119.0) == MANTA.format_world_coord(w, 1, 3)
+    @test occursin("RA---TAN", MANTA.format_world_value(w, 1, 119.0))
+    @test occursin("deg", MANTA.format_world_value(w, 1, 119.0))
+    # No WCS on the axis → "pixN=value" fallback.
+    @test occursin("pix3=", MANTA.format_world_value(MANTA.SimpleWCSAxis[], 3, 7.0))
+end
+
+@testset "helpers: cursor world strings (exact CD path)" begin
+    # Rotated TAN frame with a full CD matrix: cursor_world_strings must use
+    # sky_world_coords (CD + deprojection), not the per-axis linear CDELT.
+    hdr = Dict{String,Any}(
+        "CTYPE1" => "RA---TAN", "CUNIT1" => "deg",
+        "CRVAL1" => 150.0, "CRPIX1" => 64.0,
+        "CTYPE2" => "DEC--TAN", "CUNIT2" => "deg",
+        "CRVAL2" => 2.0, "CRPIX2" => 64.0,
+        # ~30° rotation, 0.001 deg/pix scale.
+        "CD1_1" => -0.001 * cosd(30), "CD1_2" =>  0.001 * sind(30),
+        "CD2_1" =>  0.001 * sind(30), "CD2_2" =>  0.001 * cosd(30),
+    )
+    wvec  = MANTA.read_simple_wcs(hdr, 2)
+    xform = MANTA.read_wcs_transform(hdr, 2)
+    @test MANTA.sky_dims(xform) == (1, 2)
+    @test xform.cd !== nothing
+
+    px, py = 100.0, 30.0   # well off the reference pixel so rotation matters
+
+    # Exact path matches sky_world_coords formatted through format_world_value.
+    sc = MANTA.sky_world_coords(xform, px, py)
+    @test sc !== nothing
+    exact = MANTA.cursor_world_strings(wvec, xform, [1, 2], [px, py])
+    @test exact == [MANTA.format_world_value(wvec, 1, sc[1]),
+                    MANTA.format_world_value(wvec, 2, sc[2])]
+
+    # Linear fallback (xform = nothing) differs from the exact CD/projection
+    # result at this off-center pixel — proves the CD path actually fires.
+    linear = MANTA.cursor_world_strings(wvec, nothing, [1, 2], [px, py])
+    @test linear == [MANTA.format_world_coord(wvec, 1, px),
+                     MANTA.format_world_coord(wvec, 2, py)]
+    @test exact != linear
+
+    # Display order is preserved (x first, then y) — swap dims/pix and check.
+    swapped = MANTA.cursor_world_strings(wvec, xform, [2, 1], [py, px])
+    @test occursin("DEC--TAN", swapped[1])
+    @test occursin("RA---TAN", swapped[2])
+
+    # A spectral 3rd axis stays linear even when the sky pair is exact.
+    hdr3 = merge(hdr, Dict{String,Any}(
+        "CTYPE3" => "FREQ", "CUNIT3" => "Hz",
+        "CRVAL3" => 1.0e11, "CRPIX3" => 1.0, "CDELT3" => 1.0e6))
+    wvec3  = MANTA.read_simple_wcs(hdr3, 3)
+    xform3 = MANTA.read_wcs_transform(hdr3, 3)
+    cube_world = MANTA.cursor_world_strings(wvec3, xform3, [2, 1, 3], [py, px, 5])
+    @test length(cube_world) == 3
+    @test occursin("FREQ", cube_world[3])
+    @test occursin("1.00004e11", cube_world[3])  # 1e11 + (5-1)*1e6
+
+    # No-WCS axes are skipped entirely; empty when nothing carries WCS.
+    @test MANTA.cursor_world_strings(MANTA.SimpleWCSAxis[], nothing, [1], [3.0]) == String[]
+
+    # Length mismatch is a hard error (programmer bug, not silent).
+    @test_throws ArgumentError MANTA.cursor_world_strings(wvec, xform, [1, 2], [1.0])
+end
+
 @testset "helpers: settings io" begin
     mktempdir() do tmp
         settings_path = joinpath(tmp, "viewer_settings.toml")
@@ -553,6 +841,23 @@ end
         @test restored["axis"] == 2
         @test restored["img_scale"] == "log10"
         @test restored["use_manual_clims"] == true
+    end
+
+    # Spectrum y-axis policy schema: a string source + Float32 bounds must
+    # survive the TOML round-trip (regression guard for the persisted
+    # spec_ylimits_source / spec_ymin / spec_ymax keys).
+    mktempdir() do tmp
+        settings_path = joinpath(tmp, "spec_ylimits.toml")
+        payload = Dict{String,Any}(
+            "spec_ylimits_source" => "manual",
+            "spec_ymin" => 2.5f0,
+            "spec_ymax" => 9.0f0,
+        )
+        MANTA.save_viewer_settings(settings_path, payload)
+        restored = MANTA.load_viewer_settings(settings_path)
+        @test restored["spec_ylimits_source"] == "manual"
+        @test isapprox(restored["spec_ymin"], 2.5; atol = 1e-6)
+        @test isapprox(restored["spec_ymax"], 9.0; atol = 1e-6)
     end
 end
 
@@ -824,6 +1129,15 @@ end
     @test MANTA.fits_header_for_region_spectrum(nothing, 3, 1) === nothing
     @test MANTA.fits_header_for_filtered_cube(nothing, 3, 1.0) === nothing
 
+    # --- display formatter for the header pop-out window ---
+    display_lines = MANTA.fits_header_display_lines(src_hdr)
+    @test occursin("CTYPE1", display_lines[6])
+    @test occursin("'RA---TAN'", display_lines[6])
+    @test occursin("axis1", display_lines[6])
+    @test any(occursin("HISTORY", line) && occursin("original cube", line)
+              for line in display_lines)
+    @test MANTA.fits_header_display_lines(nothing) == ["(no FITS header available)"]
+
     # --- end-to-end: write a real FITS file and read the header back ---
     mktempdir() do dir
         out = joinpath(dir, "slice.fits")
@@ -915,6 +1229,66 @@ end
     @test_logs (:warn, "Shortcut handler error") events(fig3).keyboardbutton[] = Makie.KeyEvent(Makie.Keyboard.r, Makie.Keyboard.press)
     events(fig3).keyboardbutton[] = Makie.KeyEvent(Makie.Keyboard.s, Makie.Keyboard.press)
     @test survived[] == 1
+end
+
+# ----------------------------------------------------------------------------
+# Centered zoom shortcuts (headless)
+# ----------------------------------------------------------------------------
+@testset "helpers: zoom shortcuts" begin
+    # --- zoom_limits: pure math, center-preserving, uniform scaling ---
+    @test MANTA.zoom_limits((0.0, 10.0, 0.0, 20.0), 0.8) == (1.0, 9.0, 2.0, 18.0)
+    @test MANTA.zoom_limits((0.0, 10.0, 0.0, 20.0), 1.25) == (-1.25, 11.25, -2.5, 22.5)
+    # Center is preserved for any factor.
+    let (a, b, c, d) = MANTA.zoom_limits((2.0, 6.0, -4.0, 4.0), 0.5)
+        @test (a + b) / 2 ≈ 4.0
+        @test (c + d) / 2 ≈ 0.0
+        @test (b - a) ≈ 2.0   # 4-wide span × 0.5
+        @test (d - c) ≈ 4.0   # 8-wide span × 0.5
+    end
+    # Degenerate / invalid inputs are returned unchanged (never NaN/inverted).
+    @test MANTA.zoom_limits((0.0, 0.0, 0.0, 10.0), 0.8) == (0.0, 0.0, 0.0, 10.0)
+    @test MANTA.zoom_limits((0.0, 10.0, 0.0, 10.0), 0.0) == (0.0, 10.0, 0.0, 10.0)
+    @test MANTA.zoom_limits((0.0, 10.0, 0.0, 10.0), -1.0) == (0.0, 10.0, 0.0, 10.0)
+    let bad = MANTA.zoom_limits((NaN, 10.0, 0.0, 10.0), 0.8)
+        @test bad === (NaN, 10.0, 0.0, 10.0)
+    end
+
+    # --- key labels for the new bindings render as +/− ---
+    @test MANTA.format_shortcut(MANTA.ShortcutBinding(Makie.Keyboard.equal, () -> nothing)) == "+"
+    @test MANTA.format_shortcut(MANTA.ShortcutBinding(Makie.Keyboard.minus, () -> nothing)) == "−"
+    @test MANTA.format_shortcut(MANTA.ShortcutBinding(Makie.Keyboard.kp_add, () -> nothing)) == "+"
+    @test MANTA.format_shortcut(MANTA.ShortcutBinding(Makie.Keyboard.kp_subtract, () -> nothing)) == "−"
+
+    # --- zoom_shortcut_bindings: shape + help (numpad twins are undocumented) ---
+    msgs = String[]
+    binds = MANTA.zoom_shortcut_bindings(nothing; on_change = m -> push!(msgs, m))
+    @test length(binds) == 4
+    # Only the main-row +/- carry a description, so help lists each once.
+    @test MANTA.format_shortcut_help(binds) == "+ zoom in · − zoom out"
+
+    # --- zoom_axis!: reads finallimits, applies a centered limits! ---
+    fig = Figure(size = (320, 200))
+    ax  = Axis(fig[1, 1])
+    ax.finallimits[] = Makie.Rect2f(0.0f0, 0.0f0, 10.0f0, 20.0f0)  # x∈[0,10], y∈[0,20]
+    MANTA.zoom_axis!(ax, 0.5)
+    tl = ax.targetlimits[]
+    @test isapprox(tl.origin[1], 2.5; atol = 1e-4)
+    @test isapprox(tl.origin[2], 5.0; atol = 1e-4)
+    @test isapprox(tl.widths[1], 5.0; atol = 1e-4)
+    @test isapprox(tl.widths[2], 10.0; atol = 1e-4)
+
+    # --- firing the `=`/`+` binding zooms in and echoes a status string ---
+    fig2 = Figure(size = (320, 200))
+    ax2  = Axis(fig2[1, 1])
+    ax2.finallimits[] = Makie.Rect2f(0.0f0, 0.0f0, 100.0f0, 100.0f0)
+    status = Ref("")
+    z = MANTA.zoom_shortcut_bindings(ax2; on_change = s -> (status[] = s))
+    MANTA.register_shortcuts!(fig2, z)
+    events(fig2).keyboardbutton[] = Makie.KeyEvent(Makie.Keyboard.equal, Makie.Keyboard.press)
+    @test status[] == "Zoomed in."
+    @test ax2.targetlimits[].widths[1] < 100.0f0   # span shrank → zoomed in
+    events(fig2).keyboardbutton[] = Makie.KeyEvent(Makie.Keyboard.minus, Makie.Keyboard.press)
+    @test status[] == "Zoomed out."
 end
 
 # ----------------------------------------------------------------------------
@@ -1102,6 +1476,10 @@ end
     @test MANTA.downsample_factor((8000, 4000), 4096) == 2
     @test_throws ArgumentError MANTA.downsample_factor((100,), 0)
 
+    # Block centers stay in the original pixel coordinate system.
+    @test MANTA.downsample_centers(5, 2) == Float32[1.5, 3.5, 5.0]
+    @test MANTA.downsample_centers(3, 1) == Float32[1.0, 2.0, 3.0]
+
     # 3D variant: only downsamples the spatial dims, preserves nz.
     E = rand(Float32, 1000, 1000, 5)
     outE, sE = MANTA.auto_downsample(E; max_pixels = 200)
@@ -1234,4 +1612,19 @@ end
         42
     end
     @test result == 42
+end
+
+# ----------------------------------------------------------------------------
+# Drag-and-drop helpers
+# ----------------------------------------------------------------------------
+@testset "helpers: drag-and-drop" begin
+    empty!(MANTA._DROP_ARMED)
+
+    fig = Figure(size = (120, 90))
+    @test MANTA.enable_file_drop!(fig; activate_gl = false, display_fig = false) === fig
+    @test haskey(MANTA._DROP_ARMED, fig.scene)
+
+    n_armed = length(MANTA._DROP_ARMED)
+    @test MANTA.enable_file_drop!(fig; activate_gl = false, display_fig = false) === fig
+    @test length(MANTA._DROP_ARMED) == n_armed
 end

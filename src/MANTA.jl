@@ -1,9 +1,123 @@
 # path: src/MANTA.jl
 module MANTA
 
+# ---------------------------------------------------------------------------
+# Observable / Figure lifecycle registry
+#
+# Problem: Julia's GC is a tracing collector.  A GLMakie `Figure` owns the
+# root of an `Observable` graph — slice index, colormap, contrast limits,
+# etc.  Once `display(fig)` returns, *user code* no longer holds any local
+# variable pointing at `fig`, so the GC is free to collect it along with
+# every `Observable` and `on(...)` listener registered on it.  GLMakie's
+# rendering thread holds internal back-references to the *scene*, but not
+# to the Julia `Figure` wrapper nor to the Observables layer above it,
+# which means interactive callbacks silently die the next time the GC runs.
+#
+# Solution: pin each `Figure` in the module-level `_KEEP_ALIVE` array as
+# soon as it is built.  The array is the GC root that prevents collection.
+# This is *intentional* — it is not a leak.
+#
+# Cleanup: every viewer registers a single listener on
+# `fig.scene.events.window_open`.  When GLMakie sets that Observable to
+# `false` (window closed by the user), `forget!(fig)` removes the figure
+# from `_KEEP_ALIVE`.  With no remaining strong reference the GC can then
+# collect the `Figure` together with its entire `Observable` graph and all
+# GPU-side buffers that GLMakie releases on scene destruction.
+#
+# Invariant: keepalive!(fig) is always called *before* display(fig), and
+# forget!(fig) is always called from the window_open callback, never
+# earlier.  Callers that set display_fig=false (headless tests, exports)
+# still call keepalive! so the figure stays valid for the duration of any
+# post-build operations, and forget! is still triggered on window close
+# (which is a no-op when the figure was never displayed).
+# ---------------------------------------------------------------------------
 const _KEEP_ALIVE = Any[]
+const _WINDOW_CLOSE_EVENTS = IdDict{Any,Any}()
+
+"""
+    keepalive!(x)
+
+Pin `x` (typically a `Figure`) in the module-level GC-root registry so it
+is not collected while its window is open.  Returns `x` unchanged.
+
+See the `_KEEP_ALIVE` block comment above for the full rationale.
+Use `forget!(x)` to release the reference (called automatically from the
+`window_open` event listener installed by every viewer entry point).
+"""
 keepalive!(x) = (push!(_KEEP_ALIVE, x); x)
+
+"""
+    forget!(x)
+
+Remove `x` from the `_KEEP_ALIVE` registry, allowing the GC to collect it
+once no other reference exists.  Idempotent: calling it twice is safe.
+
+This is called automatically from the `on(fig.scene.events.window_open)`
+listener installed by every MANTA viewer when the window is closed.
+"""
 forget!(x) = (filter!(y -> y !== x, _KEEP_ALIVE); nothing)
+
+"""
+    register_window_close!(fig[, on_close])
+
+Pin `fig` while its GLMakie window is open and release it when
+`fig.scene.events.window_open` becomes `false`.  `on_close` is called exactly
+once before the figure is forgotten.
+"""
+function register_window_close!(fig, on_close::Function = () -> nothing)
+    keepalive!(fig)
+    close_event = get!(_WINDOW_CLOSE_EVENTS, fig) do
+        Base.Event()
+    end
+    did_close = Ref(false)
+
+    function finish_close!()
+        did_close[] && return nothing
+        did_close[] = true
+        try
+            on_close()
+        catch e
+            @warn "MANTA: window close callback failed" exception=(e, catch_backtrace())
+        end
+        forget!(fig)
+        pop!(_WINDOW_CLOSE_EVENTS, fig, nothing)
+        notify(close_event)
+        return nothing
+    end
+
+    on(fig.scene.events.window_open) do is_open
+        is_open || finish_close!()
+    end
+    try
+        fig.scene.events.window_open[] || finish_close!()
+    catch
+        # Some non-GL/headless figures may not expose a usable window state.
+    end
+    return fig
+end
+
+register_window_close!(on_close::Function, fig) = register_window_close!(fig, on_close)
+
+"""
+    wait_until_closed(fig)
+
+Block until the GLMakie window backing `fig` is closed by the user.  Prefer
+this over polling `isopen(fig.scene)`, which can stay true after the native
+window has already disappeared on some GLMakie/GLFW combinations.
+"""
+function wait_until_closed(fig)
+    haskey(_WINDOW_CLOSE_EVENTS, fig) || register_window_close!(fig)
+    close_event = get!(_WINDOW_CLOSE_EVENTS, fig) do
+        Base.Event()
+    end
+    try
+        fig.scene.events.window_open[] || return nothing
+    catch
+        return nothing
+    end
+    wait(close_event)
+    return nothing
+end
 
 using GLMakie
 using CairoMakie
@@ -39,6 +153,7 @@ export manta_healpix, manta_healpix_cube, is_healpix_fits,
 
 # ---- loaders ----
 include("loaders/LazyFITS.jl")
+include("loaders/LazyHDF5.jl")
 include("loaders/FITSLoader.jl")
 include("loaders/HDF5Loader.jl")
 include("loaders/InMemoryLoader.jl")
@@ -49,6 +164,8 @@ include("views/HealpixMapView.jl")
 # Cube-viewer support: pure helpers shared by `_view_cube` and any future
 # cube-related entry points. Included before CubeView.jl so the symbols
 # are available when the closure-heavy view body is compiled.
+include("views/cube/CubeViewState.jl")
+include("views/cube/CubeLayout.jl")
 include("views/cube/MaskBundle.jl")
 include("views/cube/CompareBundle.jl")
 include("views/cube/KeyboardBundle.jl")
@@ -72,6 +189,7 @@ export stable_source_id
 export view_cube
 # Mask system (persistent voxel masks for cube viewers)
 export MaskSource, NoMaskSource, FiniteSource, ThresholdSource, RectangleSource
+export GradientSource, MorphologySource
 export AndSource, OrSource, NotSource
 export MANTAMask, make_mask, build_mask, validate_bounds, mask_count, mask_total, mask_fraction
 export mask_source_to_toml, mask_source_from_toml
@@ -81,6 +199,7 @@ spawn_safely(f::Function) = @async try f() catch e
 end
 
 export set_dark_mode!, is_dark_mode, dark_ui_theme, current_ui_theme
+export wait_until_closed
 export manta, manta_panels, manta_batch
 
 """
@@ -113,6 +232,16 @@ Notes:
 - `activate_gl=false` allows smoke tests without requiring an OpenGL
   context.
 - `display_fig=false` skips window display (useful for automated tests).
+
+Lifecycle:
+The returned `Figure` is pinned in the module-level `_KEEP_ALIVE` registry
+immediately after construction.  This prevents Julia's GC from collecting
+the figure (and its Observable graph) while the window is open.  When the
+user closes the window, GLMakie fires `fig.scene.events.window_open = false`
+and MANTA's internal listener calls `forget!(fig)` to release the strong
+reference.  You do not need to do anything special: just call `manta(...)`,
+interact with the window, and close it when done.  Holding the returned
+`Figure` in a variable is optional and does not change memory behaviour.
 """
 function manta(
     filepath::String;
@@ -131,8 +260,9 @@ function manta(
     nx::Int = 1400,
     ny::Int = 700,
     scale::Symbol = :lin,
+    asinh_softening::Real = ASINH_SOFTENING_DEFAULT,
     hist_mode::Symbol = :bars,
-    hist_bins::Int = 64,
+    hist_bins::Int = HIST_BINS_DEFAULT,
     hist_xlimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
     hist_ylimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
     # HEALPix PPV cube (npix×nv) — spectral axis for the spectrum panel
@@ -155,6 +285,24 @@ function manta(
     # the whole cube up-front). Quietly ignored for non-FITS inputs.
     lazy::Bool = false,
     )
+    # User startup defaults (~/.manta/defaults.toml). Per the configured policy
+    # the file *wins over* explicit keyword arguments, so a user can pin their
+    # preferred look once and not re-pass it on every launch. Missing or
+    # malformed files degrade to a no-op (see `load_manta_defaults`).
+    _defaults = load_manta_defaults()
+    if !isempty(_defaults)
+        cmap            = _manta_default_symbol(_defaults, :cmap, cmap)
+        invert          = _manta_default_bool(_defaults, :invert, invert)
+        scale           = _manta_default_symbol(_defaults, :scale, scale)
+        asinh_softening = _manta_default_real(_defaults, :asinh_softening, asinh_softening)
+        hist_mode       = _manta_default_symbol(_defaults, :hist_mode, hist_mode)
+        hist_bins       = _manta_default_int(_defaults, :hist_bins, hist_bins)
+        column          = _manta_default_int(_defaults, :column, column)
+        nx              = _manta_default_int(_defaults, :nx, nx)
+        ny              = _manta_default_int(_defaults, :ny, ny)
+        figsize         = _manta_default_figsize(_defaults, :figsize, figsize)
+        save_dir        = _manta_default_string(_defaults, :save_dir, save_dir)
+    end
     ds = load_dataset(filepath; column = column, v0 = v0, dv = dv, vunit = vunit,
                       hdu = hdu, lazy = lazy)
 
@@ -162,6 +310,7 @@ function manta(
         return manta(ds;
             cmap = cmap === :viridis ? :inferno : cmap,
             vmin = vmin, vmax = vmax, invert = invert, scale = scale,
+            asinh_softening = asinh_softening,
             hist_mode = hist_mode, hist_bins = hist_bins,
             hist_xlimits = hist_xlimits, hist_ylimits = hist_ylimits,
             nx = nx, ny = ny, figsize = figsize, save_dir = save_dir,
@@ -170,6 +319,7 @@ function manta(
         return manta(ds;
             cmap = cmap === :viridis ? :inferno : cmap,
             vmin = vmin, vmax = vmax, invert = invert, scale = scale,
+            asinh_softening = asinh_softening,
             hist_mode = hist_mode, hist_bins = hist_bins,
             hist_xlimits = hist_xlimits, hist_ylimits = hist_ylimits,
             spec_ylimits = spec_ylimits,
@@ -182,6 +332,8 @@ function manta(
     elseif ds isa CubeDataset
         return manta(ds;
             cmap = cmap, vmin = vmin, vmax = vmax, invert = invert,
+            scale = scale,
+            asinh_softening = asinh_softening,
             figsize = figsize, save_dir = save_dir,
             activate_gl = activate_gl, display_fig = display_fig,
             settings_path = settings_path,
@@ -197,6 +349,7 @@ function manta(
     elseif ds isa ImageDataset
         return manta(ds;
             cmap = cmap, vmin = vmin, vmax = vmax, invert = invert,
+            asinh_softening = asinh_softening,
             hist_mode = hist_mode, hist_bins = hist_bins,
             hist_xlimits = hist_xlimits, hist_ylimits = hist_ylimits,
             scale = scale, figsize = figsize, save_dir = save_dir,
@@ -214,8 +367,9 @@ function manta(
     vmax = nothing,
     invert::Bool = false,
     scale::Symbol = :lin,
+    asinh_softening::Real = ASINH_SOFTENING_DEFAULT,
     hist_mode::Symbol = :bars,
-    hist_bins::Int = 64,
+    hist_bins::Int = HIST_BINS_DEFAULT,
     hist_xlimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
     hist_ylimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
     figsize::Union{Nothing,Tuple{Int,Int}} = nothing,
@@ -223,6 +377,8 @@ function manta(
     activate_gl::Bool = true,
     display_fig::Bool = true,
     unit_label::AbstractString = "value",
+    wcs::AbstractVector{SimpleWCSAxis} = SimpleWCSAxis[],
+    wcs_transform::Union{Nothing,WCSTransform} = nothing,
 )
     data2d = Float32.(img)
     unit_label_tex = latexstring("\\text{", latex_safe(unit_label), "}")
@@ -233,8 +389,9 @@ function manta(
         base = to_cmap(name); inv ? reverse(base) : base
     end
     scale_mode = Observable(scale)
-    img_disp = lift(scale_mode) do m
-        A = apply_scale(data2d, m)
+    asinh_a = Observable(Float32(asinh_softening))
+    img_disp = lift(scale_mode, asinh_a) do m, a
+        A = apply_scale(data2d, m; asinh_softening = a)
         out = similar(A, Float32)
         @inbounds for i in eachindex(A)
             x = A[i]
@@ -311,6 +468,20 @@ function manta(
         valign = :center,
     )
 
+    # Celestial WCS graticule overlaid on the image. Computed by contouring the
+    # per-pixel sky grids (same deprojection as the cursor readout); a no-op
+    # with empty `plots` when the input carries no identified sky axis pair, so
+    # the headless precompile path (wcs = SimpleWCSAxis[]) is unaffected.
+    grat_src = wcs_transform === nothing ? wcs : wcs_transform
+    show_graticule = Observable(false)
+    graticule_handle = (wcs_transform !== nothing || !isempty(wcs)) ?
+        draw_wcs_graticule!(ax, grat_src, size(data2d, 1), size(data2d, 2); visible = false) :
+        nothing
+    has_grat = graticule_handle !== nothing && !isempty(graticule_handle.plots)
+    on(show_graticule) do v
+        graticule_handle === nothing || set_wcs_graticule_visible!(graticule_handle, v)
+    end
+
     ui_accent = ui_theme.accent
     ui_text_muted = ui_theme.text_muted
 
@@ -329,12 +500,22 @@ function manta(
 
     ctrl = grid[2, 1] = GridLayout(; alignmode = Outside())
     Label(ctrl[1, 1], text = "Image", halign = :left, tellwidth = false, fontsize = 14, color = ui_text_muted)
-    scale_menu = Menu(ctrl[1, 2]; options = ["lin", "log10", "ln"], prompt = String(scale), width = 96)
+    scale_menu = Menu(ctrl[1, 2]; options = scale_menu_options(), prompt = String(scale), width = 96)
     Label(ctrl[1, 3], text = "Colormap", halign = :left, tellwidth = false, fontsize = 14, color = ui_text_muted)
-    cmap_menu = Menu(ctrl[1, 4]; options = ui_colormap_options(), prompt = String(cmap), width = 112)
+    cmap_menu = colormap_selector!(ctrl[1, 4]; cmap = cmap, width = 112, theme = ui_theme)
     invert_chk = Checkbox(ctrl[1, 5])
     Label(ctrl[1, 6], text = "Invert", halign = :left, tellwidth = false, fontsize = 14, color = ui_theme.text)
-    help_btn = Button(ctrl[1, 7]; label = "Help", width = 78, height = 32)
+    help_btn = Button(ctrl[1, 7]; label = MANTA_ICONS.help, width = 46, height = 32)
+    # Graticule toggle: only surfaced when the image actually carries a sky WCS
+    # (otherwise `has_grat` is false and the control would be a dead no-op).
+    grat_chk = nothing
+    if has_grat
+        grat_chk = Checkbox(ctrl[1, 8]; checked = false)
+        Label(ctrl[1, 9], text = "Graticule", halign = :left, tellwidth = false, fontsize = 14, color = ui_theme.text)
+        on(grat_chk.checked) do c
+            show_graticule[] = c
+        end
+    end
     Label(ctrl[2, 1], text = "Contrast", halign = :left, tellwidth = false, fontsize = 14, color = ui_text_muted)
     clim_min_box = Textbox(ctrl[2, 2]; placeholder = "min", width = 110, height = 32)
     clim_max_box = Textbox(ctrl[2, 3]; placeholder = "max", width = 110, height = 32)
@@ -342,7 +523,7 @@ function manta(
     auto_btn = Button(ctrl[2, 5]; label = "Auto", width = 78, height = 32)
     p1_btn = Button(ctrl[2, 6]; label = "p1-p99", width = 92, height = 32)
     p5_btn = Button(ctrl[2, 7]; label = "p5-p95", width = 92, height = 32)
-    save_btn = Button(ctrl[2, 8]; label = "Save PNG", width = 108, height = 32)
+    save_btn = Button(ctrl[2, 8]; label = "$(MANTA_ICONS.export_icon) PNG", width = 90, height = 32)
     Label(ctrl[3, 1], text = "Histogram", halign = :left, tellwidth = false, fontsize = 14, color = ui_text_muted)
     hist_mode_menu = Menu(ctrl[3, 2]; options = ["bars", "kde"], prompt = String(hist_mode_obs[]), width = 96)
     hist_bins_box = Textbox(ctrl[3, 3]; placeholder = "bins", width = 82, height = 32)
@@ -384,6 +565,30 @@ function manta(
     end
 
     set_status!(msg::AbstractString) = (ui_status[] = String(msg); nothing)
+
+    # ── Live cursor readout (DS9 / CARTA style) ──────────────────────────
+    # Pixel value + WCS world coordinates under the pointer, pushed into the
+    # shared status line on every move. `heatmap!(ax, matrix)` samples the
+    # image at integer coordinates 1:N, so the rounded data-space position is
+    # the FITS pixel index along each axis (dim 1 = rows, dim 2 = columns).
+    # Exact celestial coordinates (CD matrix + projection) when the loader
+    # supplied a full WCSTransform; otherwise cursor_world_strings degrades to
+    # the per-axis linear world_coord.
+    nx2d, ny2d = size(data2d)
+    function _readout_at(px::Real, py::Real)
+        ix = clamp(round(Int, px), 1, nx2d)
+        iy = clamp(round(Int, py), 1, ny2d)
+        val = @inbounds data2d[ix, iy]
+        world = cursor_world_strings(wcs, wcs_transform, [1, 2], [ix, iy])
+        return format_cursor_readout(["x" => ix, "y" => iy], val, unit_label, world)
+    end
+    on(events(ax).mouseposition) do _
+        Makie.is_mouseinside(ax.scene) || return
+        p = mouseposition(ax)
+        (isfinite(p[1]) && isfinite(p[2])) || return
+        set_status!(_readout_at(p[1], p[2]))
+    end
+
     set_box_text!(tb, s::AbstractString) = begin
         str = String(s)
         tb.displayed_string[] = str
@@ -544,8 +749,7 @@ function manta(
     # ---------- Keyboard shortcuts (2D image view) ----------
     _trigger_button_2d!(btn) = (btn.clicks[] = btn.clicks[] + 1)
     function _cycle_log_scale_2d!()
-        next = scale_mode[] === :lin   ? :log10 :
-               scale_mode[] === :log10 ? :ln    : :lin
+        next = cycle_scale_mode(scale_mode[])
         scale_menu.selection[] = String(next)
         set_status!("Image scale: $(String(next)).")
     end
@@ -565,6 +769,15 @@ function manta(
         ShortcutBinding(Keyboard.l,  () -> _cycle_log_scale_2d!();
                         description = "cycle scale"),
     ]
+    # `+`/`-` (and numpad) centered zoom on the image axis.
+    append!(shortcuts_2d, zoom_shortcut_bindings(ax; on_change = set_status!))
+    if has_grat
+        # 'g' flips the checkbox; its handler propagates to `show_graticule`
+        # and thus to the overlay, keeping the UI in sync with the shortcut.
+        push!(shortcuts_2d,
+              ShortcutBinding(Keyboard.g, () -> (grat_chk.checked[] = !grat_chk.checked[]);
+                              description = "toggle WCS graticule"))
+    end
     # Help window — both the Shift+/ binding and the Help button open a
     # dedicated Makie figure listing every documented shortcut. The status
     # bar still gets a one-line recap so headless / scripted users keep a
@@ -592,11 +805,9 @@ function manta(
                      hist_ymin_box, hist_ymax_box),
     )
 
-    keepalive!(fig)
+    register_window_close!(fig)  # anchor in GC root — see _KEEP_ALIVE block comment
+    enable_file_drop!(fig; activate_gl = activate_gl, display_fig = display_fig)
     refresh_hist_axes!()
-    on(fig.scene.events.window_open) do is_open
-        is_open || forget!(fig)
-    end
     display_fig && display(fig)
     return fig
 end
@@ -622,14 +833,36 @@ function manta(
     )
     rows, cols = size(rgb_img)
     image!(ax, (1, cols), (1, rows), permutedims(rgb_img))
-    keepalive!(fig)
-    on(fig.scene.events.window_open) do is_open
-        is_open || forget!(fig)
-    end
+    register_window_close!(fig)  # anchor in GC root — see _KEEP_ALIVE block comment
+    enable_file_drop!(fig; activate_gl = activate_gl, display_fig = display_fig)
     display_fig && display(fig)
     return fig
 end
 
+"""
+    manta_panels(panels...; titles, cmaps, clims, figsize, activate_gl, display_fig)
+
+Side-by-side static viewer for N 2-D arrays or RGB images.
+
+Each element of `panels` becomes one column in a single `Figure`.  Scalar
+panels are shown as heatmaps with an individual colorbar; RGB/RGBA panels
+are rendered as true-color images.
+
+Kwargs:
+- `titles`  : vector of column titles (default: "panel 1", "panel 2", …).
+- `cmaps`   : vector of colormaps, one per scalar panel (default `:viridis`).
+- `clims`   : vector of `(lo, hi)` tuples; `nothing` auto-scales each panel.
+- `figsize` : explicit `(width, height)` in pixels; falls back to
+              `_pick_fig_size(nothing)` (1800×1000).
+- `activate_gl`, `display_fig` : same semantics as `manta`.
+
+Returns the `Figure`.
+
+Lifecycle:
+The figure is pinned in `_KEEP_ALIVE` on construction and released
+automatically via the `window_open` event when the window is closed.
+See `keepalive!` / `forget!` for details.
+"""
 function manta_panels(
     panels::Vararg{Any,N};
     titles = nothing,
@@ -670,10 +903,8 @@ function manta_panels(
             )
         end
     end
-    keepalive!(fig)
-    on(fig.scene.events.window_open) do is_open
-        is_open || forget!(fig)
-    end
+    register_window_close!(fig)  # anchor in GC root — see _KEEP_ALIVE block comment
+    enable_file_drop!(fig; activate_gl = activate_gl, display_fig = display_fig)
     display_fig && display(fig)
     return fig
 end
@@ -692,9 +923,12 @@ end
 Dispatch a pre-built MANTA dataset to the matching viewer.
 """
 function manta(ds::ImageDataset; kwargs...)
+    xform = get(ds.metadata, :wcs_transform, nothing)
     return manta(ds.data;
         title = ds.source_id,
         unit_label = ds.unit_label,
+        wcs = ds.wcs,
+        wcs_transform = xform isa WCSTransform ? xform : nothing,
         kwargs...)
 end
 
@@ -710,6 +944,7 @@ function manta(
     vmax = nothing,
     invert::Bool = false,
     scale::Symbol = :lin,
+    asinh_softening::Real = ASINH_SOFTENING_DEFAULT,
     nx::Int = 1200,
     ny::Int = 600,
     figsize::Union{Nothing,Tuple{Int,Int}} = nothing,
@@ -717,7 +952,7 @@ function manta(
     activate_gl::Bool = true,
     display_fig::Bool = true,
     hist_mode::Symbol = :bars,
-    hist_bins::Int = 64,
+    hist_bins::Int = HIST_BINS_DEFAULT,
     hist_xlimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
     hist_ylimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
     spec_ylimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
@@ -733,7 +968,8 @@ function manta(
     end
     return _view_healpix_cube(ds;
         cmap = cmap, vmin = vmin, vmax = vmax, invert = invert,
-        scale = scale, nx = nx, ny = ny, figsize = figsize,
+        scale = scale, asinh_softening = asinh_softening,
+        nx = nx, ny = ny, figsize = figsize,
         save_dir = save_dir, activate_gl = activate_gl,
         display_fig = display_fig,
         hist_mode = hist_mode, hist_bins = hist_bins,
@@ -751,13 +987,15 @@ function manta(
     vmin = nothing,
     vmax = nothing,
     invert::Bool = false,
+    scale::Symbol = :lin,
+    asinh_softening::Real = ASINH_SOFTENING_DEFAULT,
     figsize::Union{Nothing,Tuple{Int,Int}} = nothing,
     save_dir::Union{Nothing,AbstractString} = nothing,
     activate_gl::Bool = true,
     display_fig::Bool = true,
     settings_path::Union{Nothing,AbstractString} = nothing,
     hist_mode::Symbol = :bars,
-    hist_bins::Int = 64,
+    hist_bins::Int = HIST_BINS_DEFAULT,
     hist_xlimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
     hist_ylimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
     spec_ylimits::Union{Nothing,Tuple{<:Real,<:Real}} = nothing,
@@ -776,6 +1014,8 @@ function manta(
     end
     return _view_cube(ds;
         cmap = cmap, vmin = vmin, vmax = vmax, invert = invert,
+        scale = scale,
+        asinh_softening = asinh_softening,
         figsize = figsize, save_dir = save_dir,
         activate_gl = activate_gl, display_fig = display_fig,
         settings_path = settings_path,
@@ -930,6 +1170,16 @@ using PrecompileTools: @setup_workload, @compile_workload
         nside = 1,
         source_id = "precompile_hpix_cube")
 
+    # On-disk FITS cube for the full "open a cube → … → export" path. Written
+    # to a throwaway temp dir so the export workload exercises the real FITS
+    # loader (not just the in-memory bridge) and the CairoMakie save pipeline.
+    # Removed again after the workload — nothing persists past precompilation.
+    _pc_tmpdir = mktempdir()
+    _pc_fits   = joinpath(_pc_tmpdir, "precompile_cube.fits")
+    FITS(_pc_fits, "w") do f
+        write(f, reshape(Float32.(1:(6 * 6 * 4)), 6, 6, 4))
+    end
+
     @compile_workload begin
         # 1D vector → line plot + stats + selection path.
         let fig = manta(_pc_vec1d;
@@ -965,7 +1215,25 @@ using PrecompileTools: @setup_workload, @compile_workload
                         nx = 60, ny = 30, figsize = (600, 380))
             forget!(fig)
         end
+
+        # Full export path: open the FITS cube → build the cube viewer headless
+        # → save through CairoMakie (with_export_backend). This is the heaviest
+        # TTFP cost on a real launch and was previously uncompiled. PNG and PDF
+        # go through distinct Cairo surfaces (raster vs vector), so both are
+        # warmed. `manta_batch` traps per-file render errors internally (logs a
+        # @warn and continues), so this can never abort precompilation.
+        manta_batch([_pc_fits];
+                    format = :png, save_dir = _pc_tmpdir,
+                    activate_gl = false, display_fig = false,
+                    figsize = (400, 300))
+        manta_batch([_pc_fits];
+                    format = :pdf, save_dir = _pc_tmpdir,
+                    activate_gl = false, display_fig = false,
+                    figsize = (400, 300))
     end
+
+    # Transient: drop the temp dir built for the export workload above.
+    rm(_pc_tmpdir; recursive = true, force = true)
 end
 
 end # module

@@ -35,6 +35,7 @@ function _cube_compare_bundle(;
     data,
     siz,
     compare_data,
+    compare_header = nothing,
     compare_visible,
     compare_name,
     compare_path_current,
@@ -63,7 +64,7 @@ function _cube_compare_bundle(;
         compare_mode_menu.width[]   = 0
         compare_path_box.placeholder[] = "second cube FITS path"
         compare_path_box.width[]    = 310
-        btn_load_compare.label[]    = "Load cube"
+        btn_load_compare.label[]    = "$(MANTA_ICONS.compare) Load"
         btn_load_compare.width[]    = 104
         compare_state_label.text[]  = "Comparison: waiting for cube path"
         compare_state_label.color[] = ui_text_muted
@@ -84,8 +85,8 @@ function _cube_compare_bundle(;
         btn_load_compare.width[]  = 0
         compare_mode_menu.width[] = compare_visible[] ? 150 : 0
         if !compare_visible[]
-            btn_show_compare.label[]        = "Compare cube..."
-            btn_show_compare.width[]        = 138
+            btn_show_compare.label[]        = "$(MANTA_ICONS.compare) Compare"
+            btn_show_compare.width[]        = 120
             compare_state_label.text[]      = "Comparison: no cube loaded"
             compare_state_label.color[]     = ui_text_muted
         end
@@ -235,6 +236,7 @@ function _cube_compare_bundle(;
             return false
         end
         compare_data[]         = cmp_prepared
+        compare_header === nothing || (compare_header[] = cmp_header)
         compare_name[]         = String(replace(basename(cmp_path), r"\.fits(\.gz)?$" => ""))
         compare_path_current[] = cmp_path
         compare_visible[]      = true

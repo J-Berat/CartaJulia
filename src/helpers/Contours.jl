@@ -7,11 +7,11 @@
 
 
 """
-    automatic_contour_levels(vals; n=7) -> Vector{Float32}
+    automatic_contour_levels(vals; n=CONTOUR_N_LEVELS_DEFAULT) -> Vector{Float32}
 
 Robust automatic contour levels from the finite 5th to 95th percentiles.
 """
-function automatic_contour_levels(vals; n::Int = 7)
+function automatic_contour_levels(vals; n::Int = CONTOUR_N_LEVELS_DEFAULT)
     nlev = max(2, n)
     lo, hi = percentile_clims(vals, 5, 95)
     if !(isfinite(lo) && isfinite(hi)) || lo == hi

@@ -18,10 +18,20 @@
 #     `v < lo || v > hi`. Non-finite voxels are NEVER kept by a threshold.
 #   * `RectangleSource(i1, i2, j1, j2, k1, k2)` — keep voxels whose 1-based
 #     index falls in the closed box. `nothing` for any axis means "all".
+#   * `GradientSource(:ge|:le|:range|:outside, lo, hi)` — keep voxels whose
+#     local gradient magnitude `‖∇data‖` satisfies the threshold predicate
+#     (same predicate set as `ThresholdSource`). Central differences, unit
+#     spacing; isolates edges (high gradient) or flat regions (low gradient).
 #
-# Combinators (`:and` / `:or` / `:not`) compose any two `MaskSource` values
-# into a new one. They are fully recursive — e.g. `AndSource(ThresholdSource(…),
-# NotSource(RectangleSource(…)))` is valid and round-trips through TOML.
+# Morphological / logical combinators wrap other sources:
+#   * `MorphologySource(inner, :dilate|:erode|:open|:close, radius)` — apply a
+#     box (Chebyshev) morphological operation to the mask produced by `inner`.
+#
+# Logical combinators (`:and` / `:or` / `:not`) compose any two `MaskSource`
+# values into a new one. They are fully recursive — e.g.
+# `AndSource(ThresholdSource(…), NotSource(RectangleSource(…)))` is valid and
+# round-trips through TOML. `GradientSource` and `MorphologySource` compose the
+# same way.
 #
 # Consumers integrate via an optional `mask::Union{Nothing,AbstractArray{Bool,3}}`
 # kwarg (see `moment_map`, `mean_region_spectrum`) so passing `nothing` keeps
@@ -67,6 +77,38 @@ struct ThresholdSource <: MaskSource
     function ThresholdSource(op::Symbol, lo::Real, hi::Real)
         op in (:ge, :le, :range, :outside) || throw(ArgumentError(
             "ThresholdSource: op must be :ge, :le, :range, or :outside; got $(op)"))
+        return new(op, Float64(lo), Float64(hi))
+    end
+end
+
+"""
+    GradientSource(op::Symbol, lo::Float64, hi::Float64)
+
+Keep voxels whose **local gradient magnitude** satisfies the predicate
+selected by `op` (same predicate set as [`ThresholdSource`](@ref)):
+- `:ge`       → `‖∇data‖ >= lo`
+- `:le`       → `‖∇data‖ <= hi`
+- `:range`    → `lo <= ‖∇data‖ <= hi`
+- `:outside`  → `‖∇data‖ < lo || ‖∇data‖ > hi`
+
+The gradient magnitude is computed with central differences (forward /
+backward at the borders) and unit voxel spacing:
+`‖∇data‖ = sqrt(gx^2 + gy^2 + gz^2)`. Use it to isolate edges / sharp
+structures (high gradient) or smooth regions (low gradient).
+
+A voxel is rejected whenever its own value or any neighbour required by the
+difference stencil is non-finite, so the gradient never propagates `NaN`
+into a kept voxel. Singleton axes contribute a zero component. `lo`/`hi`
+are stored as `Float64` for a clean `Float32`/`Float64` round-trip.
+"""
+struct GradientSource <: MaskSource
+    op::Symbol
+    lo::Float64
+    hi::Float64
+
+    function GradientSource(op::Symbol, lo::Real, hi::Real)
+        op in (:ge, :le, :range, :outside) || throw(ArgumentError(
+            "GradientSource: op must be :ge, :le, :range, or :outside; got $(op)"))
         return new(op, Float64(lo), Float64(hi))
     end
 end
@@ -118,6 +160,40 @@ Invert a mask: keep voxels **rejected** by `inner`, reject those it keeps.
 """
 struct NotSource <: MaskSource
     inner::MaskSource
+end
+
+"""
+    MorphologySource(inner::MaskSource, op::Symbol, radius::Int)
+
+Apply a binary morphological operation to the mask produced by `inner`,
+using a cubic (Chebyshev / box) structuring element of half-width `radius`
+voxels — i.e. a `(2radius+1)^3` neighbourhood. Supported `op`:
+- `:dilate` — grow the kept region (logical OR over the neighbourhood).
+- `:erode`  — shrink the kept region (logical AND over the neighbourhood).
+- `:open`   — erosion then dilation (removes small isolated specks).
+- `:close`  — dilation then erosion (fills small holes / gaps).
+
+`radius == 0` is the identity. The structuring element is separable, so the
+operation runs as three per-axis passes. Out-of-bounds neighbours are treated
+as background (`false`) for dilation and ignored for erosion, matching the
+usual "valid window" convention near the borders.
+
+Recursively composable: `inner` may be any `MaskSource`, e.g.
+`MorphologySource(ThresholdSource(:ge, 3.0, 0.0), :open, 1)` to threshold then
+prune speckle noise.
+"""
+struct MorphologySource <: MaskSource
+    inner::MaskSource
+    op::Symbol
+    radius::Int
+
+    function MorphologySource(inner::MaskSource, op::Symbol, radius::Integer)
+        op in (:dilate, :erode, :open, :close) || throw(ArgumentError(
+            "MorphologySource: op must be :dilate, :erode, :open, or :close; got $(op)"))
+        radius >= 0 || throw(ArgumentError(
+            "MorphologySource: radius must be ≥ 0; got $(radius)"))
+        return new(inner, op, Int(radius))
+    end
 end
 
 function RectangleSource(;
@@ -226,6 +302,20 @@ function build_mask(::FiniteSource, data::AbstractArray{<:Real,3})
     return out
 end
 
+# Shared scalar predicate for `ThresholdSource` and `GradientSource`. `op` is
+# validated at source construction, so the final branch is `:outside`.
+@inline function _passes_threshold(op::Symbol, v::Float64, lo::Float64, hi::Float64)
+    return if op === :ge
+        v >= lo
+    elseif op === :le
+        v <= hi
+    elseif op === :range
+        lo <= v <= hi
+    else  # :outside
+        v < lo || v > hi
+    end
+end
+
 function build_mask(src::ThresholdSource, data::AbstractArray{<:Real,3})
     out = BitArray(undef, size(data))
     op = src.op
@@ -233,17 +323,53 @@ function build_mask(src::ThresholdSource, data::AbstractArray{<:Real,3})
     hi = src.hi
     @inbounds for i in eachindex(data, out)
         v = Float64(data[i])
-        out[i] = if !isfinite(v)
-            false
-        elseif op === :ge
-            v >= lo
-        elseif op === :le
-            v <= hi
-        elseif op === :range
-            lo <= v <= hi
-        else  # :outside (validated at construction)
-            v < lo || v > hi
+        out[i] = isfinite(v) && _passes_threshold(op, v, lo, hi)
+    end
+    return out
+end
+
+function build_mask(src::GradientSource, data::AbstractArray{<:Real,3})
+    nx, ny, nz = size(data)
+    out = BitArray(undef, nx, ny, nz)
+    op = src.op
+    lo = src.lo
+    hi = src.hi
+    @inbounds for k in 1:nz, j in 1:ny, i in 1:nx
+        v = Float64(data[i, j, k])
+        if !isfinite(v)
+            out[i, j, k] = false
+            continue
         end
+        # Central differences (unit spacing), forward/backward at the borders.
+        gx = if nx == 1
+            0.0
+        elseif i == 1
+            Float64(data[2, j, k]) - v
+        elseif i == nx
+            v - Float64(data[nx - 1, j, k])
+        else
+            0.5 * (Float64(data[i + 1, j, k]) - Float64(data[i - 1, j, k]))
+        end
+        gy = if ny == 1
+            0.0
+        elseif j == 1
+            Float64(data[i, 2, k]) - v
+        elseif j == ny
+            v - Float64(data[i, ny - 1, k])
+        else
+            0.5 * (Float64(data[i, j + 1, k]) - Float64(data[i, j - 1, k]))
+        end
+        gz = if nz == 1
+            0.0
+        elseif k == 1
+            Float64(data[i, j, 2]) - v
+        elseif k == nz
+            v - Float64(data[i, j, nz - 1])
+        else
+            0.5 * (Float64(data[i, j, k + 1]) - Float64(data[i, j, k - 1]))
+        end
+        g = sqrt(gx * gx + gy * gy + gz * gz)
+        out[i, j, k] = isfinite(g) && _passes_threshold(op, g, lo, hi)
     end
     return out
 end
@@ -279,6 +405,76 @@ end
 function build_mask(src::NotSource, data::AbstractArray{<:Real,3})
     inner = build_mask(src.inner, data)
     return .!inner
+end
+
+# Separable box (Chebyshev) morphology. `keep_if_any == true` → dilation
+# (OR over each 1-D window); `false` → erosion (AND over each window).
+# Out-of-bounds neighbours act as the reduction identity — `false` for OR
+# (dilation) and `true` for AND (erosion) — so they are effectively ignored.
+function _box_morph(bits::BitArray{3}, r::Int, keep_if_any::Bool)
+    r <= 0 && return copy(bits)
+    nx, ny, nz = size(bits)
+    a = copy(bits)
+    b = BitArray(undef, nx, ny, nz)
+    # axis 1
+    @inbounds for k in 1:nz, j in 1:ny, i in 1:nx
+        lo = max(1, i - r)
+        hi = min(nx, i + r)
+        acc = !keep_if_any
+        for ii in lo:hi
+            if a[ii, j, k] == keep_if_any
+                acc = keep_if_any
+                break
+            end
+        end
+        b[i, j, k] = acc
+    end
+    a, b = b, a
+    # axis 2
+    @inbounds for k in 1:nz, j in 1:ny, i in 1:nx
+        lo = max(1, j - r)
+        hi = min(ny, j + r)
+        acc = !keep_if_any
+        for jj in lo:hi
+            if a[i, jj, k] == keep_if_any
+                acc = keep_if_any
+                break
+            end
+        end
+        b[i, j, k] = acc
+    end
+    a, b = b, a
+    # axis 3
+    @inbounds for k in 1:nz, j in 1:ny, i in 1:nx
+        lo = max(1, k - r)
+        hi = min(nz, k + r)
+        acc = !keep_if_any
+        for kk in lo:hi
+            if a[i, j, kk] == keep_if_any
+                acc = keep_if_any
+                break
+            end
+        end
+        b[i, j, k] = acc
+    end
+    return b
+end
+
+_dilate_box(bits::BitArray{3}, r::Int) = _box_morph(bits, r, true)
+_erode_box(bits::BitArray{3}, r::Int) = _box_morph(bits, r, false)
+
+function build_mask(src::MorphologySource, data::AbstractArray{<:Real,3})
+    bits = build_mask(src.inner, data)
+    r = src.radius
+    return if src.op === :dilate
+        _dilate_box(bits, r)
+    elseif src.op === :erode
+        _erode_box(bits, r)
+    elseif src.op === :open
+        _dilate_box(_erode_box(bits, r), r)
+    else  # :close (validated at construction)
+        _erode_box(_dilate_box(bits, r), r)
+    end
 end
 
 """
@@ -384,6 +580,13 @@ function mask_source_to_toml(src::MaskSource)
             "lo"   => src.lo,
             "hi"   => src.hi,
         )
+    elseif src isa GradientSource
+        return Dict{String,Any}(
+            "kind" => "gradient",
+            "op"   => String(src.op),
+            "lo"   => src.lo,
+            "hi"   => src.hi,
+        )
     elseif src isa RectangleSource
         d = Dict{String,Any}("kind" => "rectangle")
         src.i1 === nothing || (d["i1"] = src.i1)
@@ -393,6 +596,13 @@ function mask_source_to_toml(src::MaskSource)
         src.k1 === nothing || (d["k1"] = src.k1)
         src.k2 === nothing || (d["k2"] = src.k2)
         return d
+    elseif src isa MorphologySource
+        return Dict{String,Any}(
+            "kind"   => "morphology",
+            "op"     => String(src.op),
+            "radius" => src.radius,
+            "inner"  => mask_source_to_toml(src.inner),
+        )
     elseif src isa AndSource
         return Dict{String,Any}(
             "kind" => "and",
@@ -431,6 +641,19 @@ function mask_source_from_toml(d::AbstractDict)
         hi = _toml_float(d, "hi", 0.0)
         op in (:ge, :le, :range, :outside) || return NoMaskSource()
         return ThresholdSource(op, lo, hi)
+    elseif kind == "gradient"
+        op = Symbol(get(d, "op", "ge"))
+        lo = _toml_float(d, "lo", 0.0)
+        hi = _toml_float(d, "hi", 0.0)
+        op in (:ge, :le, :range, :outside) || return NoMaskSource()
+        return GradientSource(op, lo, hi)
+    elseif kind == "morphology"
+        op = Symbol(get(d, "op", "dilate"))
+        op in (:dilate, :erode, :open, :close) || return NoMaskSource()
+        radius = _toml_int(d, "radius", 1)
+        radius < 0 && return NoMaskSource()
+        inner = mask_source_from_toml(get(d, "inner", nothing))
+        return MorphologySource(inner, op, radius)
     elseif kind == "rectangle"
         return RectangleSource(;
             i1 = _toml_int_or_nothing(d, "i1"),
@@ -460,6 +683,11 @@ mask_source_from_toml(::Nothing) = NoMaskSource()
 @inline function _toml_float(d::AbstractDict, key::AbstractString, fallback::Float64)
     v = get(d, key, fallback)
     return v isa Real ? Float64(v) : fallback
+end
+
+@inline function _toml_int(d::AbstractDict, key::AbstractString, fallback::Int)
+    v = get(d, key, fallback)
+    return v isa Integer ? Int(v) : fallback
 end
 
 @inline function _toml_int_or_nothing(d::AbstractDict, key::AbstractString)

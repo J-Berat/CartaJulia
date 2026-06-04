@@ -238,6 +238,135 @@ end
     end
 end
 
+@testset "mask: GradientSource" begin
+    # 1-D step embedded in a 3-D array (ny = nz = 1 → gy = gz = 0).
+    # values along i: [0, 0, 0, 5, 5]
+    #   central diff: i=3 → 0.5*(5-0)=2.5, i=4 → 0.5*(5-0)=2.5, rest → 0
+    nx = 5
+    data = zeros(Float32, nx, 1, 1)
+    data[4, 1, 1] = 5f0
+    data[5, 1, 1] = 5f0
+
+    @testset ":ge selects the high-gradient edge" begin
+        bits = MANTA.build_mask(MANTA.GradientSource(:ge, 1.0, 0.0), data)
+        @test count(bits) == 2
+        @test bits[3, 1, 1] == true
+        @test bits[4, 1, 1] == true
+        @test bits[1, 1, 1] == false
+        @test bits[2, 1, 1] == false
+        @test bits[5, 1, 1] == false
+    end
+
+    @testset ":le selects the flat region (complement)" begin
+        bits = MANTA.build_mask(MANTA.GradientSource(:le, 0.0, 1.0), data)
+        @test count(bits) == 3
+        @test bits[1, 1, 1] == true
+        @test bits[2, 1, 1] == true
+        @test bits[5, 1, 1] == true
+        @test bits[3, 1, 1] == false
+    end
+
+    @testset "non-finite voxels are rejected" begin
+        dnan = copy(data)
+        dnan[1, 1, 1] = NaN32
+        bits = MANTA.build_mask(MANTA.GradientSource(:ge, 1.0, 0.0), dnan)
+        @test bits[1, 1, 1] == false
+        # Neighbour whose central stencil touches the NaN is also rejected.
+        @test bits[2, 1, 1] == false
+    end
+
+    @testset "linear field → uniform interior gradient" begin
+        # data = i + 10j + 100k → |∇| = sqrt(1 + 100 + 10000) everywhere
+        # (forward/backward diffs at borders equal the central diff for a
+        # linear field), so :ge 50 keeps every voxel.
+        lin = Float32[i + 10j + 100k for i in 1:4, j in 1:3, k in 1:2]
+        bits = MANTA.build_mask(MANTA.GradientSource(:ge, 50.0, 0.0), lin)
+        @test count(bits) == length(lin)
+    end
+
+    @testset "validates op" begin
+        @test_throws ArgumentError MANTA.GradientSource(:bogus, 0.0, 1.0)
+    end
+end
+
+@testset "mask: MorphologySource" begin
+    # Single true voxel at the centre of a 5×5×5 cube.
+    data = zeros(Float32, 5, 5, 5)
+    data[3, 3, 3] = 1f0
+    base = MANTA.ThresholdSource(:ge, 0.5, 0.0)
+    bits_base = MANTA.build_mask(base, data)
+    @test count(bits_base) == 1
+
+    @testset "dilate grows by the box SE" begin
+        bits = MANTA.build_mask(MANTA.MorphologySource(base, :dilate, 1), data)
+        @test count(bits) == 27               # 3×3×3 neighbourhood
+        @test bits[3, 3, 3] == true
+        @test bits[2, 2, 2] == true
+        @test bits[4, 4, 4] == true
+        @test bits[1, 3, 3] == false          # Chebyshev distance 2
+    end
+
+    @testset "radius 0 is the identity" begin
+        bits = MANTA.build_mask(MANTA.MorphologySource(base, :dilate, 0), data)
+        @test bits == bits_base
+    end
+
+    @testset "erode shrinks a solid block to its core" begin
+        block = zeros(Float32, 5, 5, 5)
+        block[2:4, 2:4, 2:4] .= 1f0
+        src = MANTA.ThresholdSource(:ge, 0.5, 0.0)
+        @test count(MANTA.build_mask(src, block)) == 27
+        bits = MANTA.build_mask(MANTA.MorphologySource(src, :erode, 1), block)
+        @test count(bits) == 1
+        @test bits[3, 3, 3] == true
+    end
+
+    @testset "open removes an isolated speck" begin
+        bits = MANTA.build_mask(MANTA.MorphologySource(base, :open, 1), data)
+        @test count(bits) == 0
+    end
+
+    @testset "close fills back to the original speck" begin
+        bits = MANTA.build_mask(MANTA.MorphologySource(base, :close, 1), data)
+        @test count(bits) == 1
+        @test bits[3, 3, 3] == true
+    end
+
+    @testset "validates op and radius" begin
+        @test_throws ArgumentError MANTA.MorphologySource(base, :bogus, 1)
+        @test_throws ArgumentError MANTA.MorphologySource(base, :dilate, -1)
+    end
+end
+
+@testset "mask: TOML round-trip (gradient / morphology)" begin
+    data = Float32[i + 10j + 100k for i in 1:4, j in 1:3, k in 1:2]
+    for src in (
+        MANTA.GradientSource(:ge, 1.0, 0.0),
+        MANTA.GradientSource(:range, 0.0, 50.0),
+        MANTA.MorphologySource(MANTA.ThresholdSource(:ge, 100.0, 0.0), :dilate, 1),
+        MANTA.MorphologySource(MANTA.FiniteSource(), :open, 2),
+        # Nested inside a logical combinator.
+        MANTA.AndSource(
+            MANTA.GradientSource(:ge, 1.0, 0.0),
+            MANTA.MorphologySource(MANTA.FiniteSource(), :close, 1)),
+    )
+        d  = MANTA.mask_source_to_toml(src)
+        @test haskey(d, "kind")
+        rt = MANTA.mask_source_from_toml(d)
+        @test typeof(rt) === typeof(src)
+        # Functional equality of the materialised masks.
+        @test MANTA.build_mask(src, data) == MANTA.build_mask(rt, data)
+    end
+
+    # Malformed entries degrade to NoMaskSource.
+    @test MANTA.mask_source_from_toml(Dict{String,Any}(
+        "kind" => "gradient", "op" => "huh")) isa MANTA.NoMaskSource
+    @test MANTA.mask_source_from_toml(Dict{String,Any}(
+        "kind" => "morphology", "op" => "huh")) isa MANTA.NoMaskSource
+    @test MANTA.mask_source_from_toml(Dict{String,Any}(
+        "kind" => "morphology", "op" => "dilate", "radius" => -3)) isa MANTA.NoMaskSource
+end
+
 @testset "mask: headless cube viewer smoke test" begin
     # Build a tiny cube + open the viewer with activate_gl=false / display_fig=false.
     # Then sanity-check that toggling the mask doesn't crash anything.

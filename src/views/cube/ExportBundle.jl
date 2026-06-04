@@ -73,6 +73,8 @@ function _cube_export_bundle!(;
     unit_label_tex,
     slice_axis_labels,
     slice_dims,
+    ui_accent,
+    ui_selection,
     # --- animation state ---
     anim_playing,
     # --- widgets (analysis mode) ---
@@ -294,7 +296,7 @@ function _cube_export_bundle!(;
                     CairoMakie.lines!(
                         axS,
                         region_segments_from_points(region_start[], region_end[], region_shape[]);
-                        color     = (RGBf(1.0, 0.78, 0.18), 0.98),
+                        color     = (ui_selection, 0.98),
                         linewidth = REGION_LW,
                     )
                 end
@@ -339,7 +341,7 @@ function _cube_export_bundle!(;
                     xtickformat = latex_tick_formatter,
                     ytickformat = latex_tick_formatter,
                 )
-                CairoMakie.lines!(axP, spec_x_raw[], spec_y_disp[])
+                CairoMakie.lines!(axP, spec_x_raw[], spec_y_disp[]; color = ui_accent)
                 CairoMakie.xlims!(axP, 0f0, Float32(max(0, length(spec_x_raw[]) - 1)))
                 CairoMakie.save(String(out), f_spec; backend = CairoMakie)
                 @info "Saved spectrum" out

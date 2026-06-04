@@ -126,6 +126,40 @@ function _fits_header_triplets(src)
     return (ks, vs, cs)
 end
 
+function _fits_header_value_string(v)
+    v === nothing && return ""
+    if v isa AbstractString
+        return "'" * String(v) * "'"
+    end
+    return string(v)
+end
+
+"""
+    fits_header_display_lines(src) -> Vector{String}
+
+Format a FITS header as human-readable card lines for UI display. Returns a
+single explanatory line when no header is available.
+"""
+function fits_header_display_lines(src)
+    src === nothing && return ["(no FITS header available)"]
+    ks, vs, cs = _fits_header_triplets(src)
+    isempty(ks) && return ["(empty FITS header)"]
+    lines = String[]
+    @inbounds for i in eachindex(ks)
+        key = uppercase(String(ks[i]))
+        comment = strip(String(cs[i]))
+        if key == "COMMENT" || key == "HISTORY"
+            body = isempty(comment) ? _fits_header_value_string(vs[i]) : comment
+            push!(lines, rpad(key, 8) * "  " * body)
+        else
+            line = rpad(key, 8) * "= " * _fits_header_value_string(vs[i])
+            isempty(comment) || (line *= " / " * comment)
+            push!(lines, line)
+        end
+    end
+    return lines
+end
+
 # Copy the source header into fresh vectors, stripping the keys the FITSIO
 # writer rebuilds (NAXIS, BITPIX, ...). Caller adds axis-specific changes.
 function _copy_passthrough_header(src; drop_axes::Tuple = ())

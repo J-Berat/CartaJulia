@@ -37,6 +37,7 @@
         h, lc, _ = MANTA.open_lazy_fits(path3; hdu = 1)
         @test lc isa MANTA.LazyFITSCube{Float32}
         @test size(lc) == (4, 5, 3)
+        @test lc.cache_capacity == MANTA.DEFAULT_FITS_SLICE_CACHE_CAPACITY
         # Single-element + axis-3 slice.
         @test lc[1, 1, 1] == Float32(1 + 10 + 100)
         slice = MANTA.read_slice!(lc, 3, 2)
@@ -70,6 +71,7 @@
         # Give the background task a chance to complete.
         sleep(0.1)
         s_pre = MANTA.read_slice!(lc2, 3, 1)
+        @test haskey(lc2.slice_cache, (3, 1))
         # Build a reference via a fresh lazy cube (no cache / no prefetch).
         _, lc_ref, _ = MANTA.open_lazy_fits(path3; hdu = 1)
         s_ref = MANTA.read_slice!(lc_ref, 3, 1)
@@ -92,5 +94,94 @@
         _, lc_ref3, _ = MANTA.open_lazy_fits(path3; hdu = 1)
         s3_ref = MANTA.read_slice!(lc_ref3, 3, 3)
         @test s3 == s3_ref
+    end
+end
+
+@testset "lazy FITS: slice LRU cache" begin
+    mktempdir() do dir
+        path = joinpath(dir, "cube.fits")
+        FITS(path, "w") do f
+            data = Float32[i + 10j + 100k for i in 1:4, j in 1:5, k in 1:10]
+            write(f, data)
+        end
+
+        _, lc, _ = MANTA.open_lazy_fits(path; hdu = 1)
+        @test lc.cache_capacity == 7
+
+        seen = Matrix{Float32}[]
+        for k in 1:7
+            push!(seen, MANTA.read_slice!(lc, 3, k))
+        end
+        @test length(lc.slice_cache) == 7
+        @test all(haskey(lc.slice_cache, (3, k)) for k in 1:7)
+
+        # Touch slice 2, then add slice 8: slice 1 is the least recent entry.
+        @test MANTA.read_slice!(lc, 3, 2) === seen[2]
+        s8 = MANTA.read_slice!(lc, 3, 8)
+        @test s8[1, 1] == Float32(1 + 10 + 800)
+        @test length(lc.slice_cache) == 7
+        @test !haskey(lc.slice_cache, (3, 1))
+        @test all(haskey(lc.slice_cache, (3, k)) for k in 2:8)
+
+        # Going back to an evicted slice performs a fresh read and re-enters LRU.
+        s1_again = MANTA.read_slice!(lc, 3, 1)
+        @test s1_again == seen[1]
+        @test s1_again !== seen[1]
+        @test haskey(lc.slice_cache, (3, 1))
+        @test length(lc.slice_cache) == 7
+    end
+end
+
+# ----------------------------------------------------------------------------
+# Direction-aware prefetch (prefetch_adjacent!) — the wiring used by CubeView's
+# on(idx) callback to keep scrolling smooth on memory-mapped cubes.
+# ----------------------------------------------------------------------------
+@testset "lazy FITS: prefetch_adjacent! direction" begin
+    mktempdir() do dir
+        path = joinpath(dir, "cube.fits")
+        FITS(path, "w") do f
+            data = Float32[i + 10j + 100k for i in 1:4, j in 1:5, k in 1:6]
+            write(f, data)
+        end
+
+        # Ascending (last=2, new=3 ⇒ dir +1): prefetch neighbour 4 on axis 3.
+        _, lc, _ = MANTA.open_lazy_fits(path; hdu = 1)
+        @test MANTA.prefetch_adjacent!(lc, 3, 3, 2) == 3   # returns idx_new
+        @test lc.prefetch_axis == 3
+        @test lc.prefetch_idx  == 4
+        @test lc.prefetch_ch  !== nothing
+        # The prefetched slice must match a cold reference read.
+        sleep(0.1)
+        s4 = MANTA.read_slice!(lc, 3, 4)
+        _, lc_ref, _ = MANTA.open_lazy_fits(path; hdu = 1)
+        @test s4 == MANTA.read_slice!(lc_ref, 3, 4)
+
+        # Descending (last=4, new=3 ⇒ dir -1): prefetch neighbour 2.
+        _, lc2, _ = MANTA.open_lazy_fits(path; hdu = 1)
+        MANTA.prefetch_adjacent!(lc2, 3, 3, 4)
+        @test lc2.prefetch_idx == 2
+
+        # Unchanged index (last=3, new=3) defaults to +1 ⇒ neighbour 4.
+        _, lc3, _ = MANTA.open_lazy_fits(path; hdu = 1)
+        MANTA.prefetch_adjacent!(lc3, 3, 3, 3)
+        @test lc3.prefetch_idx == 4
+
+        # Neighbour out of bounds at the high edge ⇒ no prefetch launched.
+        _, lc4, _ = MANTA.open_lazy_fits(path; hdu = 1)
+        MANTA.prefetch_adjacent!(lc4, 3, 6, 5)   # neighbour 7 > nz=6
+        @test lc4.prefetch_ch === nothing
+        # ...and at the low edge (descending past slice 1).
+        MANTA.prefetch_adjacent!(lc4, 3, 1, 2)   # neighbour 0 < 1
+        @test lc4.prefetch_ch === nothing
+
+        # Invalid axis ⇒ no-op, still returns idx_new untouched.
+        @test MANTA.prefetch_adjacent!(lc4, 9, 3, 2) == 3
+        @test lc4.prefetch_ch === nothing
+
+        # Works along axis 1 too (nx=4): last=1,new=2 ⇒ neighbour 3.
+        _, lc5, _ = MANTA.open_lazy_fits(path; hdu = 1)
+        MANTA.prefetch_adjacent!(lc5, 1, 2, 1)
+        @test lc5.prefetch_axis == 1
+        @test lc5.prefetch_idx  == 3
     end
 end

@@ -39,8 +39,11 @@ function _cube_ps_window_bundle(;
     ui_text,
     ui_text_muted,
     ui_accent,
+    ui_error,
     style_menu!,
     style_button!,
+    style_button_primary!,
+    style_button_ghost!,
     style_checkbox!,
     style_textbox!,
     set_status!,
@@ -67,39 +70,49 @@ function _cube_ps_window_bundle(;
         ps_fit_on = Observable(false)
 
         fig_ps = Figure(size = (1000, 760))
-        header = fig_ps[1, 1] = GridLayout(; alignmode = Outside(8))
+        header = fig_ps[1, 1] = GridLayout(; alignmode = Outside(8), tellheight = false)
+        colgap!(header, 12)
+        rowgap!(header, 6)
 
-        # Row 1: mode / source / window / units / refresh
-        Label(header[1, 1]; text = "Mode",   halign = :right, fontsize = 13)
-        mode_menu    = Menu(header[1, 2]; options = ["2D", "1D"],                     prompt = "2D",   width = 80)
-        Label(header[1, 3]; text = "Source", halign = :right, fontsize = 13)
-        src_menu     = Menu(header[1, 4]; options = ["zoom", "full"],                 prompt = "zoom", width = 80)
-        Label(header[1, 5]; text = "Window", halign = :right, fontsize = 13)
-        win_menu     = Menu(header[1, 6]; options = ["Hann", "Hamming", "None"],      prompt = "Hann", width = 96)
-        Label(header[1, 7]; text = "Units",  halign = :right, fontsize = 13)
-        unit_menu    = Menu(header[1, 8]; options = ["pixel", "physical"],            prompt = "pixel", width = 96)
-        refresh_btn  = Button(header[1, 9]; label = "Refresh", width = 88, height = 30)
+        settings_bar = header[1, 1] = GridLayout(; alignmode = Outside(7), tellheight = false)
+        Box(settings_bar[1, 1]; color = current_ui_theme().surface, strokecolor = current_ui_theme().border,
+            strokewidth = 1.0, cornerradius = 8, z = -5)
+        settings = settings_bar[1, 1] = GridLayout(; alignmode = Inside(), tellheight = false)
+        colgap!(settings, 8)
+        rowgap!(settings, 6)
 
-        # Row 2: toggles + fit band
-        pad_chk    = Checkbox(header[2, 1]); Label(header[2, 2]; text = "Pad pow2",  halign = :left, fontsize = 13, color = ui_text)
-        nanapo_chk = Checkbox(header[2, 3]); Label(header[2, 4]; text = "NaN apod.", halign = :left, fontsize = 13, color = ui_text)
-        fit_chk    = Checkbox(header[2, 5]); Label(header[2, 6]; text = "Fit slope", halign = :left, fontsize = 13, color = ui_text)
-        Label(header[2, 7]; text = "k range", halign = :right, fontsize = 13)
-        kmin_box   = Textbox(header[2, 8]; placeholder = "k_min", width = 84, height = 28)
-        kmax_box   = Textbox(header[2, 9]; placeholder = "k_max", width = 84, height = 28)
+        # Settings bar: mode/source/window/units on top, processing toggles below.
+        Label(settings[1, 1]; text = "Mode",   halign = :right, fontsize = 13, color = ui_text_muted)
+        mode_menu    = Menu(settings[1, 2]; options = ["2D", "1D"],                prompt = "2D",   width = 80)
+        Label(settings[1, 3]; text = "Source", halign = :right, fontsize = 13, color = ui_text_muted)
+        src_menu     = Menu(settings[1, 4]; options = ["zoom", "full"],            prompt = "zoom", width = 80)
+        Label(settings[1, 5]; text = "Window", halign = :right, fontsize = 13, color = ui_text_muted)
+        win_menu     = Menu(settings[1, 6]; options = ["Hann", "Hamming", "None"], prompt = "Hann", width = 96)
+        Label(settings[1, 7]; text = "Units",  halign = :right, fontsize = 13, color = ui_text_muted)
+        unit_menu    = Menu(settings[1, 8]; options = ["pixel", "physical"],       prompt = "pixel", width = 96)
 
-        # Row 3: save buttons
-        save_png_btn = Button(header[3, 1:2]; label = "Save PNG",     width = 120, height = 28)
-        save_pdf_btn = Button(header[3, 3:4]; label = "Save PDF",     width = 120, height = 28)
-        save_csv_btn = Button(header[3, 5:6]; label = "Save CSV (1D)", width = 140, height = 28)
+        pad_chk    = Checkbox(settings[2, 1]); Label(settings[2, 2]; text = "Pad pow2",  halign = :left, fontsize = 13, color = ui_text)
+        nanapo_chk = Checkbox(settings[2, 3]); Label(settings[2, 4]; text = "NaN apod.", halign = :left, fontsize = 13, color = ui_text)
+        fit_chk    = Checkbox(settings[2, 5]); Label(settings[2, 6]; text = "$(MANTA_ICONS.fit) Fit", halign = :left, fontsize = 13, color = ui_text)
+        Label(settings[2, 7]; text = "k range", halign = :right, fontsize = 13, color = ui_text_muted)
+        kmin_box   = Textbox(settings[2, 8]; placeholder = "k_min", width = 84, height = 28)
+        kmax_box   = Textbox(settings[2, 9]; placeholder = "k_max", width = 84, height = 28)
+
+        action_bar = header[1, 2] = GridLayout(; halign = :right, valign = :top, tellwidth = false, tellheight = false)
+        colgap!(action_bar, 6)
+        rowgap!(action_bar, 6)
+        refresh_btn  = Button(action_bar[1, 1:3]; label = "Refresh", width = 88, height = 30)
+        save_png_btn = Button(action_bar[2, 1]; label = "$(MANTA_ICONS.export_icon) PNG", width = 96, height = 28)
+        save_pdf_btn = Button(action_bar[2, 2]; label = "$(MANTA_ICONS.export_icon) PDF", width = 96, height = 28)
+        save_csv_btn = Button(action_bar[2, 3]; label = "$(MANTA_ICONS.export_icon) CSV", width = 96, height = 28)
 
         ps_status = Observable(" ")
-        Label(header[3, 7:9]; text = ps_status, halign = :left, fontsize = 12,
+        Label(header[2, 1:2]; text = ps_status, halign = :left, fontsize = 12,
               color = ui_text_muted, tellwidth = false)
 
         style_menu!(mode_menu); style_menu!(src_menu); style_menu!(win_menu); style_menu!(unit_menu)
-        style_button!(refresh_btn)
-        style_button!(save_png_btn); style_button!(save_pdf_btn); style_button!(save_csv_btn)
+        style_button_ghost!(refresh_btn)
+        style_button_primary!(save_png_btn); style_button_primary!(save_pdf_btn); style_button_primary!(save_csv_btn)
         style_checkbox!(pad_chk); style_checkbox!(nanapo_chk); style_checkbox!(fit_chk)
         style_textbox!(kmin_box); style_textbox!(kmax_box)
 
@@ -282,7 +295,7 @@ function _cube_ps_window_bundle(;
                         kfit = filter(ki -> ki > 0 && ki >= kmin_v && ki <= kmax_v, k)
                         if !isempty(kfit)
                             yfit = Float32.(10 .^ (slope .* log10.(Float64.(kfit)) .+ intercept))
-                            lines!(ax, kfit, yfit; color = :red, linestyle = :dash, linewidth = 1.5)
+                            lines!(ax, kfit, yfit; color = ui_error, linestyle = :dash, linewidth = 1.5)
                             slope_str = "slope=$(round(slope; digits = 3)) [n=$(n_used)]"
                             ps_status[] = format_status(meta) * " • " * slope_str
                             return
@@ -368,16 +381,12 @@ function _cube_ps_window_bundle(;
         # Finalise
         # ------------------------------------------------------------------
         ps_render!()
-        keepalive!(fig_ps)
         ps_fig_ref[]   = fig_ps
         ps_alive_ref[] = true
-        on(fig_ps.scene.events.window_open) do is_open
-            if !is_open
-                ps_window_alive[] = false
-                ps_alive_ref[]    = false
-                ps_fig_ref[]      = nothing
-                forget!(fig_ps)
-            end
+        register_window_close!(fig_ps) do
+            ps_window_alive[] = false
+            ps_alive_ref[]    = false
+            ps_fig_ref[]      = nothing
         end
         display(fig_ps)
         return fig_ps

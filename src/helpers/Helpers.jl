@@ -44,6 +44,7 @@
 # Exports
 ############################
 export apply_scale, apply_scale_display, clamped_extrema, percentile_clims, histogram_counts
+export ASINH_SOFTENING_DEFAULT, scale_label_tex, scale_menu_options, cycle_scale_mode
 export histogram_profile, histogram_ylabel
 export is_rgb_like, as_rgb_image, as_rgb_pixels, rgb_image
 export nan_gaussian_filter
@@ -57,6 +58,7 @@ export moments, moments_map, moment_map, moment_vectors, filtered_cube_by_slice
 export make_info_tex
 export MANTA_ICONS
 export MANTA_COLORMAP_OPTIONS, ui_colormap_options
+export ColormapSelector, colormap_selector!
 export to_cmap, get_box_str, _pick_fig_size, _axis_render_height
 export latex_safe, make_main_title, make_slice_title, make_spec_title
 export latex_tick, latex_tick_formatter
@@ -65,15 +67,20 @@ export parse_manual_clims, parse_histogram_bins, parse_histogram_xlimits
 export parse_histogram_ylimits, parse_spectrum_ylimits, parse_gif_request
 export manta_recipe, copy_text_to_clipboard
 export SimpleWCSAxis, read_simple_wcs, has_wcs, world_coord
-export wcs_axis_label, format_world_coord, data_unit_label
+export wcs_axis_label, format_world_coord, format_world_value, data_unit_label
+export format_cursor_readout, cursor_world_strings
 export WCSTransform, read_wcs_transform, pixel_scale, sky_world_coords
 export spectral_quantity, spectral_quantity_word, sky_dims, spectral_dim
+export wcs_sky_grids, nice_graticule_step, wcs_graticule_levels, draw_wcs_graticule!, set_wcs_graticule_visible!
+export fits_header_display_lines
 export fits_header_for_slice, fits_header_for_moment
 export fits_header_for_region_spectrum, fits_header_for_filtered_cube
 export save_viewer_settings, load_viewer_settings
+export manta_defaults_path, load_manta_defaults
 export power_spectrum_2d, power_spectrum_1d_radial, fit_loglog_slope
 export ShortcutBinding, register_shortcuts!, format_shortcut, format_shortcut_help, shortcut_help_message
 export open_shortcut_help_window
+export zoom_limits, zoom_axis!, zoom_shortcut_bindings
 # Errors (actionable, structured)
 export MANTAError, FileNotFoundError, UnsupportedFormatError,
        HDUSelectionError, InvalidArgumentError, DatasetShapeError
@@ -91,6 +98,8 @@ export register_plugin!, unregister_plugin!, list_plugins, clear_plugins!
 export plugin_load, plugin_view, run_postprocess!
 # Backend selection (headless robustness)
 export is_headless_env, pick_backend!, with_export_backend
+# Drag-and-drop file loading (reload the dropped file in the current window)
+export enable_file_drop!, supported_drop_path
 
 ############################
 # Deps
@@ -123,3 +132,6 @@ include("Downsample.jl")
 include("UndoRedo.jl")
 include("Plugins.jl")
 include("Backend.jl")
+# DragDrop.jl references `manta` / `forget!` (defined in MANTA.jl) only inside
+# function bodies, so they resolve at call time — include order is fine here.
+include("DragDrop.jl")

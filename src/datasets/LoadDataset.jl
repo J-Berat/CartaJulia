@@ -45,19 +45,11 @@ function load_dataset(path::AbstractString; kwargs...)
     if kind === :fits
         return load_fits(spec[2]; kwargs...)
     elseif kind === :hdf5
-        # `lazy` is FITS-only. Strip it before forwarding so load_hdf5 does
-        # not receive an unknown keyword, and warn the caller explicitly.
-        kw = pairs(kwargs)
-        if get(kwargs, :lazy, false)
-            @warn "MANTA: `lazy=true` is not supported for HDF5 files and will be ignored." *
-                  " Use a FITS file, or omit `lazy`." path=abspath(String(path))
-        end
-        hdf5_kw = filter(p -> p[1] !== :lazy, kw)
         # spec is either (:hdf5, file) or (:hdf5, file, address).
         if length(spec) >= 3
-            return load_hdf5(spec[2], spec[3]; hdf5_kw...)
+            return load_hdf5(spec[2], spec[3]; kwargs...)
         else
-            return load_hdf5(spec[2]; hdf5_kw...)
+            return load_hdf5(spec[2]; kwargs...)
         end
     else
         ext = lowercase(last(splitext(path)))

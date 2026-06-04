@@ -13,6 +13,27 @@
         @test isapprox(lon2, lon; atol=1e-4)
         @test isapprox(lat2, lat; atol=1e-4)
     end
+
+    @testset "pixel index cache and ordering" begin
+        res = Healpix.Resolution(2)
+        idx1 = MANTA.mollweide_pixel_index(res, 32, 16)
+        idx2 = MANTA.mollweide_pixel_index(res, 32, 16)
+        @test idx1 == idx2
+        @test idx1 !== idx2
+
+        cached1 = MANTA._cached_mollweide_pixel_index(res, 32, 16)
+        cached2 = MANTA._cached_mollweide_pixel_index(res, 32, 16)
+        @test cached1 === cached2
+        @test_throws ArgumentError MANTA.mollweide_pixel_index(res, 0, 16)
+
+        ring_map = HealpixMap{Float64,RingOrder,Vector{Float64}}(collect(1.0:48.0))
+        nested_map = Healpix.ring2nest(ring_map)
+        @test nested_map isa HealpixMap{Float64,NestedOrder,Vector{Float64}}
+        @test isequal(
+            MANTA.mollweide_grid(ring_map; nx = 32, ny = 16),
+            MANTA.mollweide_grid(nested_map; nx = 32, ny = 16),
+        )
+    end
 end
 
 @testset "healpix: projected regions" begin

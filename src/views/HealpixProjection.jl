@@ -17,7 +17,7 @@ Reproject `map::HealpixMap` onto a `(ny, nx)` Mollweide grid centred on
   same orientation as `Healpix.jl` (lon = φ HEALPix).
 """
 function mollweide_grid(m::Healpix.HealpixMap; nx::Int=1200, ny::Int=600)
-    return mollweide_apply_index(mollweide_pixel_index(m.resolution, nx, ny), m)
+    return mollweide_apply_index(_cached_mollweide_pixel_index(m, nx, ny), m)
 end
 
 """
@@ -53,7 +53,7 @@ function mollweide_color_grid(pixels::AbstractVector{<:Colorant}; nx::Int=1200, 
     nside = valid_healpix_npix(length(pixels))
     nside > 0 || throw(ArgumentError("RGB HEALPix vector length must be 12*nside^2."))
     res = Healpix.Resolution(nside)
-    return mollweide_apply_index_color(mollweide_pixel_index(res, nx, ny), pixels)
+    return mollweide_apply_index_color(_cached_mollweide_pixel_index(res, nx, ny), pixels)
 end
 
 """
@@ -81,7 +81,7 @@ function _mollweide_scalar_grid(vals::AbstractVector; nx::Int=1200, ny::Int=600)
     nside = valid_healpix_npix(length(vals))
     nside > 0 || throw(ArgumentError("HEALPix vector length must be 12*nside^2."))
     res = Healpix.Resolution(nside)
-    return _mollweide_apply_index_scalar(mollweide_pixel_index(res, nx, ny), vals)
+    return _mollweide_apply_index_scalar(_cached_mollweide_pixel_index(res, nx, ny), vals)
 end
 
 """
@@ -107,12 +107,70 @@ end
 
 """
     mollweide_pixel_index(res, nx, ny) -> Matrix{Int32}
+    mollweide_pixel_index(map, nx, ny) -> Matrix{Int32}
 
-Pre-compute the HEALPix (RING) pixel index at every point of the Mollweide
-grid. 0 = pixel outside the ellipse. Allows regenerating a new frame in
-O(npx) without recomputing the projection.
+Pre-compute the HEALPix pixel index at every point of the Mollweide grid.
+0 = pixel outside the ellipse. The `Resolution` method uses RING ordering;
+the `HealpixMap` method follows the map's concrete order, including NESTED.
+Allows regenerating a new frame in O(npx) without recomputing the projection.
 """
 function mollweide_pixel_index(res::Healpix.Resolution, nx::Int, ny::Int)
+    return copy(_cached_mollweide_pixel_index(res, nx, ny))
+end
+
+function mollweide_pixel_index(m::Healpix.HealpixMap, nx::Int, ny::Int)
+    return copy(_cached_mollweide_pixel_index(m, nx, ny))
+end
+
+const _MOLLWEIDE_INDEX_CACHE_LOCK = ReentrantLock()
+const _MOLLWEIDE_INDEX_CACHE = Dict{Tuple{Int,Symbol,Int,Int},Matrix{Int32}}()
+const _MOLLWEIDE_INDEX_CACHE_MAX = 8
+
+@inline _healpix_order_key(::Healpix.HealpixMap{T,Healpix.RingOrder,A}) where {T,A} = :ring
+@inline _healpix_order_key(::Healpix.HealpixMap{T,Healpix.NestedOrder,A}) where {T,A} = :nested
+@inline _healpix_order_key(::Healpix.Resolution) = :ring
+
+function _validate_mollweide_grid_size(nx::Int, ny::Int)
+    (nx > 0 && ny > 0) || throw(ArgumentError("Mollweide grid dimensions must be positive, got nx=$(nx), ny=$(ny)."))
+    return nothing
+end
+
+function _cached_mollweide_pixel_index(res::Healpix.Resolution, nx::Int, ny::Int)
+    _validate_mollweide_grid_size(nx, ny)
+    key = (Int(res.nside), :ring, nx, ny)
+    lock(_MOLLWEIDE_INDEX_CACHE_LOCK)
+    try
+        return get!(_MOLLWEIDE_INDEX_CACHE, key) do
+            _evict_mollweide_index_cache_entry!()
+            _mollweide_pixel_index_compute(res, :ring, nx, ny)
+        end
+    finally
+        unlock(_MOLLWEIDE_INDEX_CACHE_LOCK)
+    end
+end
+
+function _cached_mollweide_pixel_index(m::Healpix.HealpixMap, nx::Int, ny::Int)
+    _validate_mollweide_grid_size(nx, ny)
+    order = _healpix_order_key(m)
+    key = (Int(m.resolution.nside), order, nx, ny)
+    lock(_MOLLWEIDE_INDEX_CACHE_LOCK)
+    try
+        return get!(_MOLLWEIDE_INDEX_CACHE, key) do
+            _evict_mollweide_index_cache_entry!()
+            _mollweide_pixel_index_compute(m.resolution, order, nx, ny)
+        end
+    finally
+        unlock(_MOLLWEIDE_INDEX_CACHE_LOCK)
+    end
+end
+
+function _evict_mollweide_index_cache_entry!()
+    length(_MOLLWEIDE_INDEX_CACHE) < _MOLLWEIDE_INDEX_CACHE_MAX && return nothing
+    delete!(_MOLLWEIDE_INDEX_CACHE, first(keys(_MOLLWEIDE_INDEX_CACHE)))
+    return nothing
+end
+
+function _mollweide_pixel_index_compute(res::Healpix.Resolution, order::Symbol, nx::Int, ny::Int)
     idx = zeros(Int32, ny, nx)
     @inbounds for j in 1:ny, i in 1:nx
         x = 2 * (2 * (i - 0.5) / nx - 1)
@@ -126,7 +184,9 @@ function mollweide_pixel_index(res::Healpix.Resolution, nx::Int, ny::Int)
         abs(lon) > π && continue
         θhp = π/2 - lat
         φhp = lon < 0 ? lon + 2π : lon
-        idx[j, i] = Int32(Healpix.ang2pixRing(res, θhp, φhp))
+        idx[j, i] = Int32(order === :nested ?
+                          Healpix.ang2pixNest(res, θhp, φhp) :
+                          Healpix.ang2pixRing(res, θhp, φhp))
     end
     idx
 end

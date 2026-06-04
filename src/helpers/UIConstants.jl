@@ -7,7 +7,7 @@
 #
 # Organisation
 # ─────────────
-#   §1  Layout & breakpoints
+#   §1  Layout, breakpoints & typography
 #   §2  Undo / redo stack
 #   §3  Histogram rendering
 #   §4  Crosshair rendering
@@ -15,7 +15,8 @@
 #   §6  Region-selection rendering
 #   §7  Contour rendering
 #   §8  Scatter markers
-#   §9  Mollweide / HEALPix projection
+#   §9  Cube overview navigator
+#   §10 Mollweide / HEALPix projection
 #
 # Naming conventions
 # ──────────────────
@@ -26,7 +27,7 @@
 
 
 ############################
-# §1  Layout & breakpoints
+# §1  Layout, breakpoints & typography
 ############################
 
 """
@@ -39,6 +40,32 @@ const COMPACT_LAYOUT_W = 1500
 
 """Height threshold (px) — see `COMPACT_LAYOUT_W`."""
 const COMPACT_LAYOUT_H = 950
+
+# ── Typography scale ──────────────────────────────────────────────────────
+#
+# Single source of truth for widget / label font sizes. Three semantic steps
+# cover the whole UI; call sites pick the role rather than hard-coding a number,
+# so the typographic rhythm stays consistent across every viewer.
+#
+# Integer literals (px) — consistent with Makie `fontsize` usage elsewhere
+# and with the "pixel counts use Integer literals" rule above.
+
+"""Caption font size (px) — smallest step, used for compact widgets and hints."""
+const UI_FS_CAPTION = 11
+
+"""Body font size (px) — default for labels, buttons, menus and textboxes."""
+const UI_FS_BODY = 13
+
+"""Title font size (px) — largest step, used for section / panel headers."""
+const UI_FS_TITLE = 16
+
+# ── Corner radius & padding ───────────────────────────────────────────────
+
+"""Default corner radius (px) for cards, buttons and textboxes."""
+const UI_CORNER_RADIUS = 8
+
+"""Base UI padding / spacing unit (px)."""
+const UI_PAD = 8
 
 
 ############################
@@ -170,6 +197,15 @@ const REGION_ALPHA = 0.55f0
 # §7  Contour rendering
 ############################
 
+"""
+Default number of contour levels produced by `automatic_contour_levels`.
+
+7 levels distribute uniformly across the 5th–95th percentile range and give
+readable maps for typical emission-line and continuum cubes.  Callers that
+want fewer or more levels can pass `n = CONTOUR_N_LEVELS_DEFAULT ÷ 2` etc.
+"""
+const CONTOUR_N_LEVELS_DEFAULT = 7
+
 """Contour linewidth in the 2D image viewer and cube viewer."""
 const CONTOUR_LW = 1.2f0
 
@@ -208,7 +244,30 @@ const MARKER_SIZE_HP = 12
 
 
 ############################
-# §9  Mollweide / HEALPix projection
+# §9  Cube overview navigator
+############################
+
+"""Height of the mini cube-position overview strip below the cube heatmap."""
+const CUBE_OVERVIEW_HEIGHT = 58
+
+"""Height of the compact mini cube-position overview strip."""
+const CUBE_OVERVIEW_HEIGHT_COMPACT = 48
+
+"""Linewidth for the muted X/Y/Z rails in the cube overview strip."""
+const CUBE_OVERVIEW_TRACK_LW = 5.0f0
+
+"""Linewidth for the active slicing-axis rail in the cube overview strip."""
+const CUBE_OVERVIEW_ACTIVE_LW = 7.0f0
+
+"""Linewidth for the active slice marker in the cube overview strip."""
+const CUBE_OVERVIEW_MARKER_LW = 2.6f0
+
+"""Markersize for the inactive coordinate dots in the cube overview strip."""
+const CUBE_OVERVIEW_DOT_SIZE = 8
+
+
+############################
+# §10 Mollweide / HEALPix projection
 ############################
 
 """

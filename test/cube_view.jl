@@ -2,6 +2,81 @@
 # Testsets covering cube/viewer integration: smoke + error handling, dataset
 # dispatch, the vector viewer (helpers + headless), and view_cube field respect.
 
+@testset "cube overview geometry" begin
+    g = MANTA._cube_overview_geometry((4, 5, 6), 3, 4, 2, 3, 1)
+    @test g.active_axis == 3
+    @test g.active_progress_value ≈ 3 / 5
+    @test g.marker_points == Point2f[Point2f(1 / 3, 3), Point2f(0.5, 2), Point2f(3 / 5, 1)]
+    @test g.active_progress == Point2f[Point2f(0, 1), Point2f(3 / 5, 1)]
+
+    one_wide = MANTA._cube_overview_geometry((1, 8, 8), 1, 1, 1, 4, 4)
+    @test one_wide.active_progress_value == 0.5f0
+end
+
+@testset "cube 3D orientation geometry" begin
+    R = MANTA._cube3d_axis_angle_rotation((0, 0, 1), 90)
+    p = MANTA._cube3d_apply_rotation(R, Point3f(1, 0, 0))
+    @test p[1] ≈ 0 atol = 1f-6
+    @test p[2] ≈ 1 atol = 1f-6
+    @test p[3] ≈ 0 atol = 1f-6
+
+    R2 = MANTA._cube3d_compose_rotation(MANTA._cube3d_identity_rotation(), (1, 0, 0), 180)
+    @test size(R2) == (3, 3)
+    @test_throws ArgumentError MANTA._cube3d_axis_angle_rotation((0, 0, 0), 12)
+
+    g3 = MANTA._cube3d_view_geometry((4, 5, 6), 3, 4, 2, 3, 1, MANTA._cube3d_identity_rotation())
+    @test length(g3.box_segments) == 24
+    @test length(g3.slice_loop) == 5
+    @test length(g3.selected_point) == 1
+    @test length(g3.axis_segments) == 6
+
+    cube = Float32[i + 10j + 100k for i in 1:3, j in 1:4, k in 1:5]
+    pmean = MANTA._cube_rotated_projection(cube, size(cube), 3, (0, 0, 1), 0, :mean)
+    @test pmean ≈ dropdims(mean(cube; dims = 3); dims = 3)
+    psum = MANTA._cube_rotated_projection(cube, size(cube), 1, (1, 0, 0), 0, :sum)
+    @test psum ≈ dropdims(sum(cube; dims = 1); dims = 1)
+    @test_throws ArgumentError MANTA._cube_rotated_projection(cube, size(cube), 3, (0, 0, 1), 0, :bad)
+end
+
+@testset "cube UI smoothing checkbox propagates to gaussian state" begin
+    gauss_on = Observable(false)
+    layout_mode = Observable(:base)
+    refresh_count = Ref(0)
+    ps_count = Ref(0)
+    statuses = String[]
+
+    enabled = MANTA._apply_gaussian_smoothing_toggle!(
+        true,
+        gauss_on,
+        () -> (refresh_count[] += 1),
+        layout_mode,
+        () -> (ps_count[] += 1),
+        msg -> push!(statuses, msg),
+    )
+
+    @test enabled
+    @test gauss_on[]
+    @test refresh_count[] == 1
+    @test ps_count[] == 0
+    @test last(statuses) == "Gaussian smoothing enabled."
+
+    layout_mode[] = :power_spectrum
+    enabled = MANTA._apply_gaussian_smoothing_toggle!(
+        false,
+        gauss_on,
+        () -> (refresh_count[] += 1),
+        layout_mode,
+        () -> (ps_count[] += 1),
+        msg -> push!(statuses, msg),
+    )
+
+    @test !enabled
+    @test !gauss_on[]
+    @test refresh_count[] == 2
+    @test ps_count[] == 1
+    @test last(statuses) == "Gaussian smoothing disabled."
+end
+
 @testset "integration: manta smoke and errors" begin
     mktempdir() do tmp
         cube_path = joinpath(tmp, "cube3d.fits")
@@ -131,6 +206,34 @@
         end
         @test err isa MANTA.DatasetShapeError
         @test occursin("4 dimensions", sprint(showerror, err))
+    end
+end
+
+@testset "integration: spectrum y-limits inline state round-trip" begin
+    # Persisted spectrum y-axis policy must replay through apply_inline_state!
+    # → _restore_spec_ylimits! without breaking viewer construction. We capture
+    # logs so a throw inside the restore (which _view_cube swallows with a
+    # warning) still fails the test.
+    cube = reshape(Float32.(1:60), 3, 4, 5)
+
+    for src in ("manual", "contrast", "auto")
+        logger = Test.TestLogger(min_level = Base.CoreLogging.BelowMinLevel)
+        fig = Base.CoreLogging.with_logger(logger) do
+            MANTA.manta(cube;
+                state = Dict{String,Any}(
+                    "spec_ylimits_source" => src,
+                    "spec_ymin" => 2.0,
+                    "spec_ymax" => 8.0,
+                ),
+                activate_gl = false,
+                display_fig = false,
+                figsize = (700, 450),
+            )
+        end
+        @test fig isa Makie.Figure
+        @test !any(r -> occursin("Failed to apply inline", string(r.message)),
+                   logger.logs)
+        MANTA.forget!(fig)
     end
 end
 
@@ -377,6 +480,71 @@ end
     @test bundle.compare_slice_raw[] == MANTA.get_slice_copy(cmp, 3, 4)
 end
 
+@testset "SlicePipelineBundle display downsampling preserves native coordinates" begin
+    data = reshape(Float32.(1:(4 * 6 * 2)), 4, 6, 2)
+
+    bundle = MANTA._cube_slice_pipeline_bundle(;
+        data,
+        siz = size(data),
+        wcs = MANTA.read_simple_wcs(Dict{String,Any}(), 3),
+        axis = Observable(3),
+        idx = Observable(1),
+        compare_idx = Observable(1),
+        gauss_on = Observable(false),
+        sigma = Observable(1.5f0),
+        compare_data = Observable{Any}(nothing),
+        compare_mode = Observable(:B),
+        view_product = Observable(:slice),
+        mask_bits_obs = Observable{Union{Nothing,BitArray{3}}}(nothing),
+        moment_order = Observable(0),
+        img_scale_mode = Observable(:lin),
+        moment_threshold = 0.0,
+        moment_nsigma = nothing,
+        moment_channels = nothing,
+        display_max_pixels = 2,
+    )
+
+    @test bundle.plot_stride[] == 3
+    @test bundle.plot_x[] == Float32[2.0, 5.0]
+    @test bundle.plot_y[] == Float32[2.0, 4.0]
+    @test size(bundle.slice_plot[]) == (2, 2)
+    @test bundle.slice_plot[] == permutedims(MANTA.downsample_block_mean(bundle.slice_disp[], 3))
+end
+
+@testset "SlicePipelineBundle moment cache tracks mask changes" begin
+    data = fill(1f0, 2, 2, 2)
+    mask_obs = Observable{Union{Nothing,BitArray{3}}}(nothing)
+
+    bundle = MANTA._cube_slice_pipeline_bundle(;
+        data,
+        siz = size(data),
+        wcs = MANTA.read_simple_wcs(Dict{String,Any}(), 3),
+        axis = Observable(3),
+        idx = Observable(1),
+        compare_idx = Observable(1),
+        gauss_on = Observable(false),
+        sigma = Observable(1.5f0),
+        compare_data = Observable{Any}(nothing),
+        compare_mode = Observable(:B),
+        view_product = Observable(:moment),
+        mask_bits_obs = mask_obs,
+        moment_order = Observable(0),
+        img_scale_mode = Observable(:lin),
+        moment_threshold = 0.0,
+        moment_nsigma = nothing,
+        moment_channels = nothing,
+    )
+
+    @test bundle.moment_raw[] == fill(2f0, 2, 2)
+
+    mask = trues(2, 2, 2)
+    mask[:, :, 2] .= false
+    mask_obs[] = mask
+
+    @test bundle.moment_raw[] == fill(1f0, 2, 2)
+    @test length(bundle._moment_cache) == 2
+end
+
 @testset "SlicePipelineBundle OOB idx clamps and warns" begin
     # 2×2×4 cube: valid axis-3 indices are 1..4.
     data = reshape(Float32.(1:16), 2, 2, 4)
@@ -428,7 +596,7 @@ end
     @test bundle.compare_slice_raw[] == MANTA.get_slice_copy(cmp, 3, 4)
 
     # --- in-bounds indices produce no warning ---
-    @test_logs min_level=Logging.Warn begin
+    @test_logs min_level=Base.CoreLogging.Warn begin
         idx[]         = 3
         compare_idx[] = 2
     end
@@ -460,6 +628,109 @@ end
     )
     # mask_slice should have clamped to slice 4 without throwing
     @test bundle2.mask_slice[] == collect(@view mask[:, :, 4])
+end
+
+@testset "SlicePipelineBundle: slice_raw is a zero-copy view" begin
+    # Hot-path optimisation: slice_raw must NOT copy the cube — it exposes a
+    # view aliasing the parent. The copy only materialises downstream where a
+    # transformation needs it (e.g. slice_disp via apply_scale_display).
+    data = reshape(Float32.(1:24), 2, 3, 4)
+
+    axis = Observable(3)
+    idx = Observable(2)
+    compare_idx = Observable(1)
+    cmp = reshape(Float32.(101:124), 2, 3, 4)
+
+    bundle = MANTA._cube_slice_pipeline_bundle(;
+        data,
+        siz = size(data),
+        wcs = MANTA.read_simple_wcs(Dict{String,Any}(), 3),
+        axis,
+        idx,
+        compare_idx,
+        gauss_on = Observable(false),
+        sigma = Observable(1.5f0),
+        compare_data = Observable{Any}(cmp),
+        compare_mode = Observable(:A),
+        view_product = Observable(:slice),
+        mask_bits_obs = Observable{Union{Nothing,BitArray{3}}}(nothing),
+        moment_order = Observable(0),
+        img_scale_mode = Observable(:lin),
+        moment_threshold = 0.0,
+        moment_nsigma = nothing,
+        moment_channels = nothing,
+    )
+
+    s = bundle.slice_raw[]
+    @test s isa SubArray              # not a freshly allocated Array
+    @test parent(s) === data          # aliases the cube, no copy
+    @test s == MANTA.get_slice_view(data, 3, 2)
+
+    # compare_slice_raw is likewise a view onto the comparison cube.
+    cs = bundle.compare_slice_raw[]
+    @test cs isa SubArray
+    @test parent(cs) === cmp
+
+    # The display array is still an independent, scale-applied Float32 buffer
+    # (the copy happens here, not in slice_raw).
+    d = bundle.slice_disp[]
+    @test d isa Matrix{Float32}
+    @test d !== s
+    @test !(d isa SubArray)
+end
+
+@testset "SlicePipelineBundle: smoothing can toggle after zero-copy view init" begin
+    data = reshape(Float32.(1:24), 2, 3, 4)
+    gauss_on = Observable(false)
+
+    bundle = MANTA._cube_slice_pipeline_bundle(;
+        data,
+        siz = size(data),
+        wcs = MANTA.read_simple_wcs(Dict{String,Any}(), 3),
+        axis = Observable(3),
+        idx = Observable(2),
+        compare_idx = Observable(1),
+        gauss_on,
+        sigma = Observable(1.5f0),
+        compare_data = Observable{Any}(nothing),
+        compare_mode = Observable(:A),
+        view_product = Observable(:slice),
+        mask_bits_obs = Observable{Union{Nothing,BitArray{3}}}(nothing),
+        moment_order = Observable(0),
+        img_scale_mode = Observable(:lin),
+        moment_threshold = 0.0,
+        moment_nsigma = nothing,
+        moment_channels = nothing,
+    )
+
+    @test bundle.slice_proc[] isa SubArray
+    @test eltype(bundle.slice_proc) === AbstractMatrix{Float32}
+
+    gauss_on[] = true
+
+    @test bundle.slice_proc[] isa Matrix{Float32}
+    @test bundle.base_slice_proc[] isa Matrix{Float32}
+    @test bundle.compare_slice_proc[] isa Matrix{Float32}
+end
+
+@testset "view_cube: lazy cube smoke + prefetch wiring" begin
+    # A memory-mapped (LazyFITSCube) cube must drive the full viewer headlessly.
+    # This exercises the `if data isa LazyFITSCube` prefetch-wiring branch added
+    # to _view_cube (on(idx)/on(axis) registration) without needing a GL context.
+    mktempdir() do tmp
+        path = joinpath(tmp, "lazy_cube.fits")
+        FITS(path, "w") do f
+            write(f, Float32[i + 10j + 100k for i in 1:5, j in 1:6, k in 1:7])
+        end
+        ds = MANTA.load_fits(path; lazy = true)
+        @test ds isa MANTA.CubeDataset
+        @test ds.data isa MANTA.LazyFITSCube
+
+        fig = MANTA.view_cube(ds; activate_gl = false, display_fig = false,
+                              figsize = (700, 450))
+        @test fig isa Makie.Figure
+        MANTA.forget!(fig)
+    end
 end
 
 @testset "manta_batch" begin
@@ -571,4 +842,67 @@ end
     ds64 = MANTA.CubeDataset(rand(Float64, 4, 4, 3))
     fig64 = MANTA.view_cube(ds64; activate_gl = false, display_fig = false)
     @test fig64 isa Makie.Figure
+end
+
+@testset "cube undo/redo snapshot coverage" begin
+    # Guards the audited gap: the cube viewer's undo snapshot must capture more
+    # than navigation/contrast — the mask source, the region selection and the
+    # moment product have to round-trip too, or a mask/region/moment applied by
+    # mistake would not be undoable.
+    base = (;
+        axis = 3, idx = 1, compare_idx = 1,
+        cmap_name = :viridis, invert_cmap = false, img_scale_mode = :lin,
+        use_manual = false, clims_manual = (0f0, 1f0),
+        mask_source = MANTA.NoMaskSource(),
+        region_uvs = Tuple{Int,Int}[],
+        region_p0 = (0f0, 0f0), region_p1 = (0f0, 0f0),
+        selection_mode = :point, view_product = :slice, moment_order = 0,
+    )
+    mk(; kw...) = MANTA._cube_undo_snapshot(; merge(base, (; kw...))...)
+
+    # 1. The audited fields are present in the snapshot.
+    s0 = mk()
+    @test s0 isa MANTA._CubeUndoSnapshot
+    for f in (:mask_source, :region_uvs, :selection_mode, :view_product, :moment_order)
+        @test hasproperty(s0, f)
+    end
+
+    # 2. Type stability across concrete MaskSource subtypes — the abstract-field
+    #    fix. A single UndoRedoStack{T} must accept every snapshot.
+    s_thr = mk(; mask_source = MANTA.ThresholdSource(:ge, 1.0, 0.0))
+    @test typeof(s_thr) === typeof(s0) === MANTA._CubeUndoSnapshot
+
+    # 3. NaN-safe dedup: identical empty-selection snapshots compare equal even
+    #    though the live drag points are Point2f(NaN, NaN).
+    @test mk() == mk()
+    @test MANTA._undo_clean_pt((NaN32, NaN32)) == (0f0, 0f0)
+    @test MANTA._undo_clean_pt((2.5f0, -1.0f0)) == (2.5f0, -1.0f0)
+
+    # 4. Round-trip through the real stack restores mask + region + moment.
+    stack = MANTA.UndoRedoStack(s0)
+    s1 = mk(;
+        mask_source = MANTA.ThresholdSource(:ge, 2.0, 0.0),
+        region_uvs = [(1, 1), (1, 2)], selection_mode = :box,
+        region_p0 = (1f0, 1f0), region_p1 = (2f0, 2f0),
+        view_product = :moment, moment_order = 1,
+    )
+    MANTA.register_state!(stack, s1)
+    @test length(stack) == 2
+
+    back = MANTA.undo!(stack)
+    @test back.mask_source isa MANTA.NoMaskSource
+    @test isempty(back.region_uvs)
+    @test back.view_product === :slice
+    @test back.moment_order == 0
+
+    fwd = MANTA.redo!(stack)
+    @test fwd.mask_source isa MANTA.ThresholdSource
+    @test fwd.region_uvs == [(1, 1), (1, 2)]
+    @test fwd.selection_mode === :box
+    @test fwd.view_product === :moment
+    @test fwd.moment_order == 1
+
+    # 5. Dedup still collapses a genuinely-unchanged re-register.
+    MANTA.register_state!(stack, fwd)
+    @test length(stack) == 2
 end
