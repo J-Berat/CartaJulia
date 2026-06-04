@@ -24,6 +24,12 @@
 # Entry point: `_cube_ui_callbacks_bundle!(; kwargs...)`.
 # Returns `syncing_slice_controls::Ref{Bool}` (needed by KeyboardBundle).
 
+function _apply_invert_colormap_toggle!(v, invert_cmap)
+    enabled = Bool(v)
+    invert_cmap[] = enabled
+    return enabled
+end
+
 function _apply_gaussian_smoothing_toggle!(v, gauss_on, refresh_spectrum!,
                                            layout_mode, render_power_spectrum_layout!,
                                            set_status!)
@@ -488,11 +494,11 @@ function _cube_ui_callbacks_bundle!(;
     # ------------------------------------------------------------------ #
     # Display-toggle checkboxes
     # ------------------------------------------------------------------ #
-    on_mode(invert_chk.checked, :navigation) do v
-        invert_cmap[] = v
+    on(invert_chk.checked) do v
+        _apply_invert_colormap_toggle!(v, invert_cmap)
     end
 
-    on_mode(gauss_chk.checked, :navigation) do v
+    on(gauss_chk.checked) do v
         _apply_gaussian_smoothing_toggle!(
             v, gauss_on, refresh_spectrum!,
             layout_mode, render_power_spectrum_layout!, set_status!)

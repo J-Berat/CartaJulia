@@ -38,7 +38,17 @@ end
     @test_throws ArgumentError MANTA._cube_rotated_projection(cube, size(cube), 3, (0, 0, 1), 0, :bad)
 end
 
-@testset "cube UI smoothing checkbox propagates to gaussian state" begin
+@testset "cube UI display checkboxes propagate to render state" begin
+    invert_cmap = Observable(false)
+
+    enabled = MANTA._apply_invert_colormap_toggle!(true, invert_cmap)
+    @test enabled
+    @test invert_cmap[]
+
+    enabled = MANTA._apply_invert_colormap_toggle!(false, invert_cmap)
+    @test !enabled
+    @test !invert_cmap[]
+
     gauss_on = Observable(false)
     layout_mode = Observable(:base)
     refresh_count = Ref(0)

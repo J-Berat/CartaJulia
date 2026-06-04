@@ -1426,7 +1426,7 @@ function _view_cube(
     colsize!(export_top, 1, Relative(1))
     colsize!(export_top, 2, Fixed(compact_layout ? 660 : 740))
     colsize!(export_top, 3, Fixed(compact_layout ? 14 : 22))
-    colsize!(export_top, 4, Fixed(compact_layout ? 360 : 420))
+    colsize!(export_top, 4, Fixed(compact_layout ? 430 : 480))
     colsize!(export_top, 5, Relative(1))
 
     fmt_menu  = Menu(output_card[2, 1]; options = ["png", "pdf"], prompt = "png", width = 90)
