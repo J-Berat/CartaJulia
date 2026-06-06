@@ -1292,6 +1292,59 @@ end
 end
 
 # ----------------------------------------------------------------------------
+# Log-axis zoom safety — regression for the GLMakie scroll-zoom crash
+# (`AssertionError: all(low .<= high)` from update_axis_camera on a log axis).
+# All headless: no GL context, just the limit math + interaction glue.
+# ----------------------------------------------------------------------------
+@testset "helpers: log-axis zoom safety" begin
+    # zoom_limits in log space: zoom-OUT keeps both bounds strictly positive and
+    # ordered (the linear midpoint math used to drive a log bound ≤ 0 → NaN).
+    let (a, b, c, d) = MANTA.zoom_limits((1.0, 100.0, 1.0, 100.0), 5.0;
+                                         xlog = true, ylog = true)
+        @test a > 0 && b > 0 && c > 0 && d > 0
+        @test a < b && c < d
+        # Span is scaled about the geometric mean, which stays at √(1·100)=10.
+        @test isapprox(sqrt(a * b), 10.0; rtol = 1e-6)
+        @test isapprox(sqrt(c * d), 10.0; rtol = 1e-6)
+    end
+    # Zoom-IN in log space also stays positive.
+    let (a, b, _, _) = MANTA.zoom_limits((1.0, 100.0, 1.0, 100.0), 0.5; xlog = true)
+        @test a > 0 && b > 0 && a < b
+    end
+    # A non-positive interval on a log axis is refused (returned unchanged).
+    @test MANTA.zoom_limits((-1.0, 100.0, 1.0, 100.0), 1.25; xlog = true) ===
+          (-1.0, 100.0, 1.0, 100.0)
+    # Flags off ⇒ identical to the plain linear math (no behavioural regression).
+    @test MANTA.zoom_limits((0.0, 10.0, 0.0, 20.0), 1.25) ==
+          MANTA.zoom_limits((0.0, 10.0, 0.0, 20.0), 1.25; xlog = false, ylog = false)
+
+    # zoom_axis! on a log–log axis never produces a ≤ 0 limit (the crash cause).
+    figL = Figure(size = (320, 200))
+    axL  = Axis(figL[1, 1]; xscale = log10, yscale = log10)
+    axL.finallimits[] = Makie.Rect2f(1.0f0, 1.0f0, 99.0f0, 99.0f0)  # x,y ∈ [1,100]
+    MANTA.zoom_axis!(axL, 5.0)   # zoom way out — old code drove the lower bound < 0
+    let tl = axL.targetlimits[]
+        @test tl.origin[1] > 0 && tl.origin[2] > 0
+        @test tl.widths[1] > 0 && tl.widths[2] > 0
+    end
+
+    # guard_log_zoom!: installs the safe handler on a log axis, no-op on linear.
+    @test MANTA.guard_log_zoom!(axL) === axL
+    figLin = Figure(size = (320, 200))
+    axLin  = Axis(figLin[1, 1])
+    @test MANTA.guard_log_zoom!(axLin) === axLin
+
+    # The safe scroll interaction itself keeps log limits positive on scroll-out.
+    axL.finallimits[] = Makie.Rect2f(1.0f0, 1.0f0, 99.0f0, 99.0f0)
+    s = MANTA.LogSafeScrollZoom(0.1)
+    Makie.process_interaction(s, Makie.ScrollEvent(0.0, -6.0), axL)
+    let tl = axL.targetlimits[]
+        @test tl.origin[1] > 0 && tl.origin[2] > 0
+        @test tl.widths[1] > 0 && tl.widths[2] > 0
+    end
+end
+
+# ----------------------------------------------------------------------------
 # Shortcut help window (headless)
 # ----------------------------------------------------------------------------
 @testset "helpers: shortcut help window" begin

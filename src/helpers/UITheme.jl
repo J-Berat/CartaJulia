@@ -55,19 +55,19 @@ without competing with data, and bright amber/orange accents echo the
 warm glow of emission maps.
 """
 dark_ui_theme() = MANTAUITheme(
-    RGBf(0.14, 0.16, 0.20),    # panel        — deep anthracite
-    RGBf(0.08, 0.10, 0.14),    # panel_header — deeper anthracite header
-    RGBf(0.50, 0.58, 0.96),    # accent       — luminous indigo
+    RGBf(0.19, 0.22, 0.28),    # panel        — anthracite, clearly above bg
+    RGBf(0.25, 0.29, 0.36),    # panel_header — lighter band, reads as a title bar
+    RGBf(0.54, 0.62, 1.00),    # accent       — luminous indigo
     RGBf(0.64, 0.70, 1.00),    # accent_dim   — indigo tint
-    RGBf(0.72, 0.78, 1.00),    # accent_strong — light indigo highlight
-    RGBf(0.26, 0.29, 0.34),    # track        — dark slate
-    RGBf(0.17, 0.19, 0.23),    # surface      — night-grey cards
-    RGBf(0.21, 0.24, 0.29),    # surface_hover
-    RGBf(0.25, 0.28, 0.34),    # surface_active
-    RGBf(0.23, 0.26, 0.32),    # border
-    RGBf(0.38, 0.42, 0.50),    # border_strong
-    RGBf(0.87, 0.89, 0.93),    # text         — off-white
-    RGBf(0.52, 0.57, 0.66),    # text_muted   — muted blue-grey
+    RGBf(0.74, 0.80, 1.00),    # accent_strong — light indigo highlight
+    RGBf(0.30, 0.34, 0.40),    # track        — dark slate
+    RGBf(0.23, 0.26, 0.32),    # surface      — night-grey cards
+    RGBf(0.28, 0.32, 0.39),    # surface_hover
+    RGBf(0.33, 0.37, 0.45),    # surface_active
+    RGBf(0.42, 0.47, 0.56),    # border       — visible against panel + bg
+    RGBf(0.58, 0.64, 0.74),    # border_strong — axis spines / card edges
+    RGBf(0.90, 0.92, 0.96),    # text         — off-white
+    RGBf(0.66, 0.71, 0.80),    # text_muted   — readable blue-grey
     RGBf(0.09, 0.10, 0.13),    # background   — near-black
     RGBf(1.00, 0.72, 0.18),    # selection    — bright amber
     RGBf(1.00, 0.42, 0.24),    # compare      — hot orange
@@ -95,6 +95,20 @@ called in this Julia session, light otherwise.
 current_ui_theme() = _MANTA_DARK_MODE[] ? dark_ui_theme() : default_ui_theme()
 
 """
+    _theme_rgba(c::RGBf, alpha::Real) -> RGBAf
+
+Return the theme colour `c` with an `alpha` channel applied.
+
+Centralises the `RGBAf(c.r, c.g, c.b, α)` boilerplate that recurs across the
+viewers whenever a translucent variant of a `MANTAUITheme` field is needed —
+card borders, header dividers, focus-bar backgrounds, axis grid lines, etc.
+Routing these through a single helper keeps the derived colour tied to the
+active theme (so it follows `set_dark_mode!`) instead of being re-typed inline
+at every call site.
+"""
+_theme_rgba(c::RGBf, alpha::Real) = RGBAf(c.r, c.g, c.b, alpha)
+
+"""
     _makie_theme_for(t::MANTAUITheme) -> Makie.Theme
 
 Build a `Makie.Theme` whose axis/colorbar/figure colours match the MANTA
@@ -104,8 +118,8 @@ grid lines, spines and figure backgrounds follow the chosen palette without
 needing per-axis overrides scattered across every view file.
 """
 function _makie_theme_for(t::MANTAUITheme)
-    grid_c  = RGBAf(t.border.r,        t.border.g,        t.border.b,        0.45)
-    mgrid_c = RGBAf(t.border.r,        t.border.g,        t.border.b,        0.20)
+    grid_c  = _theme_rgba(t.border, 0.45)
+    mgrid_c = _theme_rgba(t.border, 0.20)
     spine_c = t.border_strong
     text_c  = t.text
     tick_c  = t.text_muted

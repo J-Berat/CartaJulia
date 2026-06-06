@@ -22,6 +22,34 @@ function automatic_contour_levels(vals; n::Int = CONTOUR_N_LEVELS_DEFAULT)
 end
 
 """
+    auto_contour_color(img; fallback=:light) -> RGBAf
+
+Auto-contrasted default colour for *automatic* contours: black
+(`CONTOUR_AUTO_DARK_ALPHA`) on bright images, white (`CONTOUR_AUTO_LIGHT_ALPHA`)
+on dark ones. The choice is driven by the normalised median brightness of the
+finite values of `img`, measured against its 5–95th percentile clims — the same
+`t > CONTOUR_AUTO_BRIGHTNESS_THRESHOLD` rule used across every viewer. A single
+finite-filtered pass (`finite_float_values`) feeds both the clims and the median.
+
+`fallback` selects the colour returned for a degenerate image (no finite values,
+or a near-zero percentile range): `:light` (white) for the 2-D image / cube
+viewers, `:dark` (black) for the HEALPix viewers — preserving each viewer's
+historical default.
+"""
+function auto_contour_color(img; fallback::Symbol = :light)
+    dark  = RGBAf(0f0, 0f0, 0f0, CONTOUR_AUTO_DARK_ALPHA)
+    light = RGBAf(1f0, 1f0, 1f0, CONTOUR_AUTO_LIGHT_ALPHA)
+    fb = fallback === :dark ? dark : light
+    fv = finite_float_values(img)
+    isempty(fv) && return fb
+    lo, hi = percentile_clims(fv, 5, 95)
+    rng = hi - lo
+    rng < 1f-9 && return fb
+    t = clamp((median(fv) - lo) / rng, 0f0, 1f0)
+    return t > CONTOUR_AUTO_BRIGHTNESS_THRESHOLD ? dark : light
+end
+
+"""
     parse_contour_levels(txt; fallback=Float32[]) -> (ok, use_manual, levels, message)
 
 Parse comma/space/semicolon-separated contour levels. Empty text means auto.

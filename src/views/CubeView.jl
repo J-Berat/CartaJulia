@@ -452,6 +452,10 @@ function _view_cube(
     cm_obs = lift(cmap_name, invert_cmap) do name, inv
         base = to_cmap(name); inv ? reverse(base) : base
     end
+    ps_cmap_name = Observable(cmap_name[])
+    ps_cm_obs = lift(ps_cmap_name) do name
+        to_cmap(name)
+    end
     img_scale_mode            = st.img_scale_mode
     spec_scale_mode           = st.spec_scale_mode
     compare_data              = st.compare_data
@@ -461,6 +465,9 @@ function _view_cube(
     compare_mode              = st.compare_mode
     view_product              = st.view_product
     moment_order              = st.moment_order
+    rotation_axis_obs         = st.rotation_axis
+    rotation_angle_obs        = st.rotation_angle
+    rotation_projection_mode  = st.rotation_projection_mode
     layout_mode               = st.layout_mode
     control_mode              = st.control_mode
     focus_image               = Observable(false)
@@ -499,10 +506,6 @@ function _view_cube(
     mask_source_obs           = st.mask_source_obs
     mask_bits_obs             = st.mask_bits_obs
     mask_status_obs           = st.mask_status_obs
-    # ---------- Rotation-projection state ----------
-    rotation_axis_obs          = Observable((0f0, 0f0, 1f0))
-    rotation_angle_obs         = Observable(0f0)
-    rotation_projection_mode   = Observable(:mean)
 
     ui_theme = current_ui_theme()
     ui_theme_ref = Ref(ui_theme)
@@ -536,13 +539,8 @@ function _view_cube(
        compare_product_proc, view_raw, slice_proc, slice_disp, compare_slice_disp,
        plot_stride, plot_x, plot_y, slice_plot, compare_slice_plot,
        mask_slice, moment_raw, _moment_cache, _get_gauss_kernel, _gauss_kernel_cache) =
-        _cube_slice_pipeline_bundle(;
-            data, siz, wcs, axis, idx, compare_idx, gauss_on, sigma,
-            compare_data, compare_mode, view_product, mask_bits_obs,
-            rotation_axis = rotation_axis_obs,
-            rotation_angle = rotation_angle_obs,
-            rotation_projection_mode,
-            moment_order, img_scale_mode, asinh_softening,
+        _cube_slice_pipeline_bundle(st;
+            data, siz, wcs, asinh_softening,
             moment_threshold, moment_nsigma, moment_channels,
         )
 
@@ -593,18 +591,7 @@ function _view_cube(
     end
     # Auto-contrasted contour colour: white on dark images, black on bright ones.
     contour_default_color_obs = lift(slice_disp) do img
-        # why: a single finite-filtered pass, reused for both the percentile
-        # clims and the median below, instead of allocating a full `Float32.(img)`
-        # matrix plus a separate `filter` copy on every committed slice.
-        fv = finite_float_values(img)
-        isempty(fv) && return RGBAf(1f0, 1f0, 1f0, CONTOUR_AUTO_LIGHT_ALPHA)
-        lo, hi = percentile_clims(fv, 5, 95)
-        rng = hi - lo
-        rng < 1f-9 && return RGBAf(1f0, 1f0, 1f0, CONTOUR_AUTO_LIGHT_ALPHA)
-        t = clamp((median(fv) - lo) / rng, 0f0, 1f0)
-        t > CONTOUR_AUTO_BRIGHTNESS_THRESHOLD ?
-            RGBAf(0f0, 0f0, 0f0, CONTOUR_AUTO_DARK_ALPHA) :
-            RGBAf(1f0, 1f0, 1f0, CONTOUR_AUTO_LIGHT_ALPHA)
+        auto_contour_color(img; fallback = :light)
     end
     contour_colors_obs = lift(contour_levels_obs, contour_use_manual, contour_manual_colors,
                               contour_default_color_obs) do levels, use_man, colors, def_color
@@ -741,17 +728,21 @@ function _view_cube(
     pick_backend!(activate_gl)
     fig_size = _pick_fig_size(figsize)
     compact_layout = fig_size[1] <= COMPACT_LAYOUT_W || fig_size[2] <= COMPACT_LAYOUT_H
-    spec_axis_height = compact_layout ? 185 : 320
-    hist_axis_height = compact_layout ? 60 : 105
+    roomy_compact_layout = compact_layout && fig_size[1] >= 1400 && fig_size[2] >= 840
+    spec_axis_width = compact_layout ? (roomy_compact_layout ? 720 : 600) : 600
+    spec_axis_height = compact_layout ? (roomy_compact_layout ? 230 : 185) : 320
+    hist_axis_height = compact_layout ? (roomy_compact_layout ? 76 : 60) : 105
     ps_header_height = compact_layout ? 0 : 76
-    ps_axis_size = compact_layout ? 320 : 620
-    controls_row_heights = compact_layout ? (180, 164, 42) : (188, 146, 46)
+    ps_axis_size = compact_layout ? (roomy_compact_layout ? 420 : 320) : 620
+    controls_row_heights = compact_layout ?
+        (roomy_compact_layout ? (180, 130, 36) : (180, 164, 42)) :
+        (188, 146, 46)
     controls_gap = compact_layout ? 8 : 16
     controls_height = sum(controls_row_heights) + 2 * controls_gap
     card_pad = compact_layout ? 9 : 12
     card_gap = compact_layout ? 7 : 10
     main_row_gap = compact_layout ? 8 : 14
-    plot_row_height = compact_layout ? max(320, fig_size[2] - controls_height - 8 * main_row_gap) : 0
+    plot_row_height = compact_layout ? max(ps_axis_size + 80, fig_size[2] - controls_height - 2 * main_row_gap) : 0
     # Height reserved for row 1 when stacking the heatmap + PSD in :power_spectrum mode.
     ps_plot_row_height = max(360, fig_size[2] - controls_height - 2 * main_row_gap - 16)
 
@@ -768,7 +759,7 @@ function _view_cube(
     # NOTE: tellwidth=false is intentionally NOT set here — CompareBundle
     # dynamically resizes column 2 of img_grid and must be able to propagate
     # the total width up to main_grid col 1.
-    img_grid  = main_grid[1, 1] = GridLayout(; valign = :center)
+    img_grid  = main_grid[1, 1] = GridLayout(; valign = :top)
     colgap!(img_grid, compact_layout ? 8 : 14)
     rowgap!(img_grid, compact_layout ? 6 : 8)
     img_a_grid = img_grid[1, 1] = GridLayout()
@@ -932,6 +923,12 @@ function _view_cube(
         ax_cmp.width[] = ps_axis_size
         ax_cmp.height[] = ps_axis_size
     end
+    normal_axis_size = (;
+        img_w = ax_img.width[],
+        img_h = ax_img.height[],
+        cmp_w = ax_cmp.width[],
+        cmp_h = ax_cmp.height[],
+    )
     colsize!(img_grid, 2, Fixed(0))
 
     uv_point = Observable(Point2f(1, 1))
@@ -1196,7 +1193,7 @@ function _view_cube(
         title  = L"\text{Spectrum at selected pixel}",
         xlabel = L"\text{index along slice axis}",
         ylabel = unit_label_tex,
-        width  = 600,
+        width  = spec_axis_width,
         height = spec_axis_height,
         xtickformat = latex_tick_formatter,
         ytickformat = latex_tick_formatter,
@@ -1271,15 +1268,17 @@ function _view_cube(
     ps_win_menu = track_ps!(Menu(ps_settings[1, 4]; options = ["Hann", "Hamming", "None"], prompt = "Hann", width = 82))
     track_ps!(Label(ps_settings[1, 5]; text = "Units", halign = :right, fontsize = 12, color = ui_text_muted))
     ps_unit_menu = track_ps!(Menu(ps_settings[1, 6]; options = ["pixel", "physical"], prompt = "pixel", width = 82))
+    track_ps!(Label(ps_settings[1, 7]; text = "PSD cmap", halign = :right, fontsize = 12, color = ui_text_muted))
+    ps_cmap_menu = track_ps!(Menu(ps_settings[1, 8]; options = ui_colormap_options(), prompt = String(ps_cmap_name[]), width = 104))
 
     ps_pad_chk = track_ps!(Checkbox(ps_settings[2, 1]))
     track_ps!(Label(ps_settings[2, 2]; text = "Pad", halign = :left, fontsize = 12, color = ui_text))
     ps_nanapo_chk = track_ps!(Checkbox(ps_settings[2, 3]))
     track_ps!(Label(ps_settings[2, 4]; text = "NaN", halign = :left, fontsize = 12, color = ui_text))
-    ps_fit_chk = track_ps!(Checkbox(ps_settings[2, 5]))
-    track_ps!(Label(ps_settings[2, 6]; text = "$(MANTA_ICONS.fit) Fit", halign = :left, fontsize = 12, color = ui_text))
-    ps_kmin_box = track_ps!(Textbox(ps_settings[2, 7]; placeholder = "k_min", width = 66, height = 28))
-    ps_kmax_box = track_ps!(Textbox(ps_settings[2, 8]; placeholder = "k_max", width = 66, height = 28))
+    ps_kmin_box = track_ps!(Textbox(ps_settings[2, 5]; placeholder = "k_min", width = 66, height = 28))
+    ps_kmax_box = track_ps!(Textbox(ps_settings[2, 6]; placeholder = "k_max", width = 66, height = 28))
+    ps_fit_btn = track_ps!(Button(ps_settings[2, 7]; label = "$(MANTA_ICONS.fit) Fit", width = 66, height = 28))
+    ps_clear_fit_btn = track_ps!(Button(ps_settings[2, 8]; label = "Clear", width = 66, height = 28))
 
     ps_actions = ps_header[1, 2] = GridLayout(; halign = :right, valign = :top, tellwidth = false, tellheight = false)
     colgap!(ps_actions, 6)
@@ -1314,8 +1313,8 @@ function _view_cube(
         )
         body_rows = rows + 1
         card_is_dark = ui_theme.background.r < 0.5
-        card_border = RGBAf(ui_border.r, ui_border.g, ui_border.b, card_is_dark ? 0.58 : 0.82)
-        header_divider = RGBAf(ui_border.r, ui_border.g, ui_border.b, card_is_dark ? 0.30 : 0.50)
+        card_border = _theme_rgba(ui_border, card_is_dark ? 0.58 : 0.82)
+        header_divider = _theme_rgba(ui_border, card_is_dark ? 0.30 : 0.50)
         # Card body
         Box(card[1:body_rows, 1:cols];
             color = ui_panel, strokecolor = card_border,
@@ -1355,17 +1354,17 @@ function _view_cube(
     btn_undo = Button(mode_bar[1, 6]; label = MANTA_ICONS.undo, width = 46, height = 32)
     btn_redo = Button(mode_bar[1, 7]; label = MANTA_ICONS.redo, width = 46, height = 32)
     foreach(c -> colsize!(mode_bar, c, Auto()), 1:7)
-    view_card = control_card!(controls_grid, 1, 1, "View"; rows = 6, cols = 4)
+    view_card = control_card!(controls_grid, 1, 1, "View"; rows = 5, cols = 4)
     control_label!(view_card, (2, 1), "Image")
     img_scale_menu = Menu(view_card[2, 2]; options = scale_menu_options(), prompt = String(scale), width = 96)
     control_label!(view_card, (3, 1), "Spectrum")
     spec_scale_menu = Menu(view_card[3, 2]; options = scale_menu_options(), prompt = String(scale), width = 96)
     reset_zoom_btn = Button(view_card[2, 3:4]; label = "$(MANTA_ICONS.fit) Fit", width = 92, height = 32)
     cube3d_btn = Button(view_card[3, 3:4]; label = "3D cube", width = 92, height = 32)
-    ps_btn = Button(view_card[4, 1:4]; label = "Power spectrum layout", width = 240, height = 32)
-    base_layout_btn = Button(view_card[5, 1:4]; label = "Base layout", width = 240, height = 32)
-    clim_fix_btn = Button(view_card[6, 1:2]; label = "Fix cbar", width = 116, height = 32)
-    clim_auto_nav_btn = Button(view_card[6, 3:4]; label = "Auto cbar", width = 116, height = 32)
+    ps_btn = Button(view_card[4, 1:2]; label = "Power spectrum", width = 116, height = 32)
+    base_layout_btn = Button(view_card[4, 3:4]; label = "Base layout", width = 116, height = 32)
+    clim_fix_btn = Button(view_card[5, 1:2]; label = "Fix cbar", width = 116, height = 32)
+    clim_auto_nav_btn = Button(view_card[5, 3:4]; label = "Auto cbar", width = 116, height = 32)
     foreach(c -> colsize!(view_card, c, Auto()), 1:4)
 
     slice_card = control_card!(controls_grid, 1, 2, "Slice"; rows = 5, cols = 5)
@@ -1535,8 +1534,8 @@ function _view_cube(
     )
     colgap!(focus_bar, compact_layout ? 4 : 6)
     Box(focus_bar[1, 1:5];
-        color = RGBAf(ui_panel.r, ui_panel.g, ui_panel.b, 0.94),
-        strokecolor = RGBAf(ui_border.r, ui_border.g, ui_border.b, 0.75),
+        color = _theme_rgba(ui_panel, 0.94),
+        strokecolor = _theme_rgba(ui_border, 0.75),
         strokewidth = 0.9,
         cornerradius = 8,
         z = -5)
@@ -1615,6 +1614,7 @@ function _view_cube(
     style_menu!(ps_src_menu)
     style_menu!(ps_win_menu)
     style_menu!(ps_unit_menu)
+    style_menu!(ps_cmap_menu)
     style_menu!(fmt_menu)
     style_menu!(compare_mode_menu)
     style_menu!(axis_menu)
@@ -1665,9 +1665,10 @@ function _view_cube(
     style_button_ghost!(ps_btn)
     style_button_ghost!(ps_refresh_btn)
     style_button_ghost!(ps_popout_btn)
+    style_button_primary!(ps_fit_btn)
+    style_button_ghost!(ps_clear_fit_btn)
     style_checkbox!(ps_pad_chk)
     style_checkbox!(ps_nanapo_chk)
-    style_checkbox!(ps_fit_chk)
     # Export — action principale + secondaires
     style_button_primary!(btn_save_img)
     style_button_primary!(btn_save_spec)
@@ -1735,6 +1736,7 @@ function _view_cube(
                     reset_zoom_btn, reset_zoom_analysis_btn, reset_zoom_export_btn,
                     cube3d_btn, rot_project_btn, rot_slice_btn, rot_reset_btn,
                     ps_btn, base_layout_btn, ps_refresh_btn, ps_popout_btn,
+                    ps_fit_btn, ps_clear_fit_btn,
                     btn_undo, btn_redo,
                     focus_exit_btn, focus_fit_btn, focus_auto_btn, focus_help_btn,
                     btn_save_img, btn_save_spec, btn_save_state, btn_load_state, btn_copy_code,
@@ -1749,7 +1751,7 @@ function _view_cube(
             btn.padding[] = (9, 9, 5, 5)
         end
         for menu in (img_scale_menu, spec_scale_menu, cmap_menu, ps_src_menu, ps_win_menu,
-                     ps_unit_menu, fmt_menu, compare_mode_menu, axis_menu, region_mode_menu, hist_mode_menu,
+                     ps_unit_menu, ps_cmap_menu, fmt_menu, compare_mode_menu, axis_menu, region_mode_menu, hist_mode_menu,
                      rot_mode_menu, moment_menu, fits_product_menu, mask_source_menu, mask_op_menu)
             menu.height[] = 30
             menu.fontsize[] = 13
@@ -1766,7 +1768,7 @@ function _view_cube(
             tb.fontsize[] = 13
             tb.textpadding[] = (8, 8, 5, 5)
         end
-        for chk in (ps_pad_chk, ps_nanapo_chk, ps_fit_chk, pingpong_chk, loop_chk, invert_chk,
+        for chk in (ps_pad_chk, ps_nanapo_chk, pingpong_chk, loop_chk, invert_chk,
                     gauss_chk, crosshair_chk, marker_chk, grid_chk, contour_chk)
             chk.size[] = 18
             chk.checkmarksize[] = 0.58
@@ -1935,8 +1937,6 @@ function _view_cube(
     end
     refresh_control_mode!()
 
-    _theme_rgba(c::RGBf, alpha) = RGBAf(c.r, c.g, c.b, alpha)
-
     function _retint_theme_color(c, old_theme::MANTAUITheme, new_theme::MANTAUITheme)
         c == old_theme.panel         && return new_theme.panel
         c == old_theme.panel_header  && return new_theme.panel_header
@@ -2059,11 +2059,11 @@ function _view_cube(
         try; spec_legend.framecolor[] = new_theme.border; catch; end
 
         for chk in (pingpong_chk, loop_chk, invert_chk, gauss_chk, crosshair_chk,
-                    marker_chk, grid_chk, contour_chk, ps_pad_chk, ps_nanapo_chk, ps_fit_chk)
+                    marker_chk, grid_chk, contour_chk, ps_pad_chk, ps_nanapo_chk)
             style_checkbox!(chk)
         end
         for menu in (img_scale_menu, spec_scale_menu, cmap_menu, ps_src_menu, ps_win_menu,
-                     ps_unit_menu, fmt_menu, compare_mode_menu, axis_menu, moment_menu,
+                     ps_unit_menu, ps_cmap_menu, fmt_menu, compare_mode_menu, axis_menu, moment_menu,
                      fits_product_menu, region_mode_menu, hist_mode_menu, rot_mode_menu, mask_source_menu,
                      mask_op_menu)
             style_menu!(menu)
@@ -2082,14 +2082,16 @@ function _view_cube(
                     reset_zoom_btn, reset_zoom_analysis_btn,
                     reset_zoom_export_btn, cube3d_btn, base_layout_btn, clim_fix_btn, clim_auto_nav_btn,
                     rot_slice_btn, rot_reset_btn,
-                    ps_btn, ps_refresh_btn, ps_popout_btn, btn_load_state, btn_copy_code,
+                    ps_btn, ps_refresh_btn, ps_popout_btn, ps_clear_fit_btn,
+                    btn_load_state, btn_copy_code,
                     btn_show_compare, btn_load_compare, play_btn, clim_auto_btn, region_clear_btn,
                     spec_y_auto_btn, hist_auto_btn, hist_y_auto_btn, mask_reset_btn)
             style_button_ghost!(btn)
         end
         for btn in (btn_save_img, btn_save_spec, btn_save_state, anim_btn, clim_apply_btn,
                     contour_apply_btn, spec_y_apply_btn, hist_apply_btn, hist_y_apply_btn,
-                    rot_project_btn, btn_moment_png, btn_moment_fits, btn_save_fits, mask_apply_btn)
+                    rot_project_btn, ps_fit_btn, btn_moment_png, btn_moment_fits,
+                    btn_save_fits, mask_apply_btn)
             style_button_primary!(btn)
         end
         for btn in (clim_p1_btn, clim_p5_btn, btn_show_moment, btn_show_slice)
@@ -2994,7 +2996,13 @@ function _view_cube(
     end
 
     function ps_layout_clear!()
-        for b in ps_layout_blocks
+        live_blocks = Any[]
+        append!(live_blocks, ps_layout_blocks)
+        try
+            append!(live_blocks, contents(ps_plot_grid))
+        catch
+        end
+        for b in unique(live_blocks)
             set_block_visible!(b, false)
             try
                 Makie.delete!(b)
@@ -3139,7 +3147,7 @@ function _view_cube(
                 xtickformat = latex_tick_formatter,
                 ytickformat = latex_tick_formatter,
             )
-            hm_ps = heatmap!(ax2d, bundle.kx, bundle.ky, bundle.P2d_log10; colormap = cm_obs[])
+            hm_ps = heatmap!(ax2d, bundle.kx, bundle.ky, bundle.P2d_log10; colormap = ps_cm_obs[])
             cb = Colorbar(
                 ps_plot_grid[1, cb_col],
                 hm_ps;
@@ -3178,6 +3186,7 @@ function _view_cube(
                 xtickformat = latex_tick_formatter,
             )
             isempty(k_pos) || lines!(ax1d, k_pos, p_pos; color = line_color, linewidth = PS_LINE_LW)
+            guard_log_zoom!(ax1d)   # log–log: keep scroll-zoom from inverting limits
             push!(ps_layout_blocks, ax1d)
 
             if ps_layout_fit[] && length(k) >= 3
@@ -3188,6 +3197,10 @@ function _view_cube(
                 kmax_txt = get_box_str(ps_kmax_box)
                 kmin_v = isempty(kmin_txt) ? auto_lo : something(tryparse(Float64, kmin_txt), auto_lo)
                 kmax_v = isempty(kmax_txt) ? auto_hi : something(tryparse(Float64, kmax_txt), auto_hi)
+                k_guides = Float64[]
+                isfinite(kmin_v) && kmin_v > 0 && push!(k_guides, kmin_v)
+                isfinite(kmax_v) && kmax_v > 0 && kmax_v != kmin_v && push!(k_guides, kmax_v)
+                isempty(k_guides) || vlines!(ax1d, k_guides; color = ui_error, linestyle = :dot, linewidth = 1.5)
                 slope, intercept, n_used = fit_loglog_slope(k, prof; kmin = kmin_v, kmax = kmax_v)
                 if isfinite(slope) && n_used >= 2
                     kfit = filter(ki -> ki > 0 && ki >= kmin_v && ki <= kmax_v, k)
@@ -3251,6 +3264,43 @@ function _view_cube(
         nothing
     end
 
+    function focus_axis_size()
+        u_max, v_max = slice_dims(axis[])
+        aspect = max(Float64(v_max), 1.0) / max(Float64(u_max), 1.0)
+        n_panels = compare_visible[] ? 2 : 1
+
+        # Leave room for colorbars, inter-panel gap, axis labels/title, the
+        # cube overview strip and the small Focus toolbar.
+        panel_gap = compare_visible[] ? (compact_layout ? 16 : 28) : 0
+        cbar_pad = n_panels * (compact_layout ? 34 : 42)
+        usable_w = max(260, (fig_size[1] - (compact_layout ? 56 : 80) - cbar_pad - panel_gap) ÷ n_panels)
+        usable_h = max(260, fig_size[2] - (compact_layout ? 145 : 170))
+
+        w_from_h = floor(Int, usable_h * aspect)
+        if w_from_h <= usable_w
+            return (max(260, w_from_h), usable_h)
+        else
+            return (usable_w, max(260, floor(Int, usable_w / aspect)))
+        end
+    end
+
+    function apply_focus_axis_size!()
+        w, h = focus_axis_size()
+        ax_img.width[] = w
+        ax_img.height[] = h
+        ax_cmp.width[] = w
+        ax_cmp.height[] = h
+        nothing
+    end
+
+    function restore_normal_axis_size!()
+        ax_img.width[] = normal_axis_size.img_w
+        ax_img.height[] = normal_axis_size.img_h
+        ax_cmp.width[] = normal_axis_size.cmp_w
+        ax_cmp.height[] = normal_axis_size.cmp_h
+        nothing
+    end
+
     function apply_focus_image_mode!()
         if focus_image[]
             ps_layout_clear!()
@@ -3267,6 +3317,7 @@ function _view_cube(
             rowgap!(main_grid, 0)
             colsize!(main_grid, 1, Relative(1))
             colsize!(main_grid, 2, Fixed(0))
+            apply_focus_axis_size!()
             set_block_visible!(ax_img, true)
             set_compare_panel_visible!(compare_visible[])
             set_block_visible!(img_colorbar, true)
@@ -3281,6 +3332,7 @@ function _view_cube(
             rowgap!(main_grid, main_row_gap)
             rowsize!(main_grid, 3, Auto())
             rowsize!(main_grid, 4, Auto())
+            restore_normal_axis_size!()
             apply_layout_mode!()
             set_layout_contents_visible!(controls_grid, true)
             refresh_control_mode!()
@@ -3297,6 +3349,10 @@ function _view_cube(
 
     on(focus_image) do _
         apply_focus_image_mode!()
+    end
+
+    on(axis) do _
+        focus_image[] && apply_focus_axis_size!()
     end
 
     on(focus_btn.clicks) do _
@@ -3338,6 +3394,15 @@ function _view_cube(
         layout_mode[] === :power_spectrum && render_power_spectrum_layout!()
     end
 
+    on(ps_cmap_menu.selection) do sel
+        sel === nothing && return
+        ps_cmap_name[] = Symbol(String(sel))
+    end
+
+    on(ps_cmap_name) do _
+        layout_mode[] === :power_spectrum && render_power_spectrum_layout!()
+    end
+
     on(ps_pad_chk.checked) do v
         ps_layout_pad[] = v
         layout_mode[] === :power_spectrum && render_power_spectrum_layout!()
@@ -3348,9 +3413,16 @@ function _view_cube(
         layout_mode[] === :power_spectrum && render_power_spectrum_layout!()
     end
 
-    on(ps_fit_chk.checked) do v
-        ps_layout_fit[] = v
+    on(ps_fit_btn.clicks) do _
+        ps_layout_fit[] = true
         layout_mode[] === :power_spectrum && render_power_spectrum_layout!()
+        set_status!("Power spectrum fit applied over k_min/k_max.")
+    end
+
+    on(ps_clear_fit_btn.clicks) do _
+        ps_layout_fit[] = false
+        layout_mode[] === :power_spectrum && render_power_spectrum_layout!()
+        set_status!("Power spectrum fit cleared.")
     end
 
     on(ps_kmin_box.stored_string) do _
@@ -3367,6 +3439,8 @@ function _view_cube(
 
     on(compare_visible) do v
         set_compare_panel_visible!(v)
+        layout_mode[] === :power_spectrum && set_block_visible!(img_colorbar, true)
+        focus_image[] && apply_focus_axis_size!()
         # Always refresh the control panel so the Index-B slider appears / disappears
         # immediately when a comparison cube is loaded or unloaded, without requiring
         # the user to manually switch mode tabs.
@@ -3573,7 +3647,7 @@ function _view_cube(
         save_root, fname, fname_box, make_name,
         ui_text, ui_text_muted, ui_accent, ui_error,
         style_menu!, style_button!, style_button_primary!, style_button_ghost!, style_checkbox!, style_textbox!,
-        set_status!, cm_obs,
+        set_status!, ps_cmap_name,
     )
 
     on(ps_popout_btn.clicks) do _

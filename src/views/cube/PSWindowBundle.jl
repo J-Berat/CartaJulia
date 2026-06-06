@@ -47,7 +47,7 @@ function _cube_ps_window_bundle(;
     style_checkbox!,
     style_textbox!,
     set_status!,
-    cm_obs,
+    ps_cmap_name,
 )
     function open_power_spectrum_window!()
         # Re-focus existing window instead of opening a second one.
@@ -90,13 +90,16 @@ function _cube_ps_window_bundle(;
         win_menu     = Menu(settings[1, 6]; options = ["Hann", "Hamming", "None"], prompt = "Hann", width = 96)
         Label(settings[1, 7]; text = "Units",  halign = :right, fontsize = 13, color = ui_text_muted)
         unit_menu    = Menu(settings[1, 8]; options = ["pixel", "physical"],       prompt = "pixel", width = 96)
+        Label(settings[1, 9]; text = "PSD cmap", halign = :right, fontsize = 13, color = ui_text_muted)
+        cmap_menu    = Menu(settings[1, 10]; options = ui_colormap_options(), prompt = String(ps_cmap_name[]), width = 112)
 
         pad_chk    = Checkbox(settings[2, 1]); Label(settings[2, 2]; text = "Pad pow2",  halign = :left, fontsize = 13, color = ui_text)
         nanapo_chk = Checkbox(settings[2, 3]); Label(settings[2, 4]; text = "NaN apod.", halign = :left, fontsize = 13, color = ui_text)
-        fit_chk    = Checkbox(settings[2, 5]); Label(settings[2, 6]; text = "$(MANTA_ICONS.fit) Fit", halign = :left, fontsize = 13, color = ui_text)
-        Label(settings[2, 7]; text = "k range", halign = :right, fontsize = 13, color = ui_text_muted)
-        kmin_box   = Textbox(settings[2, 8]; placeholder = "k_min", width = 84, height = 28)
-        kmax_box   = Textbox(settings[2, 9]; placeholder = "k_max", width = 84, height = 28)
+        Label(settings[2, 5]; text = "k range", halign = :right, fontsize = 13, color = ui_text_muted)
+        kmin_box   = Textbox(settings[2, 6]; placeholder = "k_min", width = 84, height = 28)
+        kmax_box   = Textbox(settings[2, 7]; placeholder = "k_max", width = 84, height = 28)
+        fit_btn    = Button(settings[2, 8]; label = "$(MANTA_ICONS.fit) Fit", width = 78, height = 28)
+        clear_fit_btn = Button(settings[2, 9]; label = "Clear", width = 78, height = 28)
 
         action_bar = header[1, 2] = GridLayout(; halign = :right, valign = :top, tellwidth = false, tellheight = false)
         colgap!(action_bar, 6)
@@ -110,11 +113,12 @@ function _cube_ps_window_bundle(;
         Label(header[2, 1:2]; text = ps_status, halign = :left, fontsize = 12,
               color = ui_text_muted, tellwidth = false)
 
-        style_menu!(mode_menu); style_menu!(src_menu); style_menu!(win_menu); style_menu!(unit_menu)
+        style_menu!(mode_menu); style_menu!(src_menu); style_menu!(win_menu); style_menu!(unit_menu); style_menu!(cmap_menu)
         style_button_ghost!(refresh_btn)
         style_button_primary!(save_png_btn); style_button_primary!(save_pdf_btn); style_button_primary!(save_csv_btn)
-        style_checkbox!(pad_chk); style_checkbox!(nanapo_chk); style_checkbox!(fit_chk)
+        style_checkbox!(pad_chk); style_checkbox!(nanapo_chk)
         style_textbox!(kmin_box); style_textbox!(kmax_box)
+        style_button_primary!(fit_btn); style_button_ghost!(clear_fit_btn)
 
         plot_grid = fig_ps[2, 1] = GridLayout()
         colgap!(plot_grid, -8)
@@ -248,7 +252,7 @@ function _cube_ps_window_bundle(;
                 )
                 kx = bundle.kx
                 ky = bundle.ky
-                hm = heatmap!(ax, kx, ky, vis; colormap = cm_obs[])
+                hm = heatmap!(ax, kx, ky, vis; colormap = to_cmap(ps_cmap_name[]))
                 cb = Colorbar(
                     plot_grid[1, 2],
                     hm;
@@ -263,23 +267,28 @@ function _cube_ps_window_bundle(;
                 prof     = bundle.prof
                 k        = bundle.k
                 p_floored = bundle.prof_floored
+                pos_mask = k .> 0
+                k_pos = k[pos_mask]
+                p_pos = p_floored[pos_mask]
                 resize!(last_1d_k, length(k));    copyto!(last_1d_k, k)
                 resize!(last_1d_p, length(prof)); copyto!(last_1d_p, prof)
                 last_1d_units = k_unit_lbl
 
                 ax = Axis(
                     plot_grid[1, 1];
-                    title  = latexstring("\\text{1D radial power spectrum — ", latex_safe(src_label), "}"),
+                    title  = latexstring("\\text{1D radial power spectrum (log–log) — ", latex_safe(src_label), "}"),
                     xlabel = use_phys ?
                         latexstring("k\\;(", latex_safe(k_unit_lbl), ")") :
                         L"k\;\text{(cycles/pixel)}",
                     ylabel = L"\langle|F|^2\rangle",
+                    xscale = log10,
                     yscale = log10,
                     xtickformat = latex_tick_formatter,
                 )
-                if !isempty(k)
-                    lines!(ax, k, p_floored; color = ui_accent, linewidth = PS_LINE_LW)
+                if !isempty(k_pos)
+                    lines!(ax, k_pos, p_pos; color = ui_accent, linewidth = PS_LINE_LW)
                 end
+                guard_log_zoom!(ax)   # log-log scale: keep scroll-zoom limits valid
                 push!(ps_blocks, ax)
 
                 if ps_fit_on[] && length(k) >= 3
@@ -290,6 +299,10 @@ function _cube_ps_window_bundle(;
                     auto_hi   = isempty(k) ? Inf  : Float64(last(k))
                     kmin_v    = isempty(kmin_txt) ? auto_lo : something(tryparse(Float64, kmin_txt), auto_lo)
                     kmax_v    = isempty(kmax_txt) ? auto_hi : something(tryparse(Float64, kmax_txt), auto_hi)
+                    k_guides = Float64[]
+                    isfinite(kmin_v) && kmin_v > 0 && push!(k_guides, kmin_v)
+                    isfinite(kmax_v) && kmax_v > 0 && kmax_v != kmin_v && push!(k_guides, kmax_v)
+                    isempty(k_guides) || vlines!(ax, k_guides; color = ui_error, linestyle = :dot, linewidth = 1.5)
                     slope, intercept, n_used = fit_loglog_slope(k, prof; kmin = kmin_v, kmax = kmax_v)
                     if isfinite(slope) && n_used >= 2
                         kfit = filter(ki -> ki > 0 && ki >= kmin_v && ki <= kmax_v, k)
@@ -321,9 +334,22 @@ function _cube_ps_window_bundle(;
             ps_units[] = sel == "physical" ? :physical : :pixel
             ps_render!()
         end
+        on(cmap_menu.selection) do sel
+            sel === nothing && return
+            ps_cmap_name[] = Symbol(String(sel))
+        end
         on(pad_chk.checked)    do v; ps_pad[]    = v; ps_render!(); end
         on(nanapo_chk.checked) do v; ps_nanapo[] = v; ps_render!(); end
-        on(fit_chk.checked)    do v; ps_fit_on[] = v; ps_render!(); end
+        on(fit_btn.clicks) do _
+            ps_fit_on[] = true
+            ps_render!()
+            set_status!("Power spectrum fit applied over k_min/k_max.")
+        end
+        on(clear_fit_btn.clicks) do _
+            ps_fit_on[] = false
+            ps_render!()
+            set_status!("Power spectrum fit cleared.")
+        end
         on(kmin_box.stored_string) do _; ps_fit_on[] && ps_render!(); end
         on(kmax_box.stored_string) do _; ps_fit_on[] && ps_render!(); end
         on(refresh_btn.clicks) do _; ps_render!(); end
@@ -331,6 +357,9 @@ function _cube_ps_window_bundle(;
         # Re-render when the main viewer's slice changes.
         ps_window_alive = Ref(true)
         on(slice_proc) do _
+            ps_window_alive[] && ps_render!()
+        end
+        on(ps_cmap_name) do _
             ps_window_alive[] && ps_render!()
         end
 

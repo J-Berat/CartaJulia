@@ -16,6 +16,13 @@
 # 3. **Onboarding** — new contributors can read the struct + its docstring to
 #    understand what drives the reactive graph before diving into the view code.
 #
+# Non-state Observables
+# ---------------------
+# `_view_cube` still owns a few local `Observable(...)` values that are not
+# part of this contract: render buffers (`spec_y_raw`, previews), popout-window
+# internals, and widget/page-local state.  Those values are intentionally kept
+# beside the code that consumes them.
+#
 # Derived Observables (lift chains)
 # ----------------------------------
 # The following are *not* stored here because they require outputs from the
@@ -33,15 +40,10 @@
 #
 # Migration guide
 # ---------------
-# The struct is NOT yet wired into `_view_cube` — that function still declares
-# each observable as a local variable. The recommended migration path is:
-#
-#   1. Construct a `CubeViewObservables` at the top of `_view_cube` using the
-#      provided `build_cube_view_state` constructor.
-#   2. Replace the ~40 local `Observable(...)` declarations with aliases:
-#      `axis = st.axis`, etc.  (zero behaviour change; fully bisectable.)
-#   3. Pass `st` directly to bundles that already accept a superset of its
-#      fields; remove the individual kwargs one bundle at a time.
+# `_view_cube` now constructs this struct once and aliases its fields locally
+# while the remaining large body is gradually split into bundles.  New bundles
+# should prefer accepting `st::CubeViewObservables` directly instead of adding
+# another long keyword list of source observables.
 
 # ---------------------------------------------------------------------------
 # Type
@@ -134,8 +136,11 @@ struct CubeViewObservables
     # `view_product` selects what is shown in the image panel.
     # `layout_mode`  controls which secondary panel is visible in the right column.
     # `control_mode` controls which tab is active in the bottom control strip.
-    view_product  ::Observable{Symbol}  # :slice | :moment
+    view_product  ::Observable{Symbol}  # :slice | :moment | :rotproj
     moment_order  ::Observable{Int}     # 0 | 1 | 2
+    rotation_axis ::Observable{NTuple{3,Float32}}  # arbitrary axis for :rotproj
+    rotation_angle ::Observable{Float32}            # degrees for :rotproj
+    rotation_projection_mode ::Observable{Symbol}   # :mean | :sum | :max
     layout_mode   ::Observable{Symbol}  # :base | :power_spectrum
     control_mode  ::Observable{Symbol}  # :navigation | :analysis | :export
     anim_playing  ::Observable{Bool}    # auto-advance animation running?
@@ -307,6 +312,9 @@ function build_cube_view_state(;
         # View product & layout
         Observable(:slice),          # view_product
         Observable(0),               # moment_order
+        Observable((0f0, 0f0, 1f0)), # rotation_axis
+        Observable(0f0),             # rotation_angle
+        Observable(:mean),           # rotation_projection_mode
         Observable(:base),           # layout_mode
         Observable(:navigation),     # control_mode
         Observable(false),           # anim_playing

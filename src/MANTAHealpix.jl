@@ -56,6 +56,7 @@ end
 
 # ---- HEALPix projection / graticule helpers ----
 include("views/HealpixProjection.jl")
+include("views/healpix/LayoutBundle.jl")
 
 """
     manta_healpix(m::Healpix.HealpixMap;
@@ -665,15 +666,7 @@ function _view_healpix_cube(
     end
     # Auto-contrasted contour colour: white on dark images, black on bright ones.
     contour_default_color_obs = lift(img_disp) do img
-        fv = filter(isfinite, vec(Float32.(img)))
-        isempty(fv) && return RGBAf(0f0, 0f0, 0f0, CONTOUR_AUTO_DARK_ALPHA)
-        lo, hi = percentile_clims(fv, 5, 95)
-        rng = hi - lo
-        rng < 1f-9 && return RGBAf(0f0, 0f0, 0f0, CONTOUR_AUTO_DARK_ALPHA)
-        t = clamp((median(fv) - lo) / rng, 0f0, 1f0)
-        t > CONTOUR_AUTO_BRIGHTNESS_THRESHOLD ?
-            RGBAf(0f0, 0f0, 0f0, CONTOUR_AUTO_DARK_ALPHA) :
-            RGBAf(1f0, 1f0, 1f0, CONTOUR_AUTO_LIGHT_ALPHA)
+        auto_contour_color(img; fallback = :dark)
     end
     contour_colors_obs = lift(contour_levels_obs, contour_use_manual, contour_manual_colors,
                               contour_default_color_obs) do levels, use_man, colors, def_color
@@ -710,6 +703,8 @@ function _view_healpix_cube(
     show_graticule   = Observable(true)
     selection_mode = Observable(:point)
     region_shape = Observable(:box)
+    focus_image = Observable(false)
+    layout_mode = Observable(:map)
     region_drag_active = Observable(false)
     region_start = Observable(Point2f(NaN32, NaN32))
     region_end = Observable(Point2f(NaN32, NaN32))
@@ -770,19 +765,36 @@ function _view_healpix_cube(
     # screen when the user opens the PPV view with figsize ≤ 1500×950.
     compact_layout = fig_size[1] <= COMPACT_LAYOUT_W || fig_size[2] <= COMPACT_LAYOUT_H
     tight_layout   = fig_size[1] <= 1280 || fig_size[2] <= 760
-    cbar_h_px      = tight_layout ? 30 : compact_layout ? 38  : 52
-    map_h_px       = tight_layout ? 170 : compact_layout ? 220 : 340
-    map_w_px       = tight_layout ? 340 : compact_layout ? 440 : 680
-    spec_h_px      = tight_layout ? 85  : compact_layout ? 110 : 150
-    hist_h_px      = tight_layout ? 45  : compact_layout ? 60  : 90
+    roomy_compact_layout = compact_layout && fig_size[1] >= 1400 && fig_size[2] >= 840
+    cbar_h_px      = tight_layout ? 28 : compact_layout ? 34 : 42
+    ctrl_row_h     = tight_layout ? (142, 104, 30) : compact_layout ? (168, 130, 36) : (190, 150, 42)
+    ctrl_gap       = tight_layout ? 5 : compact_layout ? 6 : 10
+    ctrl_total_h   = sum(ctrl_row_h) + 2 * ctrl_gap
+    main_row_gap   = tight_layout ? 6 : compact_layout ? 8 : 14
+    top_col_gap    = tight_layout ? 6 : compact_layout ? 8 : 12
+    side_w_px      = tight_layout ? 360 : compact_layout ? (roomy_compact_layout ? 460 : 420) : 520
+    side_axis_w_px = max(300, side_w_px - (tight_layout ? 60 : 70))
+    side_pad_px    = tight_layout ? 30 : compact_layout ? 54 : 70
+    spec_h_px      = tight_layout ? 170 : compact_layout ? (roomy_compact_layout ? 220 : 185) : 320
+    hist_h_px      = tight_layout ? 64  : compact_layout ? (roomy_compact_layout ? 90  : 72)  : 105
+    map_cell_w_px  = max(360, fig_size[1] - side_w_px - side_pad_px - 2 * top_col_gap - 24)
+    map_cell_h_px  = max(220, fig_size[2] - ctrl_total_h - main_row_gap - cbar_h_px)
+    map_h_px       = min(map_cell_h_px, max(220, floor(Int, map_cell_w_px / 2)))
+    map_w_px       = 2 * map_h_px
+    top_h_px       = max(map_h_px + cbar_h_px, spec_h_px + hist_h_px + main_row_gap)
     font_sz        = tight_layout ? 12 : compact_layout ? 13  : 15
     fig = Figure(size = fig_size, backgroundcolor = ui_theme.background)
     main_grid = fig[1, 1] = GridLayout()
     colsize!(fig.layout, 1, Relative(1))
     colsize!(main_grid, 1, Relative(1))
+    rowgap!(main_grid, main_row_gap)
 
     # Carte
-    map_grid = main_grid[1, 1] = GridLayout()
+    top_grid = main_grid[1, 1] = GridLayout(1, 3; halign = :center, valign = :top)
+    colgap!(top_grid, top_col_gap)
+    rowgap!(top_grid, 0)
+
+    map_grid = top_grid[1, 1] = GridLayout(; halign = :right, valign = :top)
     colsize!(map_grid, 1, Relative(1))
     colgap!(map_grid, -8)
     rowgap!(map_grid, -8)
@@ -808,6 +820,7 @@ function _view_healpix_cube(
         bottomspinevisible = false, topspinevisible = false,
         leftspinevisible   = false, rightspinevisible = false,
         width = map_w_px,
+        height = map_h_px,
         tellwidth = false,
         tellheight = false)
 
@@ -897,12 +910,25 @@ function _view_healpix_cube(
         end
         out2
     end
-    ax_spec = Axis(main_grid[2, 1];
+    plots_grid = top_grid[1, 2] = GridLayout(2, 1; valign = :top, tellwidth = false)
+    Box(top_grid[1, 3]; color = :transparent, strokewidth = 0)
+    colsize!(top_grid, 1, Fixed(map_w_px))
+    colsize!(top_grid, 2, Fixed(side_w_px))
+    colsize!(top_grid, 3, Fixed(side_pad_px))
+    rowsize!(top_grid, 1, Fixed(top_h_px))
+    rowgap!(plots_grid, main_row_gap)
+
+    ax_spec = Axis(plots_grid[1, 1];
         title  = sel_label,
         xlabel = is_channel_axis ?
             L"\text{channel}" :
             latexstring("v\\;[\\mathrm{", latex_safe(vunit_eff), "}]"),
         ylabel = lift(m_ -> scale_label_tex(m_, data_unit), scale_mode),
+        width = side_axis_w_px,
+        height = spec_h_px,
+        xtickformat = _latex_tick_formatter,
+        ytickformat = _latex_tick_formatter,
+        tellwidth = false,
         tellheight = false)
     lines!(ax_spec, spec_x, spec_y_disp; color=:black, linewidth=1.5)
     # vertical line at v(chan_idx)
@@ -940,65 +966,57 @@ function _view_healpix_cube(
     end
 
     ax_hist = Axis(
-        main_grid[3, 1];
+        plots_grid[2, 1];
         title = L"\text{Visible channel histogram}",
         xlabel = data_unit_tex,
         ylabel = hist_ylabel_obs,
-        # height is governed by `rowsize!(main_grid, 3, ...)` below — no
-        # hard-coded value here (cf. CLAUDE.md / anti-patterns).
+        width = side_axis_w_px,
+        height = hist_h_px,
         xtickformat = _latex_tick_formatter,
         ytickformat = _latex_tick_formatter,
+        tellwidth = false,
         tellheight = false,
     )
+    rowsize!(plots_grid, 1, Fixed(spec_h_px))
+    rowsize!(plots_grid, 2, Fixed(hist_h_px))
+    colsize!(plots_grid, 1, Fixed(side_w_px))
     barplot!(ax_hist, hist_x_obs, hist_y_obs; width=hist_width_obs, color=(ui_accent, HIST_BAR_ALPHA), strokecolor=ui_accent, strokewidth=HIST_BAR_STROKE_LW, visible=hist_bars_visible)
     lines!(ax_hist, hist_x_obs, hist_y_obs; color=ui_accent, linewidth=HIST_KDE_LW, visible=hist_kde_visible)
     vlines!(ax_hist, lift(lim -> [first(lim), last(lim)], clims_safe);
             color=(ui_text_muted, HIST_LIMITS_ALPHA), linewidth=HIST_LIMITS_LW_HP, linestyle=:dash)
 
     # Controls (card-based modal layout, mirrors CubeView / HealpixMapView)
-    ctrl_row_h   = tight_layout ? (142, 104, 30) : compact_layout ? (168, 130, 36) : (190, 150, 42)
-    ctrl_gap     = tight_layout ? 5 : compact_layout ? 6 : 10
     card_pad     = tight_layout ? 7 : compact_layout ? 9 : 12
     card_gap     = tight_layout ? 5 : compact_layout ? 7 : 10
-    ctrl_total_h = sum(ctrl_row_h) + 2 * ctrl_gap
 
-    ctrl_grid = main_grid[4, 1] = GridLayout(; alignmode = Outside())
-    rowsize!(main_grid, 4, Fixed(ctrl_total_h))
+    ctrl_grid = main_grid[2, 1] = GridLayout(; alignmode = Outside())
+    rowsize!(main_grid, 2, Fixed(ctrl_total_h))
 
-    # -- Visibility helpers (verbatim from CubeView) --
-    set_block_visible!(block, visible::Bool) = begin
-        try; block.visible[] = visible;            catch; end
-        try; block.scene.visible[] = visible;      catch; end
-        try; block.blockscene.visible[] = visible; catch; end
-        nothing
-    end
-    function set_layout_contents_visible!(layout, visible::Bool)
-        for block in try; contents(layout); catch; Any[]; end
-            set_block_visible!(block, visible)
-            block isa GridLayout && set_layout_contents_visible!(block, visible)
-        end
-        nothing
-    end
+    # -- shared HEALPix layout helpers --
+    set_block_visible! = _healpix_set_block_visible!
+    set_layout_contents_visible! = _healpix_set_layout_contents_visible!
+
+    # Embedded HEALPix spherical-harmonic power spectrum panel.
+    ps_panel = _healpix_power_spectrum_panel!(main_grid[1, 1];
+        tight_layout = tight_layout,
+        compact_layout = compact_layout,
+        font_sz = font_sz,
+        ui_theme = ui_theme)
+    ps_grid = ps_panel.grid
+    ps_back_btn = ps_panel.back_btn
 
     # -- Card factory (mirrors CubeView / HealpixMapView) --
     function control_card!(parent, row, col, title::AbstractString; rows::Int = 4, cols::Int = 4)
-        card = parent[row, col] = GridLayout(;
-            alignmode = Outside(card_pad), tellwidth = false, tellheight = false)
-        body_rows = rows + 1
-        Box(card[1:body_rows, 1:cols]; color = ui_theme.panel, strokecolor = ui_theme.border,
-            strokewidth = 1.0, cornerradius = 8, z = -6)
-        Box(card[1, 1:cols]; color = ui_theme.panel_header, strokecolor = (:transparent, 0.0),
-            strokewidth = 0.0, cornerradius = 8, z = -5)
-        Label(card[1, 1:cols]; text = uppercase(title), halign = :left, tellwidth = false,
-            fontsize = 13, font = :bold, color = ui_theme.accent_strong, padding = (10, 10, 6, 6))
-        Box(card[body_rows, 1:cols]; color = :transparent, strokewidth = 0, z = -7)
-        rowsize!(card, body_rows, Fixed(compact_layout ? 10 : 12))
-        rowgap!(card, card_gap)
-        colgap!(card, card_gap)
-        return card
+        _healpix_control_card!(parent, row, col, title;
+            rows = rows,
+            cols = cols,
+            card_pad = card_pad,
+            card_gap = card_gap,
+            compact_layout = compact_layout,
+            ui_theme = ui_theme)
     end
-    ctrl_lbl!(layout, pos, txt) = Label(layout[pos...]; text = txt, halign = :left,
-        tellwidth = false, fontsize = font_sz, color = ui_theme.text_muted)
+    ctrl_lbl!(layout, pos, txt) = _healpix_ctrl_label!(layout, pos, txt;
+        font_sz = font_sz, ui_theme = ui_theme)
 
     # -- Mode bar (full width) --
     mode_bar = ctrl_grid[3, 1:3] = GridLayout(; alignmode = Outside(0), halign = :center)
@@ -1011,14 +1029,25 @@ function _view_healpix_cube(
     mode_export_btn   = Button(mode_segment[1, 3]; label = "$(MANTA_ICONS.export_icon) Export", width = tight_layout ? 106 : 114, height = tab_h)
     foreach(c -> colsize!(mode_segment, c, Auto()), 1:3)
     help_btn          = Button(mode_bar[1, 2]; label = MANTA_ICONS.help, width = tight_layout ? 42 : 46, height = tab_h)
-    btn_undo          = Button(mode_bar[1, 3]; label = MANTA_ICONS.undo, width = tight_layout ? 42 : 46, height = tab_h)
-    btn_redo          = Button(mode_bar[1, 4]; label = MANTA_ICONS.redo, width = tight_layout ? 42 : 46, height = tab_h)
-    foreach(c -> colsize!(mode_bar, c, Auto()), 1:4)
+    focus_btn         = Button(mode_bar[1, 3]; label = "Focus", width = tight_layout ? 68 : 76, height = tab_h)
+    btn_undo          = Button(mode_bar[1, 4]; label = MANTA_ICONS.undo, width = tight_layout ? 42 : 46, height = tab_h)
+    btn_redo          = Button(mode_bar[1, 5]; label = MANTA_ICONS.redo, width = tight_layout ? 42 : 46, height = tab_h)
+    foreach(c -> colsize!(mode_bar, c, Auto()), 1:5)
     foreach(w -> manta_style_segmented_button!(w, ui_theme; compact = compact_layout),
             (mode_nav_btn, mode_analysis_btn, mode_export_btn))
     foreach(w -> manta_style_button_ghost!(w, ui_theme; compact = compact_layout),
-            (help_btn, btn_undo, btn_redo))
+            (help_btn, focus_btn, btn_undo, btn_redo))
     control_mode = Observable(:navigation)
+
+    focus_panel = _healpix_focus_bar!(main_grid[3, 1];
+        tight_layout = tight_layout,
+        compact_layout = compact_layout,
+        ui_theme = ui_theme)
+    focus_bar = focus_panel.grid
+    focus_exit_btn = focus_panel.exit_btn
+    focus_fit_btn = focus_panel.fit_btn
+    focus_auto_btn = focus_panel.auto_btn
+    focus_help_btn = focus_panel.help_btn
 
     # ---- NAVIGATION cards ----
 
@@ -1068,6 +1097,10 @@ function _view_healpix_cube(
         fontsize = font_sz, color = ui_theme.text_muted)
     reset_btn = Button(nav_view_card[2, 3:4]; label = "$(MANTA_ICONS.fit) Fit", height = 32)
     manta_style_button_ghost!(reset_btn, ui_theme; compact = compact_layout)
+    base_layout_btn = Button(nav_view_card[3, 1:2]; label = "Map", height = 32)
+    manta_style_button_ghost!(base_layout_btn, ui_theme; compact = compact_layout)
+    ps_btn = Button(nav_view_card[3, 3:4]; label = "Power spectrum", height = 32)
+    manta_style_button_ghost!(ps_btn, ui_theme; compact = compact_layout)
 
     # ---- ANALYSIS cards ----
 
@@ -1171,13 +1204,12 @@ function _view_healpix_cube(
     rowsize!(ctrl_grid, 1, Fixed(ctrl_row_h[1]))
     rowsize!(ctrl_grid, 2, Fixed(0))
     rowsize!(ctrl_grid, 3, Fixed(ctrl_row_h[3]))
+    rowsize!(main_grid, 3, Fixed(0))
     colgap!(ctrl_grid, ctrl_gap)
     rowgap!(ctrl_grid, ctrl_gap)
 
     # main_grid row sizing
-    rowsize!(main_grid, 1, Fixed(map_h_px))
-    rowsize!(main_grid, 2, Fixed(spec_h_px))
-    rowsize!(main_grid, 3, Fixed(hist_h_px))
+    rowsize!(main_grid, 1, Fixed(top_h_px))
 
     # ---- Mode switching ----
     nav_cards_hpc      = (channel_card, display_card, nav_view_card)
@@ -1189,10 +1221,17 @@ function _view_healpix_cube(
         nothing
     end
     function refresh_control_mode!()
+        if focus_image[]
+            set_layout_contents_visible!(ctrl_grid, false)
+            set_layout_contents_visible!(focus_bar, true)
+            return nothing
+        end
         mode = control_mode[]
         is_nav = (mode === :navigation)
         is_ana = (mode === :analysis)
         is_exp = (mode === :export)
+        set_layout_contents_visible!(ctrl_grid, true)
+        set_layout_contents_visible!(focus_bar, false)
         for c in nav_cards_hpc;      set_layout_contents_visible!(c, is_nav); end
         for c in analysis_cards_hpc; set_layout_contents_visible!(c, is_ana); end
         for c in export_cards_hpc;   set_layout_contents_visible!(c, is_exp); end
@@ -1387,6 +1426,102 @@ function _view_healpix_cube(
         nothing
     end
 
+    function current_hpc_ps_source()
+        if show_moment[]
+            label = moment_label(moment_order[])
+            return moment_vector(moment_order[]), label
+        end
+        j = clamp(chan_idx[], 1, nv)
+        if is_channel_axis
+            return @view(cube[:, j]), "channel $(j)"
+        end
+        v = v0_eff + (j - 1) * dv_eff
+        return @view(cube[:, j]), "channel $(j), v=$(round(v; digits = 2)) $(vunit_eff)"
+    end
+
+    function render_power_spectrum_layout!()
+        pixels, ps_label = current_hpc_ps_source()
+        _healpix_render_power_spectrum_panel!(ps_panel;
+            pixels = pixels,
+            fname = fname,
+            source_label = ps_label,
+            set_status! = _hpc_status!)
+    end
+
+    function apply_layout_mode!()
+        is_ps = layout_mode[] === :power_spectrum
+        set_layout_contents_visible!(ps_grid, is_ps)
+        set_layout_contents_visible!(top_grid, !is_ps)
+        rowsize!(main_grid, 1, Fixed(top_h_px))
+        rowsize!(main_grid, 2, Fixed(ctrl_total_h))
+        rowsize!(main_grid, 3, Fixed(0))
+        rowgap!(main_grid, main_row_gap)
+        refresh_control_mode!()
+        nothing
+    end
+
+    function reset_hpc_zoom!()
+        set_mollweide_view!(ax_img, full_map_bounds...)
+        refresh_graticule_labels!(graticule, ax_img; bounds=full_map_bounds)
+        nothing
+    end
+
+    focus_map_w = max(map_w_px, min(fig_size[1] - 48, 2 * (fig_size[2] - 76)))
+    focus_map_h = max(map_h_px, focus_map_w ÷ 2)
+    function apply_focus_image_mode!()
+        if focus_image[]
+            if layout_mode[] === :power_spectrum
+                layout_mode[] = :map
+                apply_layout_mode!()
+            end
+            set_layout_contents_visible!(ctrl_grid, false)
+            set_layout_contents_visible!(focus_bar, true)
+            set_layout_contents_visible!(plots_grid, false)
+            rowsize!(main_grid, 1, Relative(1))
+            rowsize!(main_grid, 2, Fixed(0))
+            rowsize!(main_grid, 3, Fixed(tight_layout ? 34 : 38))
+            colsize!(top_grid, 2, Fixed(0))
+            colsize!(top_grid, 3, Fixed(0))
+            rowgap!(main_grid, 0)
+            ax_img.width[] = focus_map_w
+            ax_img.height[] = focus_map_h
+            _hpc_status!("Focus image: controls hidden. Press f or Exit to return.")
+        else
+            set_layout_contents_visible!(plots_grid, true)
+            set_layout_contents_visible!(focus_bar, false)
+            rowgap!(main_grid, main_row_gap)
+            rowsize!(main_grid, 1, Fixed(top_h_px))
+            rowsize!(main_grid, 2, Fixed(ctrl_total_h))
+            rowsize!(main_grid, 3, Fixed(0))
+            colsize!(top_grid, 2, Fixed(side_w_px))
+            colsize!(top_grid, 3, Fixed(side_pad_px))
+            ax_img.width[] = map_w_px
+            ax_img.height[] = map_h_px
+            refresh_control_mode!()
+            _hpc_status!("Focus image closed.")
+        end
+        nothing
+    end
+
+    on(focus_image) do _
+        apply_focus_image_mode!()
+    end
+
+    on(focus_btn.clicks) do _
+        layout_mode[] = :map
+        apply_layout_mode!()
+        focus_image[] = true
+    end
+
+    on(focus_exit_btn.clicks) do _
+        focus_image[] = false
+    end
+
+    toggle_focus_image!() = begin
+        focus_image[] = !focus_image[]
+        nothing
+    end
+
     # ---------- Reactivity ----------
     on(chan_slider.value) do v
         chan_idx[] = Int(round(v))
@@ -1394,6 +1529,7 @@ function _view_healpix_cube(
             update_region_spectrum!(region_ipix[])
             _refresh_spec_ylim!()
         end
+        layout_mode[] === :power_spectrum && render_power_spectrum_layout!()
     end
     on(scale_menu.selection) do sel
         sel === nothing && return
@@ -1427,8 +1563,37 @@ function _view_healpix_cube(
         set_graticule_visible!(graticule, v)
     end
     on(reset_btn.clicks) do _
-        set_mollweide_view!(ax_img, full_map_bounds...)
-        refresh_graticule_labels!(graticule, ax_img; bounds=full_map_bounds)
+        reset_hpc_zoom!()
+    end
+    on(focus_fit_btn.clicks) do _
+        focus_image[] || return
+        reset_hpc_zoom!()
+        _hpc_status!("Focus image: view fitted.")
+    end
+    on(focus_auto_btn.clicks) do _
+        focus_image[] || return
+        use_manual[] = false
+        set_box_text!(clim_min_box, "")
+        set_box_text!(clim_max_box, "")
+    end
+    on(focus_help_btn.clicks) do _
+        help_btn.clicks[] = help_btn.clicks[] + 1
+    end
+    on(base_layout_btn.clicks) do _
+        layout_mode[] = :map
+        apply_layout_mode!()
+        _hpc_status!("Map layout enabled.")
+    end
+    on(ps_back_btn.clicks) do _
+        layout_mode[] = :map
+        apply_layout_mode!()
+        _hpc_status!("Map layout enabled.")
+    end
+    on(ps_btn.clicks) do _
+        focus_image[] = false
+        render_power_spectrum_layout!()
+        layout_mode[] = :power_spectrum
+        apply_layout_mode!()
     end
     on(apply_btn.clicks) do _
         ok, manual, clims, _msg = parse_manual_clims(
@@ -1580,18 +1745,21 @@ function _view_healpix_cube(
         sel === nothing && return
         label = String(sel)
         moment_order[] = startswith(label, "M1") ? 1 : startswith(label, "M2") ? 2 : 0
+        layout_mode[] === :power_spectrum && show_moment[] && render_power_spectrum_layout!()
     end
     on(show_moment_btn.clicks) do _
         show_moment[] = true
         use_manual[] = false
         set_box_text!(clim_min_box, "")
         set_box_text!(clim_max_box, "")
+        layout_mode[] === :power_spectrum && render_power_spectrum_layout!()
     end
     on(show_channel_btn.clicks) do _
         show_moment[] = false
         use_manual[] = false
         set_box_text!(clim_min_box, "")
         set_box_text!(clim_max_box, "")
+        layout_mode[] === :power_spectrum && render_power_spectrum_layout!()
     end
     on(scale_mode)        do _; _refresh_spec_ylim!(); end
     on(spec_y_disp)       do _; _refresh_spec_ylim!(); end
@@ -1686,11 +1854,9 @@ function _view_healpix_cube(
     _refresh_spec_ylim!()
     _refresh_hist_axes!()
 
-    # Extra vertical spacing: push the control row away from the spectrum
-    # xtick labels to avoid overlap (e.g. "j=41, v=80km/s" over tick "80").
+    # Keep the bottom controls clear of the top plotting area.
     try
-        rowgap!(main_grid, 2, 22)
-        rowgap!(main_grid, 1, 6)
+        rowgap!(main_grid, 1, main_row_gap)
     catch
         # rowgap! fails silently when the index is out of range.
     end
@@ -1716,7 +1882,7 @@ function _view_healpix_cube(
         _set_status_hpc!("Image scale: $(String(next)).")
     end
     shortcuts_hpc = ShortcutBinding[
-        ShortcutBinding(Keyboard.i,         () -> (invert_cmap[] = !invert_cmap[]);
+        ShortcutBinding(Keyboard.i,         () -> (invert_chk.checked[] = !invert_chk.checked[]);
                         description = "invert cmap"),
         ShortcutBinding(Keyboard.page_up,   () -> _set_channel_hpc!(chan_idx[] - 1);
                         description = "prev channel"),
@@ -1734,10 +1900,14 @@ function _view_healpix_cube(
                         description = "reset zoom"),
         ShortcutBinding(Keyboard.s,         () -> _trigger_btn_hpc!(save_btn);
                         description = "save image"),
+        ShortcutBinding(Keyboard.p,         () -> _trigger_btn_hpc!(ps_btn);
+                        description = "power spectrum"),
         ShortcutBinding(Keyboard.c,         () -> _toggle_contours_hpc!();
                         description = "contours"),
         ShortcutBinding(Keyboard.l,         () -> _cycle_log_scale_hpc!();
                         description = "cycle scale"),
+        ShortcutBinding(Keyboard.f,         () -> toggle_focus_image!();
+                        description = "focus image"),
     ]
     # `g` toggles the graticule checkbox; its handler propagates to the
     # overlay, keeping the UI control and the shortcut in sync.

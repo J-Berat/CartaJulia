@@ -327,8 +327,8 @@ function draw_mollweide_graticule!(
     ax;
     lon_values = -150:30:150,
     lat_values = -60:30:60,
-    line_color = RGBAf(1, 1, 1, 0.30),
-    label_color = RGBAf(0, 0, 0, 0.85),
+    line_color = RGBAf(1, 1, 1, 0.30),   # dotted lon/lat lines drawn over the sky map (over data → fixed white, like contours)
+    label_color = _theme_rgba(current_ui_theme().text, 0.85),  # coord labels sit on the axis panel → follow theme so they stay readable in dark mode
     linewidth::Real = 0.9,
     fontsize::Real = 12,
 )

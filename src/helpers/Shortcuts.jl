@@ -147,28 +147,52 @@ Default multiplicative factors applied to the current view span on each
 const ZOOM_IN_FACTOR  = 0.8
 const ZOOM_OUT_FACTOR = 1.25
 
+# Scale functions whose displayed interval is `(0, ∞)`, i.e. the span must be
+# scaled in transformed (log) space and any zoom must keep both bounds > 0.
+_is_log_scale(f) = f === log10 || f === log2 || f === log
+
 """
-    zoom_limits((xmin, xmax, ymin, ymax), factor) -> (xmin, xmax, ymin, ymax)
+    zoom_limits((xmin, xmax, ymin, ymax), factor; xlog=false, ylog=false)
+        -> (xmin, xmax, ymin, ymax)
 
 Pure helper: scale each axis span by `factor` about its own midpoint and
 return the new `(xmin, xmax, ymin, ymax)`. `factor < 1` zooms in, `> 1`
 zooms out. The scaling is uniform across both axes, so an aspect-locked
 (`DataAspect`) view stays consistent.
 
+When `xlog` / `ylog` is set, the corresponding span is scaled in *display*
+(`log10`) space and mapped back with `exp10`. A log-scaled axis only ever
+displays a strictly-positive interval, so this keeps both new bounds `> 0`
+for any `factor` — which is exactly what prevents `log10` from producing
+`NaN` limits (and the downstream Makie `all(low .<= high)` assertion in
+`update_axis_camera`) when zooming out on a log axis.
+
 The inputs are returned unchanged when any limit is non-finite, when
-`factor` is not a finite positive number, or when a span collapses to zero —
-so the caller can never produce `NaN`/inverted limits.
+`factor` is not a finite positive number, when a log axis is asked to scale a
+non-positive interval, or when a span collapses to zero — so the caller can
+never produce `NaN`/inverted limits.
 """
-function zoom_limits(lims::NTuple{4,<:Real}, factor::Real)
+function zoom_limits(lims::NTuple{4,<:Real}, factor::Real;
+                     xlog::Bool = false, ylog::Bool = false)
     xmin, xmax, ymin, ymax = lims
     all(isfinite, (xmin, xmax, ymin, ymax)) || return lims
     (isfinite(factor) && factor > 0) || return lims
-    xc = (xmin + xmax) / 2
-    yc = (ymin + ymax) / 2
-    xh = (xmax - xmin) / 2 * factor
-    yh = (ymax - ymin) / 2 * factor
+    (xlog && !(xmin > 0 && xmax > 0)) && return lims
+    (ylog && !(ymin > 0 && ymax > 0)) && return lims
+    fx = xlog ? log10 : identity
+    fy = ylog ? log10 : identity
+    gx = xlog ? exp10 : identity
+    gy = ylog ? exp10 : identity
+    tx0, tx1 = fx(xmin), fx(xmax)
+    ty0, ty1 = fy(ymin), fy(ymax)
+    xc = (tx0 + tx1) / 2
+    yc = (ty0 + ty1) / 2
+    xh = (tx1 - tx0) / 2 * factor
+    yh = (ty1 - ty0) / 2 * factor
     (xh == 0 || yh == 0) && return lims
-    return (xc - xh, xc + xh, yc - yh, yc + yh)
+    new = (gx(xc - xh), gx(xc + xh), gy(yc - yh), gy(yc + yh))
+    all(isfinite, new) || return lims
+    return new
 end
 
 """
@@ -178,16 +202,77 @@ Zoom Makie `Axis` `ax` by `factor` about the centre of its *currently
 displayed* view (`ax.finallimits`). `factor < 1` zooms in, `> 1` zooms out.
 Reading `finallimits` (rather than `targetlimits`) means the zoom always
 starts from what the user actually sees, including any `DataAspect`
-adjustment. No-ops on degenerate / non-finite limits.
+adjustment. The axis scales (`ax.xscale` / `ax.yscale`) are honoured, so a
+`log10` axis is scaled in log space and stays strictly positive. No-ops on
+degenerate / non-finite limits.
 """
 function zoom_axis!(ax, factor::Real)
     fl   = ax.finallimits[]
     o, w = fl.origin, fl.widths
     xmin = Float64(o[1]); ymin = Float64(o[2])
     cur  = (xmin, xmin + Float64(w[1]), ymin, ymin + Float64(w[2]))
-    nlim = zoom_limits(cur, factor)
+    xlog = _is_log_scale(ax.xscale[])
+    ylog = _is_log_scale(ax.yscale[])
+    nlim = zoom_limits(cur, factor; xlog = xlog, ylog = ylog)
     nlim === cur && return ax
     limits!(ax, nlim[1], nlim[2], nlim[3], nlim[4])
+    return ax
+end
+
+"""
+    LogSafeScrollZoom(speed)
+
+Drop-in replacement for Makie's built-in `:scrollzoom` interaction that is
+safe on `log10`-scaled axes. The scroll delta is mapped to a multiplicative
+zoom `factor` and applied through [`zoom_axis!`](@ref), which scales the span
+in log space about the view centre. Because the new bounds are produced with
+`exp10`, they stay strictly positive for any scroll amount, so zooming out can
+never drive a log limit to `≤ 0` (the root cause of the Makie
+`AssertionError: all(low .<= high)` raised from `update_axis_camera` inside the
+render loop).
+
+Unlike Makie's default scroll zoom this is anchored at the view centre rather
+than the cursor — matching the `+` / `-` keyboard zoom — which is a deliberate
+trade-off for crash safety on log axes.
+"""
+struct LogSafeScrollZoom
+    speed::Float64
+end
+
+# Per-notch multiplier; scroll up (`event.y > 0`) zooms in (factor < 1).
+function Makie.process_interaction(s::LogSafeScrollZoom, event::Makie.ScrollEvent,
+                                   ax::Makie.Axis)
+    zoom = Float64(event.y)
+    (isfinite(zoom) && zoom != 0) || return Makie.Consume(false)
+    factor = (1.0 - s.speed) ^ zoom
+    zoom_axis!(ax, factor)
+    return Makie.Consume(true)
+end
+
+const LOGSAFE_SCROLL_SPEED = 0.10
+
+"""
+    guard_log_zoom!(ax; speed=LOGSAFE_SCROLL_SPEED) -> ax
+
+Make scroll-wheel zooming safe on a `log10`-scaled `Axis`. Replaces the
+default `:scrollzoom` interaction with a [`LogSafeScrollZoom`](@ref) so that
+zooming out can never push a log-axis limit to `≤ 0` and crash the GLMakie
+render loop with `AssertionError: all(low .<= high)`.
+
+No-op on axes whose `x` and `y` scales are both non-log (linear axes keep
+Makie's native cursor-anchored scroll zoom). Safe to call on axes whose scale
+is decided at runtime — it only swaps the interaction when at least one axis is
+actually log-scaled.
+"""
+function guard_log_zoom!(ax::Makie.Axis; speed::Real = LOGSAFE_SCROLL_SPEED)
+    (_is_log_scale(ax.xscale[]) || _is_log_scale(ax.yscale[])) || return ax
+    try
+        Makie.deregister_interaction!(ax, :scrollzoom)
+    catch
+        # No default :scrollzoom registered (or already replaced) — nothing to
+        # remove; registering below still installs the safe handler.
+    end
+    Makie.register_interaction!(ax, :scrollzoom, LogSafeScrollZoom(Float64(speed)))
     return ax
 end
 

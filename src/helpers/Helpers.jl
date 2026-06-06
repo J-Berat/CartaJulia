@@ -78,9 +78,11 @@ export fits_header_for_region_spectrum, fits_header_for_filtered_cube
 export save_viewer_settings, load_viewer_settings
 export manta_defaults_path, load_manta_defaults
 export power_spectrum_2d, power_spectrum_1d_radial, fit_loglog_slope
+export healpix_power_spectrum, healpix_power_spectrum_map
 export ShortcutBinding, register_shortcuts!, format_shortcut, format_shortcut_help, shortcut_help_message
 export open_shortcut_help_window
 export zoom_limits, zoom_axis!, zoom_shortcut_bindings
+export guard_log_zoom!, LogSafeScrollZoom
 # Errors (actionable, structured)
 export MANTAError, FileNotFoundError, UnsupportedFormatError,
        HDUSelectionError, InvalidArgumentError, DatasetShapeError

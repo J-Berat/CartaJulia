@@ -284,7 +284,7 @@ function _colormap_swatch!(layout, pos, name::AbstractString,
     lines!(ax, [0, 1, 1, 0, 0], [0, 0, 1, 1, 0];
            color = border_color, linewidth = border_width)
 
-    on(ax.scene.events.mousebutton) do event
+    on(events(ax).mousebutton) do event
         if event.button == Mouse.left &&
            event.action == Mouse.release &&
            Makie.is_mouseinside(ax.scene)

@@ -23,10 +23,12 @@
 #   _moment_cache        — Dict keyed by (axis, order, mask token)
 #   _get_gauss_kernel    — closure: returns (and caches) an ImageFiltering Gaussian kernel for σ
 #
-# Entry point: `_cube_slice_pipeline_bundle(; kwargs...)`.
+# Entry point: `_cube_slice_pipeline_bundle(st; kwargs...)` (preferred) or
+# `_cube_slice_pipeline_bundle(; kwargs...)` (legacy keyword form).
 # Returns a named tuple with all the items listed above.
 
 """
+    _cube_slice_pipeline_bundle(st::CubeViewObservables; kwargs...) -> NamedTuple
     _cube_slice_pipeline_bundle(; kwargs...) -> NamedTuple
 
 Build the full reactive slice-and-moment data pipeline for the cube viewer.
@@ -63,6 +65,26 @@ widgets are touched here — this is a pure data layer.
 | `display_max_pixels` | Maximum displayed heatmap pixels along either slice dimension |
 | `display_downsample_mode` | `:block_mean` or `:subsample` for display downsampling |
 """
+function _cube_slice_pipeline_bundle(st::CubeViewObservables; kwargs...)
+    return _cube_slice_pipeline_bundle(;
+        kwargs...,
+        axis = st.axis,
+        idx = st.idx,
+        compare_idx = st.compare_idx,
+        gauss_on = st.gauss_on,
+        sigma = st.sigma,
+        compare_data = st.compare_data,
+        compare_mode = st.compare_mode,
+        view_product = st.view_product,
+        rotation_axis = st.rotation_axis,
+        rotation_angle = st.rotation_angle,
+        rotation_projection_mode = st.rotation_projection_mode,
+        mask_bits_obs = st.mask_bits_obs,
+        moment_order = st.moment_order,
+        img_scale_mode = st.img_scale_mode,
+    )
+end
+
 function _cube_slice_pipeline_bundle(;
     data,
     siz,

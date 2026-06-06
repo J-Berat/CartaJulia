@@ -96,15 +96,7 @@ function _view_healpix_map(
     end
     # Auto-contrasted contour colour: white on dark images, black on bright ones.
     contour_default_color_obs = lift(img_disp) do img
-        fv = filter(isfinite, vec(Float32.(img)))
-        isempty(fv) && return RGBAf(0f0, 0f0, 0f0, CONTOUR_AUTO_DARK_ALPHA)
-        lo, hi = percentile_clims(fv, 5, 95)
-        rng = hi - lo
-        rng < 1f-9 && return RGBAf(0f0, 0f0, 0f0, CONTOUR_AUTO_DARK_ALPHA)
-        t = clamp((median(fv) - lo) / rng, 0f0, 1f0)
-        t > CONTOUR_AUTO_BRIGHTNESS_THRESHOLD ?
-            RGBAf(0f0, 0f0, 0f0, CONTOUR_AUTO_DARK_ALPHA) :
-            RGBAf(1f0, 1f0, 1f0, CONTOUR_AUTO_LIGHT_ALPHA)
+        auto_contour_color(img; fallback = :dark)
     end
     contour_colors_obs = lift(contour_levels_obs, contour_use_manual, contour_manual_colors,
                               contour_default_color_obs) do levels, use_man, colors, def_color
@@ -140,6 +132,7 @@ function _view_healpix_map(
     zoom_drag_end    = Observable(Point2f(NaN32, NaN32))
     show_graticule   = Observable(true)
     focus_image      = Observable(false)
+    layout_mode      = Observable(:map)
     selection_mode = Observable(:point)
     region_shape = Observable(:box)
     region_drag_active = Observable(false)
@@ -269,7 +262,7 @@ function _view_healpix_map(
 
     # Bandeau info
     info_obs = Observable(latexstring("\\text{move cursor over the map}"))
-    Label(main_grid[3, 1], info_obs; halign=:left, fontsize=font_sz, tellheight=false)
+    info_label = Label(main_grid[3, 1], info_obs; halign=:left, fontsize=font_sz, tellheight=false)
     rowsize!(main_grid, 3, Fixed(info_h_px))
 
     # Controls
@@ -305,72 +298,38 @@ function _view_healpix_map(
     colgap!(ctrl_grid, ctrl_gap)
     rowgap!(ctrl_grid, ctrl_gap)
 
-    # -- block/layout visibility helpers (verbatim from CubeView) --
-    set_block_visible!(block, visible::Bool) = begin
-        try; block.visible[] = visible;            catch; end
-        try; block.scene.visible[] = visible;      catch; end
-        try; block.blockscene.visible[] = visible; catch; end
-        nothing
-    end
-    function set_layout_contents_visible!(layout, visible::Bool)
-        for block in try; contents(layout); catch; Any[]; end
-            set_block_visible!(block, visible)
-            block isa GridLayout && set_layout_contents_visible!(block, visible)
-        end
-        nothing
-    end
+    # -- shared HEALPix layout helpers --
+    set_block_visible! = _healpix_set_block_visible!
+    set_layout_contents_visible! = _healpix_set_layout_contents_visible!
 
-    focus_bar = GridLayout(
-        main_grid[2, 1];
-        alignmode = Outside(0),
-        halign = :center,
-        valign = :center,
-        tellwidth = false,
-        tellheight = false,
-    )
-    colgap!(focus_bar, tight_layout ? 4 : 6)
-    Box(focus_bar[1, 1:5];
-        color = RGBAf(ui_theme.panel.r, ui_theme.panel.g, ui_theme.panel.b, 0.94),
-        strokecolor = RGBAf(ui_theme.border.r, ui_theme.border.g, ui_theme.border.b, 0.75),
-        strokewidth = 0.9,
-        cornerradius = 8,
-        z = -5)
-    Label(focus_bar[1, 1];
-        text = "Focus",
-        halign = :left,
-        tellwidth = false,
-        fontsize = tight_layout ? 12 : 13,
-        color = ui_theme.text,
-        padding = (10, 4, 5, 5))
-    focus_exit_btn = Button(focus_bar[1, 2]; label = "Exit", width = 62, height = tight_layout ? 28 : 30)
-    focus_fit_btn = Button(focus_bar[1, 3]; label = MANTA_ICONS.fit, width = 42, height = tight_layout ? 28 : 30)
-    focus_auto_btn = Button(focus_bar[1, 4]; label = MANTA_ICONS.contrast, width = 42, height = tight_layout ? 28 : 30)
-    focus_help_btn = Button(focus_bar[1, 5]; label = MANTA_ICONS.help, width = 42, height = tight_layout ? 28 : 30)
-    foreach(c -> colsize!(focus_bar, c, Auto()), 1:5)
+    # Embedded HEALPix power spectrum panel (same-window layout, like CubeView).
+    ps_panel = _healpix_power_spectrum_panel!(main_grid[1:4, 1];
+        tight_layout = tight_layout,
+        compact_layout = compact_layout,
+        font_sz = font_sz,
+        ui_theme = ui_theme)
+    ps_grid = ps_panel.grid
+    ps_back_btn = ps_panel.back_btn
+
+    focus_panel = _healpix_focus_bar!(main_grid[2, 1];
+        tight_layout = tight_layout,
+        compact_layout = compact_layout,
+        ui_theme = ui_theme)
+    focus_bar = focus_panel.grid
+    focus_exit_btn = focus_panel.exit_btn
+    focus_fit_btn = focus_panel.fit_btn
+    focus_auto_btn = focus_panel.auto_btn
+    focus_help_btn = focus_panel.help_btn
 
     # -- card factory (mirrors CubeView card styling) --
     function control_card!(parent, row, col, title::AbstractString; rows::Int = 4, cols::Int = 4)
-        card = parent[row, col] = GridLayout(;
-            alignmode = Outside(card_pad), tellwidth = false, tellheight = false)
-        body_rows = rows + 1
-        card_is_dark = ui_theme.background.r < 0.5
-        card_border = RGBAf(ui_theme.border.r, ui_theme.border.g, ui_theme.border.b,
-                            card_is_dark ? 0.58 : 0.82)
-        header_divider = RGBAf(ui_theme.border.r, ui_theme.border.g, ui_theme.border.b,
-                               card_is_dark ? 0.30 : 0.50)
-        Box(card[1:body_rows, 1:cols]; color = ui_theme.panel, strokecolor = card_border,
-            strokewidth = card_is_dark ? 0.8 : 0.9, cornerradius = 8, z = -6)
-        Box(card[1, 1:cols]; color = ui_theme.panel_header, strokecolor = header_divider,
-            strokewidth = 0.8, cornerradius = 8, z = -5)
-        Label(card[1, 1:cols]; text = title, halign = :left, tellwidth = false,
-            fontsize = 12, color = ui_theme.text,
-            padding = (10, 10, 5, 5))
-        Box(card[body_rows, 1:cols]; color = :transparent, strokewidth = 0, z = -7)
-        rowsize!(card, 1, Fixed(compact_layout ? 28 : 32))
-        rowsize!(card, body_rows, Fixed(compact_layout ? 10 : 12))
-        rowgap!(card, tight_layout ? 5 : compact_layout ? 7 : 9)
-        colgap!(card, card_gap)
-        return card
+        _healpix_control_card!(parent, row, col, title;
+            rows = rows,
+            cols = cols,
+            card_pad = card_pad,
+            card_gap = tight_layout ? 5 : compact_layout ? 7 : 9,
+            compact_layout = compact_layout,
+            ui_theme = ui_theme)
     end
     ctrl_lbl!(layout, pos, txt) = Label(layout[pos...]; text = txt, halign = :left,
         tellwidth = false, fontsize = 13, color = ui_theme.text_muted)
@@ -422,7 +381,9 @@ function _view_healpix_map(
     Label(nav_view_card[2, 2]; text = "Graticule", halign = :left, tellwidth = false,
           fontsize = 13, color = ui_theme.text)
     graticule_chk.checked[] = show_graticule[]
-    reset_zoom_btn = Button(nav_view_card[3, 1:2]; label = "$(MANTA_ICONS.fit) Fit", width = 88, height = 32)
+    reset_zoom_btn = Button(nav_view_card[2, 3:4]; label = "$(MANTA_ICONS.fit) Fit", width = 88, height = 32)
+    base_layout_btn = Button(nav_view_card[3, 1:2]; label = "Map", width = compact_layout ? 86 : 96, height = 32)
+    ps_btn = Button(nav_view_card[3, 3:4]; label = "Power spectrum", width = compact_layout ? 126 : 146, height = 32)
     foreach(c -> colsize!(nav_view_card, c, Auto()), 1:4)
 
     # ── ANALYSIS: Contrast card (row 1 col 1) ────────────────────────────
@@ -504,7 +465,8 @@ function _view_healpix_map(
     # Resets, Clear, and utilities (unobtrusive)
     foreach(w -> manta_style_button_ghost!(w, ui_theme),
             (help_btn, focus_btn, btn_undo, btn_redo, auto_btn, reset_zoom_btn,
-             region_clear_btn, hist_auto_btn, hist_y_auto_btn,
+             base_layout_btn, ps_back_btn,
+             ps_btn, region_clear_btn, hist_auto_btn, hist_y_auto_btn,
              focus_exit_btn, focus_fit_btn, focus_auto_btn, focus_help_btn))
     foreach(w -> manta_style_checkbox!(w, ui_theme),
             (invert_chk, graticule_chk, gauss_chk, contour_chk))
@@ -703,10 +665,45 @@ function _view_healpix_map(
         nothing
     end
 
+    function render_power_spectrum_layout!()
+        _healpix_render_power_spectrum_panel!(ps_panel;
+            pixels = m.pixels,
+            fname = fname,
+            set_status! = _hp_status!)
+    end
+
+    function apply_layout_mode!()
+        is_ps = layout_mode[] === :power_spectrum
+        set_layout_contents_visible!(ps_grid, is_ps)
+        set_block_visible!(ax_img, !is_ps)
+        set_block_visible!(map_colorbar, !is_ps)
+        set_block_visible!(info_label, !is_ps)
+        set_block_visible!(ax_hist, !is_ps)
+        if is_ps
+            rowsize!(main_grid, 1, Fixed(map_h_px + cbar_h_px + info_h_px + hist_h_px))
+            rowsize!(main_grid, 2, Fixed(0))
+            rowsize!(main_grid, 3, Fixed(0))
+            rowsize!(main_grid, 4, Fixed(0))
+            rowgap!(main_grid, tight_layout ? 4 : 8)
+        else
+            rowsize!(main_grid, 1, Fixed(map_h_px))
+            rowsize!(main_grid, 2, Fixed(cbar_h_px))
+            rowsize!(main_grid, 3, Fixed(info_h_px))
+            rowsize!(main_grid, 4, Fixed(hist_h_px))
+            rowgap!(main_grid, -8)
+        end
+        refresh_control_mode!()
+        nothing
+    end
+
     focus_map_w = max(map_w_px, min(fig_size[1] - 48, 2 * (fig_size[2] - 72)))
     focus_map_h = max(map_h_px, focus_map_w ÷ 2)
     function apply_focus_image_mode!()
         if focus_image[]
+            if layout_mode[] === :power_spectrum
+                layout_mode[] = :map
+                apply_layout_mode!()
+            end
             set_layout_contents_visible!(ctrl_grid, false)
             set_layout_contents_visible!(focus_bar, true)
             rowsize!(main_grid, 1, Relative(1))
@@ -743,6 +740,8 @@ function _view_healpix_map(
     end
 
     on(focus_btn.clicks) do _
+        layout_mode[] = :map
+        apply_layout_mode!()
         focus_image[] = true
     end
 
@@ -808,6 +807,22 @@ function _view_healpix_map(
     end
     on(focus_help_btn.clicks) do _
         help_btn.clicks[] = help_btn.clicks[] + 1
+    end
+    on(base_layout_btn.clicks) do _
+        layout_mode[] = :map
+        apply_layout_mode!()
+        _hp_status!("Map layout enabled.")
+    end
+    on(ps_back_btn.clicks) do _
+        layout_mode[] = :map
+        apply_layout_mode!()
+        _hp_status!("Map layout enabled.")
+    end
+    on(ps_btn.clicks) do _
+        focus_image[] = false
+        render_power_spectrum_layout!()
+        layout_mode[] = :power_spectrum
+        apply_layout_mode!()
     end
     on(apply_btn.clicks) do _
         ok, manual, clims, _msg = parse_manual_clims(
@@ -1011,7 +1026,7 @@ function _view_healpix_map(
         _set_status_hp!("Image scale: $(String(next)).")
     end
     shortcuts_hp = ShortcutBinding[
-        ShortcutBinding(Keyboard.i,  () -> (invert_cmap[] = !invert_cmap[]);
+        ShortcutBinding(Keyboard.i,  () -> (invert_chk.checked[] = !invert_chk.checked[]);
                         description = "invert cmap"),
         ShortcutBinding(Keyboard.a,  () -> _trigger_btn_hp!(auto_btn);
                         description = "auto contrast"),
@@ -1023,6 +1038,8 @@ function _view_healpix_map(
                         description = "reset zoom"),
         ShortcutBinding(Keyboard.s,  () -> _trigger_btn_hp!(save_btn);
                         description = "save image"),
+        ShortcutBinding(Keyboard.p,  () -> _trigger_btn_hp!(ps_btn);
+                        description = "power spectrum"),
         ShortcutBinding(Keyboard.c,  () -> _toggle_contours_hp!();
                         description = "contours"),
         ShortcutBinding(Keyboard.l,  () -> _cycle_log_scale_hp!();

@@ -364,8 +364,8 @@ function _build_cube_layout(;
         )
         body_rows = rows + 1   # +1 for the invisible bottom spacer row
         card_is_dark = ui_theme.background.r < 0.5
-        card_border = RGBAf(ui_border.r, ui_border.g, ui_border.b, card_is_dark ? 0.58 : 0.82)
-        header_divider = RGBAf(ui_border.r, ui_border.g, ui_border.b, card_is_dark ? 0.30 : 0.50)
+        card_border = _theme_rgba(ui_border, card_is_dark ? 0.58 : 0.82)
+        header_divider = _theme_rgba(ui_border, card_is_dark ? 0.30 : 0.50)
         # Full-height card background
         Box(card[1:body_rows, 1:cols];
             color        = ui_panel,

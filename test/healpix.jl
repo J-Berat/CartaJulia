@@ -61,6 +61,21 @@ end
     @test spec == Float32[2, 80 / 3, 800 / 3]
 end
 
+@testset "healpix: spherical harmonic power spectrum" begin
+    pix = collect(1.0:48.0)
+    pix[3] = NaN
+    pix[7] = Healpix.UNSEEN
+    ps = MANTA.healpix_power_spectrum(pix; lmax = 3, mmax = 3, niter = 0)
+    @test ps.nside == 2
+    @test ps.ell == collect(0:3)
+    @test length(ps.cl) == 4
+    @test length(ps.dl) == 4
+    @test ps.n_valid == 46
+    @test ps.f_sky ≈ 46 / 48
+    @test all(isfinite, ps.cl)
+    @test all(isfinite, ps.dl)
+end
+
 # ----------------------------------------------------------------------------
 # HEALPix viewer regression tests (headless, activate_gl=false)
 # ----------------------------------------------------------------------------
